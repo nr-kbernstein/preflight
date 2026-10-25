@@ -21,6 +21,7 @@ import {
   getLogsApiUrl,
   compressPayload,
   sendWithRetry,
+  stagingHost,
 } from './http-client.js';
 import type { HttpSendOptions } from './types.js';
 import { getLogOutput } from '../__test-utils__/log-output.js';
@@ -67,6 +68,13 @@ describe('resolveRegion', () => {
     expect(resolveRegion('GOV01xxSOMEKEY123456', null)).toBe('gov');
   });
 
+  // Japan license keys use a bare 'jp' prefix (no digit suffix, unlike
+  // us01/eu01/gov01) — real NR JP keys look like 'jpxxxx...'.
+  it('returns jp for Japan license key (bare jp prefix, no digit suffix)', () => {
+    expect(resolveRegion('jpxxSOMEKEY123456', null)).toBe('jp');
+    expect(resolveRegion('JPXXSOMEKEY123456', null)).toBe('jp');
+  });
+
   // legacy keys without a region-prefix shape default to US
   it('returns us for legacy keys without a region prefix', () => {
     // Real NR legacy license keys are 40-char hex strings — they don't start
@@ -89,6 +97,7 @@ describe('resolveRegion', () => {
   });
 
   it('warns with unrecognized prefix and names supported prefixes on fallback', () => {
+    // F3: use shared getLogOutput helper instead of hand-rolled .find()
     resolveRegion('ca06xxNRALUSERKEY', null);
     const msg = getLogOutput(stderrSpy);
     expect(msg).toContain('ca06');
@@ -97,6 +106,7 @@ describe('resolveRegion', () => {
     expect(msg).toContain('gov01');
   });
 
+  // F5: warn must also fire for other unrecognized-shape prefixes, not just ca06
   it('warn fires for every unrecognized region-shaped prefix (apac01, xx99)', () => {
     resolveRegion('apac01xxSOMEKEY', null);
     expect(getLogOutput(stderrSpy)).toContain('apac01');
@@ -105,23 +115,32 @@ describe('resolveRegion', () => {
     expect(getLogOutput(stderrSpy)).toContain('xx99');
   });
 
+  // F2: warn message must call out potential data misrouting risk
   it('warn message states data may be misrouted to the wrong region', () => {
     resolveRegion('ca06xxNRALUSERKEY', null);
     expect(getLogOutput(stderrSpy)).toContain('misrouted');
   });
 
+  // F1: FQDN collectorHost makes region irrelevant — no warn should fire
   it('FQDN collectorHost suppresses unrecognized-prefix warn', () => {
     resolveRegion('ca06xxNRALUSERKEY', 'my.proxy.newrelic.com');
     expect(getLogOutput(stderrSpy)).not.toContain('Unrecognized');
   });
 
+  it('keyword collectorHost overrides region even for unrecognized-shaped key', () => {
+    // Bare keyword form short-circuits the license-key check entirely.
+    expect(resolveRegion('apac01xxSOMEKEY', 'staging')).toBe('staging');
+  });
+
   // ---------------------------------------------------------------------------
   // 2. resolveRegion — collectorHost override (keyword-only form)
   // ---------------------------------------------------------------------------
-  it('bare keyword collectorHost values are recognized (eu, gov, us)', () => {
+  it('bare keyword collectorHost values are recognized (eu, gov, staging, us, jp)', () => {
     expect(resolveRegion('us01xxSOMEKEY', 'eu')).toBe('eu');
     expect(resolveRegion('us01xxSOMEKEY', 'gov')).toBe('gov');
+    expect(resolveRegion('us01xxSOMEKEY', 'staging')).toBe('staging');
     expect(resolveRegion('eu01xxSOMEKEY', 'us')).toBe('us');
+    expect(resolveRegion('us01xxSOMEKEY', 'jp')).toBe('jp');
   });
 
   it('FQDN collectorHost returns us (region is irrelevant — URL builders use the FQDN directly)', () => {
@@ -140,6 +159,11 @@ describe('resolveRegion', () => {
     expect(resolveRegion('us01xxSOMEKEY', 'eucalyptus.test')).toBe('us');
   });
 
+  it('returns staging when collectorHost is the bare keyword', () => {
+    expect(resolveRegion('us01xxSOMEKEY', 'staging')).toBe('staging');
+    expect(resolveRegion('eu01xxSOMEKEY', 'staging')).toBe('staging');
+  });
+
   // gov collectorHost override (bare keyword only)
   it('returns gov when collectorHost is the bare keyword gov', () => {
     expect(resolveRegion('us01xxSOMEKEY', 'gov')).toBe('gov');
@@ -149,9 +173,15 @@ describe('resolveRegion', () => {
 });
 
 // ---------------------------------------------------------------------------
-// URL builders
+// URL builders — staging endpoints
 // ---------------------------------------------------------------------------
 describe('getEventsApiUrl', () => {
+  it('returns staging endpoint for staging region', () => {
+    expect(getEventsApiUrl('908482', 'staging')).toBe(
+      `https://${stagingHost('insights-collector')}/v1/accounts/908482/events`,
+    );
+  });
+
   it('returns US endpoint for us region', () => {
     expect(getEventsApiUrl('12345', 'us')).toBe(
       'https://insights-collector.newrelic.com/v1/accounts/12345/events',
@@ -170,6 +200,12 @@ describe('getEventsApiUrl', () => {
     );
   });
 
+  it('returns JP endpoint for jp region', () => {
+    expect(getEventsApiUrl('12345', 'jp')).toBe(
+      'https://insights-collector.jp.nr-data.net/v1/accounts/12345/events',
+    );
+  });
+
   // literal-hostname override
   it('uses collectorHost as literal URL host when it contains a dot', () => {
     expect(getEventsApiUrl('12345', 'us', 'collector.example.com')).toBe(
@@ -180,6 +216,13 @@ describe('getEventsApiUrl', () => {
   it('uses collectorHost as literal URL host when it contains a port', () => {
     expect(getEventsApiUrl('12345', 'us', 'proxy.local:9000')).toBe(
       'https://proxy.local:9000/v1/accounts/12345/events',
+    );
+  });
+
+  it('ignores collectorHost without dot or colon and falls through to region', () => {
+    // 'staging' keyword has no dot — region resolution must determine the URL.
+    expect(getEventsApiUrl('12345', 'staging', 'staging')).toBe(
+      `https://${stagingHost('insights-collector')}/v1/accounts/12345/events`,
     );
   });
 
@@ -205,8 +248,16 @@ describe('getEventsApiUrl', () => {
 });
 
 describe('getMetricApiUrl', () => {
+  it('returns staging endpoint for staging region', () => {
+    expect(getMetricApiUrl('staging')).toBe(`https://${stagingHost('metric-api')}/metric/v1`);
+  });
+
   it('returns FedRAMP endpoint for gov region', () => {
     expect(getMetricApiUrl('gov')).toBe('https://gov-metric-api.newrelic.com/metric/v1');
+  });
+
+  it('returns JP endpoint for jp region', () => {
+    expect(getMetricApiUrl('jp')).toBe('https://metric-api.jp.nr-data.net/metric/v1');
   });
 
   it('uses collectorHost as literal URL host when it contains a dot', () => {
@@ -214,17 +265,35 @@ describe('getMetricApiUrl', () => {
       'https://collector.example.com/metric/v1',
     );
   });
+
+  it('ignores bare staging keyword and falls through to region', () => {
+    expect(getMetricApiUrl('staging', 'staging')).toBe(
+      `https://${stagingHost('metric-api')}/metric/v1`,
+    );
+  });
 });
 
 describe('getLogsApiUrl', () => {
+  it('returns staging endpoint for staging region', () => {
+    expect(getLogsApiUrl('staging')).toBe(`https://${stagingHost('log-api')}/log/v1`);
+  });
+
   it('returns FedRAMP endpoint for gov region', () => {
     expect(getLogsApiUrl('gov')).toBe('https://gov-log-api.newrelic.com/log/v1');
+  });
+
+  it('returns JP endpoint for jp region', () => {
+    expect(getLogsApiUrl('jp')).toBe('https://log-api.jp.nr-data.net/log/v1');
   });
 
   it('uses collectorHost as literal URL host when it contains a dot', () => {
     expect(getLogsApiUrl('us', 'collector.example.com')).toBe(
       'https://collector.example.com/log/v1',
     );
+  });
+
+  it('ignores bare staging keyword and falls through to region', () => {
+    expect(getLogsApiUrl('staging', 'staging')).toBe(`https://${stagingHost('log-api')}/log/v1`);
   });
 });
 
@@ -256,6 +325,41 @@ describe('sendWithRetry', () => {
 
   afterEach(() => {
     fetchSpy.mockRestore();
+  });
+
+  // SSRF guard — blocks a private/loopback/metadata collectorHost override
+  // before any request is attempted. statusCode: null (like the gzip-failure
+  // path above) distinguishes this from an HTTP-level failure so callers
+  // don't retry it as if the network request itself failed.
+  it('returns statusCode: null and does not call fetch when the URL targets a private host', async () => {
+    const result = await sendWithRetry(
+      baseOptions({ url: 'https://127.0.0.1/v1/accounts/1/events' }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBeNull();
+    expect(result.error).toContain('private or loopback address');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('returns statusCode: null and does not call fetch when the URL targets a cloud metadata host', async () => {
+    const result = await sendWithRetry(
+      baseOptions({ url: 'http://metadata.google.internal/latest/meta-data/' }),
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBeNull();
+    expect(result.error).toContain('cloud metadata service endpoint');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('still sends normally for an ordinary NR ingest URL', async () => {
+    fetchSpy.mockResolvedValue(new Response('{}', { status: 200 }));
+
+    const result = await sendWithRetry(baseOptions());
+
+    expect(result.success).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   // 4. Verifies gzip headers

@@ -22,7 +22,11 @@ const ENTRIES: readonly Entry[] = NAV_SECTIONS.flatMap((s) =>
 );
 
 /** Route switcher behind the header search field (⌘K or `/`). */
-export function CommandPalette({ open, onClose, onNavigate }: CommandPaletteProps): JSX.Element | null {
+export function CommandPalette({
+  open,
+  onClose,
+  onNavigate,
+}: CommandPaletteProps): JSX.Element | null {
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -118,7 +122,9 @@ export function CommandPalette({ open, onClose, onNavigate }: CommandPaletteProp
                 <kbd className="px-1.5 rounded border border-border-subtle font-mono text-[11px] text-ink-muted">
                   g {entry.item.shortcut}
                 </kbd>
-                {active && <CornerDownLeft size={14} className="text-ink-muted" aria-hidden="true" />}
+                {active && (
+                  <CornerDownLeft size={14} className="text-ink-muted" aria-hidden="true" />
+                )}
               </li>
             );
           })}

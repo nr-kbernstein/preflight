@@ -35,19 +35,19 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { calculateCost, createLogger, type TokenUsage } from '../shared/index.js';
+import { createLogger, type TokenUsage } from '../shared/index.js';
+import { calculateModelCost } from '../metrics/pricing-overlay.js';
+import { AGENT_ID_RE } from '../lib/agent-id.js';
+import { parseAssistantTurnLine } from '../lib/subagent-transcript-parser.js';
 import { findWorkflowScriptPath, WorkflowStore } from './workflow-store.js';
 import { parseWorkflowScript, type DeclaredTopology } from '../hooks/workflow-script-parser.js';
-import type {
-  RawTranscriptEntry,
-  RawAssistantMessage,
-  RawUsage,
-} from '../hooks/transcript-types.js';
+import type { RawTranscriptEntry, RawAssistantMessage } from '../lib/transcript-types.js';
 
 const logger = createLogger('subagent-timeline-store');
 
 const SESSION_ID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-const AGENT_ID_RE = /^a[a-f0-9]{16}$/;
+// AGENT_ID_RE imported from ../lib/agent-id.js — see its doc comment for the
+// two valid agentId shapes.
 const WORKFLOW_RUN_ID_RE = /^wf_[A-Za-z0-9_-]{1,128}$/;
 const PROJECTS_DIR_NAME = '.claude/projects';
 
@@ -222,7 +222,8 @@ interface ParsedAgentFile {
   readonly endMs: number;
   readonly turnCount: number;
   readonly totalTokens: number;
-  readonly usage: TokenUsage;
+  /** Sum of per-turn USD; null when no turn priced. */
+  readonly usd: number | null;
   readonly model: string;
 }
 
@@ -326,7 +327,7 @@ export class SubagentTimelineStore {
         label = `agent ${file.agentId.slice(0, 8)}`;
       }
 
-      const usd = computeUsd(parsed.usage, parsed.model);
+      const usd = parsed.usd;
 
       agents.push({
         agentId: file.agentId,
@@ -405,7 +406,7 @@ export class SubagentTimelineStore {
       if (parsed === null) continue;
 
       totalTokens += parsed.totalTokens;
-      const usd = computeUsd(parsed.usage, parsed.model);
+      const usd = parsed.usd;
       if (usd !== null) {
         totalUsd += usd;
         anyPriced = true;
@@ -708,6 +709,10 @@ export class SubagentTimelineStore {
     let cacheReadTokens = 0;
     let cacheCreationTokens = 0;
     let lastModel = '';
+    // Tier thresholds are a per-request property, so each turn is priced on
+    // its own and the USD summed; pricing the summed usage would push a
+    // many-turn agent over a threshold no single request crossed.
+    let usd: number | null = null;
 
     // Dedup streaming-duplicate lines: Claude Code logs one JSONL line per
     // streaming snapshot of a single assistant turn, all sharing one
@@ -750,6 +755,19 @@ export class SubagentTimelineStore {
       cacheReadTokens += turn.cacheReadTokens;
       cacheCreationTokens += turn.cacheCreationTokens;
       if (turn.model.length > 0) lastModel = turn.model;
+      const turnUsd = computeUsd(
+        {
+          inputTokens: turn.inputTokens,
+          outputTokens: turn.outputTokens,
+          thinkingTokens: 0,
+          cacheReadTokens: turn.cacheReadTokens,
+          cacheCreationTokens: turn.cacheCreationTokens,
+          totalTokens:
+            turn.inputTokens + turn.outputTokens + turn.cacheReadTokens + turn.cacheCreationTokens,
+        },
+        lastModel,
+      );
+      if (turnUsd !== null) usd = (usd ?? 0) + turnUsd;
 
       if (nl === len) break;
     }
@@ -759,16 +777,8 @@ export class SubagentTimelineStore {
     }
 
     const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
-    const usage: TokenUsage = {
-      inputTokens,
-      outputTokens,
-      thinkingTokens: 0,
-      cacheReadTokens,
-      cacheCreationTokens,
-      totalTokens,
-    };
 
-    return { startMs, endMs, turnCount, totalTokens, usage, model: lastModel };
+    return { startMs, endMs, turnCount, totalTokens, usd, model: lastModel };
   }
 
   // -------------------------------------------------------------------------
@@ -905,21 +915,10 @@ interface AssistantTurn {
  * malformed or not an assistant turn with usage. Never throws.
  */
 function parseAssistantTurn(line: string): AssistantTurn | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(line);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== 'object') return null;
-  const obj = parsed as RawTranscriptEntry;
-  if (obj.type !== 'assistant') return null;
+  const { fields } = parseAssistantTurnLine(line);
+  if (!fields) return null;
 
-  const message = obj.message;
-  if (!message || typeof message !== 'object') return null;
-  const m = message as RawAssistantMessage;
-
-  const model = typeof m.model === 'string' ? m.model : '';
+  const model = fields.model ?? '';
   // `<synthetic>` turns carry no real usage and no priceable model.
   if (model === '<synthetic>') return null;
 
@@ -929,30 +928,21 @@ function parseAssistantTurn(line: string): AssistantTurn | null {
   // snapshots can be deduped in parseTranscript — mirroring the cost path's
   // `${agentId}|${messageId}` dedup in event-processor.ts. Lines without an id
   // are skipped, exactly as the CostTracker feed (SubagentWatcher) skips them.
-  const messageId = typeof m.id === 'string' ? m.id : '';
+  const messageId = fields.messageId ?? '';
   if (messageId.length === 0) return null;
 
-  const usage = m.usage;
-  if (!usage || typeof usage !== 'object') return null;
-  const u = usage as RawUsage;
-
-  const tsRaw = typeof obj.timestamp === 'string' ? obj.timestamp : null;
-  const timestampMs = tsRaw ? Date.parse(tsRaw) : NaN;
+  const timestampMs = fields.rawTimestamp ? Date.parse(fields.rawTimestamp) : NaN;
   if (!Number.isFinite(timestampMs)) return null;
 
   return {
     messageId,
     timestampMs,
     model,
-    inputTokens: num(u.input_tokens),
-    outputTokens: num(u.output_tokens),
-    cacheReadTokens: num(u.cache_read_input_tokens),
-    cacheCreationTokens: num(u.cache_creation_input_tokens),
+    inputTokens: fields.inputTokens,
+    outputTokens: fields.outputTokens,
+    cacheReadTokens: fields.cacheReadTokens,
+    cacheCreationTokens: fields.cacheCreationTokens,
   };
-}
-
-function num(v: unknown): number {
-  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
 /**
@@ -964,7 +954,7 @@ function num(v: unknown): number {
  */
 function computeUsd(usage: TokenUsage, model: string): number | null {
   if (model.length === 0) return null;
-  const breakdown = calculateCost(model, usage);
+  const breakdown = calculateModelCost(model, usage);
   if (breakdown.totalUsd > 0) return breakdown.totalUsd;
   return null;
 }

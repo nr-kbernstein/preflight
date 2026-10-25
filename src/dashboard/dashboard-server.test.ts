@@ -7,6 +7,7 @@ import { LiveEventBus } from './live-event-bus.js';
 import { LocalAlertEngine } from '../alerts/local-alert-engine.js';
 import { AlertLog } from '../alerts/alert-log.js';
 import { VERSION } from '../version.js';
+import { UnforwardedSessionMonitor } from '../transport/unforwarded-session-monitor.js';
 
 describe('DashboardServer', () => {
   let server: DashboardServer;
@@ -24,6 +25,31 @@ describe('DashboardServer', () => {
     const addr = await server.start();
     expect(addr.address).toBe('127.0.0.1');
     expect(addr.port).toBeGreaterThan(0);
+  });
+
+  it('keeps sockets alive longer than the UI poll interval, with headersTimeout above it', async () => {
+    // Node's 5s default closed idle sockets while the browser was still
+    // reusing them, so polled requests hung "(pending)" forever.
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+    });
+    await server.start();
+    const raw = (server as unknown as { server: http.Server }).server;
+    expect(raw.keepAliveTimeout).toBeGreaterThanOrEqual(60_000);
+    expect(raw.headersTimeout).toBeGreaterThan(raw.keepAliveTimeout);
+  });
+
+  it('marks API responses no-store so the browser cannot serve stale metrics', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/health`);
+    expect(res.headers.get('cache-control')).toBe('no-store');
   });
 
   it('responds 404 to unknown paths', async () => {
@@ -50,6 +76,61 @@ describe('DashboardServer', () => {
     const body = await res.json();
     expect(body.ok).toBe(true);
     expect(typeof body.uptime).toBe('number');
+    expect(body).not.toHaveProperty('unforwardedSessions');
+  });
+
+  it('reports unforwarded sessions in /api/health when a provider is wired', async () => {
+    const monitor = new UnforwardedSessionMonitor({
+      gap: { reason: 'missing-license-key', missingField: 'licenseKey', requestedMode: 'both' },
+      warn: () => {},
+    });
+    monitor.recordToolCall('copilot-session-1');
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      unforwardedSessions: () => monitor.getSnapshot(),
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/health`);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+    expect(body.unforwardedSessions).toMatchObject({
+      reason: 'missing-license-key',
+      requestedMode: 'both',
+      count: 1,
+      toolCalls: 1,
+      sessions: [{ sessionId: 'copilot-session-1', toolCalls: 1 }],
+    });
+  });
+
+  it('leaves unforwarded sessions out of /api/health for a caller that fails isAuthorized', async () => {
+    // /api/health is exempt from isAuthorized, so anything naming a session
+    // must be gated separately or an exposed server would hand it out.
+    const monitor = new UnforwardedSessionMonitor({
+      gap: { reason: 'missing-license-key', missingField: 'licenseKey', requestedMode: 'both' },
+      warn: () => {},
+    });
+    monitor.recordToolCall('copilot-session-1');
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      isAuthorized: (authHeader) => authHeader === 'Basic good',
+      unforwardedSessions: () => monitor.getSnapshot(),
+    });
+    const addr = await server.start();
+
+    const anonymous = await fetch(`http://127.0.0.1:${addr.port}/api/health`);
+    expect(anonymous.status).toBe(200);
+    const anonymousBody = await anonymous.json();
+    expect(anonymousBody.ok).toBe(true);
+    expect(anonymousBody).not.toHaveProperty('unforwardedSessions');
+
+    const authed = await fetch(`http://127.0.0.1:${addr.port}/api/health`, {
+      headers: { authorization: 'Basic good' },
+    });
+    expect((await authed.json()).unforwardedSessions).toMatchObject({ count: 1 });
   });
 
   it('includes the package version in /api/health', async () => {
@@ -430,6 +511,17 @@ describe('DashboardServer Host validation', () => {
     const addr = await server.start();
     expect(await requestWithHost(addr.port, '[::1]:abc.evil.com')).toBe(403);
   });
+
+  it('serverMode accepts a non-loopback Host header that would otherwise be rejected', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      serverMode: true,
+    });
+    const addr = await server.start();
+    expect(await requestWithHost(addr.port, 'evil.example.com')).toBe(200);
+  });
 });
 
 describe('DashboardServer SSE shutdown', () => {
@@ -615,5 +707,124 @@ describe('DashboardServer handle() defensive error handling', () => {
     } finally {
       stderrSpy.mockRestore();
     }
+  });
+});
+
+describe('DashboardServer isAuthorized gate', () => {
+  let server: DashboardServer;
+  afterEach(async () => {
+    await server?.stop();
+  });
+
+  function basicAuthHeader(password: string): string {
+    return `Basic ${Buffer.from(`ignored:${password}`).toString('base64')}`;
+  }
+
+  it('returns 401 with a WWW-Authenticate header for the static/root route when unauthorized', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      isAuthorized: () => false,
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/`);
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toMatch(/^Basic realm=/);
+  });
+
+  it('returns 401 for /api/* routes when unauthorized', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      api: {},
+      isAuthorized: () => false,
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/whatever`);
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 for /sse when unauthorized', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      isAuthorized: () => false,
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/sse`);
+    expect(res.status).toBe(401);
+  });
+
+  it('passes the Authorization header through to isAuthorized and allows the request when it returns true', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      api: {},
+      isAuthorized: (authHeader) => authHeader === basicAuthHeader('correct-token'),
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/whatever`, {
+      headers: { authorization: basicAuthHeader('correct-token') },
+    });
+    expect(res.status).not.toBe(401);
+  });
+
+  it('rejects the request when isAuthorized returns false for a wrong token', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      api: {},
+      isAuthorized: (authHeader) => authHeader === basicAuthHeader('correct-token'),
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/whatever`, {
+      headers: { authorization: basicAuthHeader('wrong-token') },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('never gates GET /api/health, even when isAuthorized always returns false', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      isAuthorized: () => false,
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/health`);
+    expect(res.status).toBe(200);
+  });
+
+  it('never gates POST /ingest, leaving its own Bearer-token check as the sole guard', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+      isAuthorized: () => false,
+      ingestHandler: (authHeader) => (authHeader === 'Bearer real-token' ? 204 : 401),
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/ingest`, {
+      method: 'POST',
+      headers: { authorization: 'Bearer real-token', 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(204);
+  });
+
+  it('does not gate anything when isAuthorized is not provided', async () => {
+    server = new DashboardServer({
+      port: 0,
+      host: '127.0.0.1',
+      bus: new LiveEventBus(),
+    });
+    const addr = await server.start();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/`);
+    expect(res.status).not.toBe(401);
   });
 });

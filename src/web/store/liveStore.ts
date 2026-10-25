@@ -30,6 +30,13 @@ export interface AntiPatternEvent {
   readonly count: number;
 }
 
+export interface RetryAlertEvent {
+  readonly sessionId?: string;
+  readonly toolName: string;
+  readonly occurrences: number;
+  readonly tokensWasted: number;
+}
+
 // Mirror of the AlertEvent shape from src/dashboard/live-event-bus.ts, minus
 // its optional `sessionId` — alerts aren't session-scoped client-side (every
 // firing alert is shown regardless of which session triggered it). Kept
@@ -93,6 +100,7 @@ interface LiveState {
   readonly recentToolCalls: ToolCallEvent[];
   readonly cost: CostUpdateEvent | null;
   readonly antiPatterns: AntiPatternEvent[];
+  readonly retryAlerts: RetryAlertEvent[];
   readonly contextBySession: Map<string, ContextUpdateEvent>;
   readonly firingAlerts: Map<string, AlertEvent>;
   readonly dismissedAlerts: Set<string>;
@@ -111,6 +119,7 @@ interface LiveState {
   pushToolCall(e: ToolCallEvent): void;
   setCost(c: CostUpdateEvent): void;
   pushAntiPattern(e: AntiPatternEvent): void;
+  pushRetryAlert(e: RetryAlertEvent): void;
   setContext(c: ContextUpdateEvent): void;
   addOrUpdateAlert(e: AlertEvent): void;
   clearAlert(id: string): void;
@@ -119,10 +128,23 @@ interface LiveState {
   addSubagentTurn(usdEstimate: number | null): void;
   upsertWorkflowRun(run: WorkflowRunLiveState): void;
   setObservabilityHealth(health: ObservabilityHealthState): void;
+  /**
+   * Clears the SSE-derived `cost` snapshot and resets the subagent
+   * accumulators once the caller has detected a local-midnight rollover
+   * (see the interval in Today.tsx). `setCost`/`addSubagentTurn`
+   * only fire on a fresh server push, so a tab left open across midnight
+   * with no new tool-call activity right away would otherwise keep
+   * displaying yesterday's "Spend Today"/forecast/subagent numbers forever
+   * — nothing else ever invalidates the cached value. After this runs, the
+   * KPIs fall back to the day-aware `/api/sessions/today/aggregate`/
+   * persisted-session values until a fresh same-day SSE frame arrives.
+   */
+  handleDayRollover(): void;
 }
 
 const RECENT_CAP = 20;
 const ANTI_CAP = 10;
+const RETRY_CAP = 10;
 
 const WORKFLOW_CAP = 50;
 
@@ -131,6 +153,7 @@ export const useLiveStore = create<LiveState>((set) => ({
   recentToolCalls: [],
   cost: null,
   antiPatterns: [],
+  retryAlerts: [],
   contextBySession: new Map(),
   firingAlerts: new Map(),
   dismissedAlerts: new Set(),
@@ -159,6 +182,7 @@ export const useLiveStore = create<LiveState>((set) => ({
         activeSessionId: id,
         recentToolCalls: s.recentToolCalls.filter((t) => matchOrUnknown(t.sessionId)),
         antiPatterns: s.antiPatterns.filter((a) => matchOrUnknown(a.sessionId)),
+        retryAlerts: s.retryAlerts.filter((a) => matchOrUnknown(a.sessionId)),
         cost: s.cost && matchOrUnknown(s.cost.sessionId) ? s.cost : null,
       };
     }),
@@ -191,6 +215,12 @@ export const useLiveStore = create<LiveState>((set) => ({
     set((s) => {
       const next = [...s.antiPatterns, e];
       return { antiPatterns: next.length > ANTI_CAP ? next.slice(next.length - ANTI_CAP) : next };
+    }),
+
+  pushRetryAlert: (e) =>
+    set((s) => {
+      const next = [...s.retryAlerts, e];
+      return { retryAlerts: next.length > RETRY_CAP ? next.slice(next.length - RETRY_CAP) : next };
     }),
 
   addOrUpdateAlert: (e) =>
@@ -245,6 +275,8 @@ export const useLiveStore = create<LiveState>((set) => ({
     }),
 
   setObservabilityHealth: (health) => set({ observabilityHealth: health }),
+
+  handleDayRollover: () => set({ cost: null, todaySubagentUsd: 0, todaySubagentTurnCount: 0 }),
 }));
 
 // ---------------------------------------------------------------------------
@@ -294,5 +326,3 @@ export function selectMaxSeverity(state: LiveState): AlertEvent['severity'] | nu
 // keeping the `{ usd, turns }` call-site API intact.
 export const useSubagentStats = (): { usd: number; turns: number } =>
   useLiveStore(useShallow((s) => ({ usd: s.todaySubagentUsd, turns: s.todaySubagentTurnCount })));
-export const useObservabilityHealth = (): ObservabilityHealthState | null =>
-  useLiveStore((s) => s.observabilityHealth);

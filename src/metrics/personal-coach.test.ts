@@ -1,4 +1,5 @@
 import { PersonalCoach } from './personal-coach.js';
+import { getIsoWeekId } from '../storage/weekly-summary.js';
 import type { WeeklySummaryGenerator } from '../storage/weekly-summary.js';
 import type { WeeklySummary } from '../storage/weekly-summary.js';
 
@@ -145,7 +146,7 @@ describe('PersonalCoach', () => {
     }
   });
 
-  it('flags regression when cost-per-session spikes above baseline', () => {
+  it('flags regression when cost-per-task spikes above baseline', () => {
     const summaries = [
       makeWeeklySummary('2026-W04', developer, { totalCostUsd: 20.0, sessionCount: 10 }),
       makeWeeklySummary('2026-W03', developer, { totalCostUsd: 5.0, sessionCount: 10 }),
@@ -155,7 +156,7 @@ describe('PersonalCoach', () => {
     const coach = new PersonalCoach(gen, developer);
     const result = coach.generate();
     if (result.status === 'ok') {
-      expect(result.regressions.some((r) => r.includes('Cost per session'))).toBe(true);
+      expect(result.regressions.some((r) => r.includes('Cost per completed task'))).toBe(true);
     }
   });
 
@@ -260,6 +261,76 @@ describe('PersonalCoach', () => {
         result.regressions.some((r) => r.includes('Anti-pattern rate') && r.includes('stuck loop')),
       ).toBe(true);
       expect(result.topRecommendation).toContain('Focus on reducing "stuck loop"');
+    }
+  });
+
+  it('suppresses highlights/regressions and discloses sample size for a low-session in-progress week', () => {
+    const now = new Date('2026-06-10T09:00:00Z');
+    const currentWeekId = getIsoWeekId(now);
+    const summaries = [
+      makeWeeklySummary(currentWeekId, developer, {
+        sessionCount: 1,
+        totalCostUsd: 50.0,
+        avgEfficiencyScore: 0.2,
+      }),
+      makeWeeklySummary('2026-W01', developer, { totalCostUsd: 5.0, avgEfficiencyScore: 0.8 }),
+      makeWeeklySummary('2026-W02', developer, { totalCostUsd: 5.0, avgEfficiencyScore: 0.8 }),
+    ];
+    const gen = makeSummaryGenerator(summaries);
+    const coach = new PersonalCoach(gen, developer);
+    const result = coach.generate(now);
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') {
+      expect(result.thisWeek.weekId).toBe(currentWeekId);
+      expect(result.thisWeek.sessionsCount).toBe(1);
+      expect(result.highlights).toEqual([]);
+      expect(result.regressions).toEqual([]);
+      expect(result.topRecommendation).toContain('1 session');
+      expect(result.topRecommendation).toContain('check back');
+    }
+  });
+
+  it('applies normal comparisons to an in-progress week once it has enough sessions', () => {
+    const now = new Date('2026-06-10T09:00:00Z');
+    const currentWeekId = getIsoWeekId(now);
+    const summaries = [
+      makeWeeklySummary(currentWeekId, developer, {
+        sessionCount: 10,
+        totalCostUsd: 20.0,
+        avgEfficiencyScore: 0.5,
+      }),
+      makeWeeklySummary('2026-W01', developer, { totalCostUsd: 5.0, avgEfficiencyScore: 0.75 }),
+      makeWeeklySummary('2026-W02', developer, { totalCostUsd: 5.0, avgEfficiencyScore: 0.75 }),
+    ];
+    const gen = makeSummaryGenerator(summaries);
+    const coach = new PersonalCoach(gen, developer);
+    const result = coach.generate(now);
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') {
+      expect(result.regressions.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('does not gate a fully-elapsed low-session week even when it is the most recent one loaded', () => {
+    // "now" is far after every loaded week, so none of them are the
+    // in-progress current week — a genuinely quiet past week should still
+    // surface its real regressions.
+    const now = new Date('2026-09-01T09:00:00Z');
+    const summaries = [
+      makeWeeklySummary('2026-W02', developer, {
+        sessionCount: 1,
+        totalCostUsd: 50.0,
+        avgEfficiencyScore: 0.2,
+      }),
+      makeWeeklySummary('2026-W01', developer, { totalCostUsd: 5.0, avgEfficiencyScore: 0.8 }),
+      makeWeeklySummary('2025-W52', developer, { totalCostUsd: 5.0, avgEfficiencyScore: 0.8 }),
+    ];
+    const gen = makeSummaryGenerator(summaries);
+    const coach = new PersonalCoach(gen, developer);
+    const result = coach.generate(now);
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') {
+      expect(result.regressions.length).toBeGreaterThan(0);
     }
   });
 

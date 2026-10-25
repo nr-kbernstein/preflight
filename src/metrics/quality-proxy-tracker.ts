@@ -58,6 +58,77 @@ export interface QualityProxyOptions {
   readonly degradationThreshold?: number;
 }
 
+export interface QualityProxyRawCounts {
+  readonly totalSignals: number;
+  readonly diffApplyCleanCount: number;
+  readonly diffFailCount: number;
+  readonly testPassCount: number;
+  readonly testFailCount: number;
+  readonly backtrackCount: number;
+  readonly selfCorrectionCount: number;
+}
+
+export const ZERO_QUALITY_PROXY_COUNTS: QualityProxyRawCounts = {
+  totalSignals: 0,
+  diffApplyCleanCount: 0,
+  diffFailCount: 0,
+  testPassCount: 0,
+  testFailCount: 0,
+  backtrackCount: 0,
+  selfCorrectionCount: 0,
+};
+
+export interface QualityProxyRates {
+  readonly totalSignals: number;
+  readonly diffApplyRate: number | null;
+  readonly testPassRate: number | null;
+  readonly backtrackCount: number;
+  readonly selfCorrectionCount: number;
+}
+
+// Sums raw counts across multiple sources (e.g. this process's own live
+// counts plus every other today session's persisted snapshot, or a single
+// persisted session's own snapshot), then derives diffApplyRate/testPassRate
+// exactly once from the summed totals — never by averaging each source's own
+// rate, which would misweight sources with different signal volumes. Pure
+// and stateless, not a QualityProxyTracker instance method: unlike
+// ModelUsageTracker.combineBreakdowns, one of this function's two real call
+// sites (a persisted session's own detail view) has no live tracker involved
+// at all — it just re-derives that one session's own rates from its stored
+// counts.
+export function combineQualityProxyRawCounts(
+  countsList: ReadonlyArray<QualityProxyRawCounts>,
+): QualityProxyRates {
+  let diffApplied = 0;
+  let diffFailed = 0;
+  let testPass = 0;
+  let testFail = 0;
+  let backtrackCount = 0;
+  let selfCorrectionCount = 0;
+  let totalSignals = 0;
+
+  for (const counts of countsList) {
+    diffApplied += counts.diffApplyCleanCount;
+    diffFailed += counts.diffFailCount;
+    testPass += counts.testPassCount;
+    testFail += counts.testFailCount;
+    backtrackCount += counts.backtrackCount;
+    selfCorrectionCount += counts.selfCorrectionCount;
+    totalSignals += counts.totalSignals;
+  }
+
+  const totalDiffs = diffApplied + diffFailed;
+  const totalTests = testPass + testFail;
+
+  return {
+    totalSignals,
+    diffApplyRate: totalDiffs > 0 ? Math.round((diffApplied / totalDiffs) * 1000) / 1000 : null,
+    testPassRate: totalTests > 0 ? Math.round((testPass / totalTests) * 1000) / 1000 : null,
+    backtrackCount,
+    selfCorrectionCount,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -83,6 +154,15 @@ export class QualityProxyTracker {
   private lastEditFile: string | null = null;
   private lastEditTurn = 0;
   private lastEditSuccess = false;
+
+  // Additive seed from a previous process's last checkpoint for this same
+  // session — see seedFromPersisted()'s doc comment for why. Kept separate
+  // from `events` rather than pushed in as synthetic entries: `events` feeds
+  // computeTurnBuckets()/detectDegradation(), which need real turn numbers a
+  // persisted aggregate count can't provide (see FullSessionSummary.qualityProxy's
+  // doc comment for the same caveat). Only the aggregate counts/rates below
+  // are recoverable this way.
+  private seededCounts: QualityProxyRawCounts = { ...ZERO_QUALITY_PROXY_COUNTS };
 
   constructor(options?: QualityProxyOptions) {
     this.bucketSize = options?.bucketSize ?? DEFAULT_BUCKET_SIZE;
@@ -146,26 +226,66 @@ export class QualityProxyTracker {
     }
   }
 
-  getMetrics(): QualityProxyMetrics {
-    const diffApplied = this.events.filter((e) => e.signal === 'diff_applied_clean').length;
-    const diffFailed = this.events.filter((e) => e.signal === 'diff_failed').length;
-    const testPass = this.events.filter((e) => e.signal === 'test_pass').length;
-    const testFail = this.events.filter((e) => e.signal === 'test_fail').length;
-    const backtrackCount = this.events.filter((e) => e.signal === 'backtrack').length;
-    const selfCorrectionCount = this.events.filter((e) => e.signal === 'self_correction').length;
+  /**
+   * Seeds cumulative raw signal counts from a previous process's last
+   * checkpoint for this same session — mirrors
+   * `ModelUsageTracker.seedFromPersisted()`, which has the identical
+   * in-memory-only, resets-on-restart problem: a process restart mid-session
+   * (sleep, closing a terminal, `claude --resume`, a crash) otherwise
+   * silently discards every diff/test/backtrack/self-correction signal a
+   * now-dead prior process already observed.
+   *
+   * Adds to current counts rather than overwriting, so callers must invoke
+   * this at most once per (re)adopted session id, before any real activity
+   * for that id has reached this tracker.
+   */
+  seedFromPersisted(counts: QualityProxyRawCounts): void {
+    if (counts.totalSignals === 0) return;
+    this.seededCounts = {
+      totalSignals: this.seededCounts.totalSignals + counts.totalSignals,
+      diffApplyCleanCount: this.seededCounts.diffApplyCleanCount + counts.diffApplyCleanCount,
+      diffFailCount: this.seededCounts.diffFailCount + counts.diffFailCount,
+      testPassCount: this.seededCounts.testPassCount + counts.testPassCount,
+      testFailCount: this.seededCounts.testFailCount + counts.testFailCount,
+      backtrackCount: this.seededCounts.backtrackCount + counts.backtrackCount,
+      selfCorrectionCount: this.seededCounts.selfCorrectionCount + counts.selfCorrectionCount,
+    };
+  }
 
-    const totalDiffs = diffApplied + diffFailed;
-    const totalTests = testPass + testFail;
+  // Raw per-session counts only — no derived rates. This is the shape
+  // persisted onto FullSessionSummary.qualityProxy (session-store.ts) so a
+  // session file never stores a stale derived rate; rates are always
+  // recomputed at read time via getMetrics()/combineQualityProxyRawCounts().
+  getRawCounts(): QualityProxyRawCounts {
+    return {
+      totalSignals: this.events.length + this.seededCounts.totalSignals,
+      diffApplyCleanCount:
+        this.countBySignal('diff_applied_clean') + this.seededCounts.diffApplyCleanCount,
+      diffFailCount: this.countBySignal('diff_failed') + this.seededCounts.diffFailCount,
+      testPassCount: this.countBySignal('test_pass') + this.seededCounts.testPassCount,
+      testFailCount: this.countBySignal('test_fail') + this.seededCounts.testFailCount,
+      backtrackCount: this.countBySignal('backtrack') + this.seededCounts.backtrackCount,
+      selfCorrectionCount:
+        this.countBySignal('self_correction') + this.seededCounts.selfCorrectionCount,
+    };
+  }
+
+  getMetrics(): QualityProxyMetrics {
+    const counts = this.getRawCounts();
+    const totalDiffs = counts.diffApplyCleanCount + counts.diffFailCount;
+    const totalTests = counts.testPassCount + counts.testFailCount;
 
     const buckets = this.computeTurnBuckets();
     const degradationDetected = this.detectDegradation(buckets);
 
     return {
-      totalSignals: this.events.length,
-      diffApplyRate: totalDiffs > 0 ? Math.round((diffApplied / totalDiffs) * 1000) / 1000 : null,
-      testPassRate: totalTests > 0 ? Math.round((testPass / totalTests) * 1000) / 1000 : null,
-      backtrackCount,
-      selfCorrectionCount,
+      totalSignals: counts.totalSignals,
+      diffApplyRate:
+        totalDiffs > 0 ? Math.round((counts.diffApplyCleanCount / totalDiffs) * 1000) / 1000 : null,
+      testPassRate:
+        totalTests > 0 ? Math.round((counts.testPassCount / totalTests) * 1000) / 1000 : null,
+      backtrackCount: counts.backtrackCount,
+      selfCorrectionCount: counts.selfCorrectionCount,
       qualityByTurnBucket: buckets,
       degradationDetected,
       events: this.events,
@@ -193,6 +313,7 @@ export class QualityProxyTracker {
     this.lastEditFile = null;
     this.lastEditTurn = 0;
     this.lastEditSuccess = false;
+    this.seededCounts = { ...ZERO_QUALITY_PROXY_COUNTS };
   }
 
   private addEvent(signal: QualitySignal, turnNumber: number, toolName: string): void {
@@ -200,6 +321,10 @@ export class QualityProxyTracker {
     if (this.events.length > this.maxEvents) {
       this.events.shift();
     }
+  }
+
+  private countBySignal(signal: QualitySignal): number {
+    return this.events.filter((e) => e.signal === signal).length;
   }
 
   private computeTurnBuckets(): TurnQualityBucket[] {

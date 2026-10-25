@@ -11,13 +11,21 @@ import { resolve, dirname } from 'node:path';
 import { z } from 'zod';
 
 import { normalizeDeveloperName, ConfigFileSchema, DEFAULT_STORAGE_PATH } from '../config.js';
+import type { Mode } from '../config.js';
 import { migrateStoragePath } from './migrate.js';
-import { runInstallCli, verifyBinaryOnPath, findRepoRoot } from './cli.js';
+import { runInstallCli, verifyBinaryOnPath } from './cli.js';
+import { detectUpdateSupport, findRepoRoot, upgradeCommandFor } from './update-support.js';
 import { writeJsonFile } from './json-utils.js';
 import { installSchedule, installDashboardDaemon, resolveBinaryPath } from './schedule.js';
 import { isWsl, resolveWindowsHome } from './platform.js';
 import { validateLicenseKey, validateApiKey } from './key-validator.js';
 import { getDashboardAddress, waitForHealthyDashboard } from './dashboard-health.js';
+import {
+  REGIONS,
+  getRegion,
+  suggestRegionFromLicenseKey,
+  detectRegionFromLicenseKeyStrict,
+} from './regions.js';
 
 const CONFIG_PATH = resolve(DEFAULT_STORAGE_PATH, 'config.json');
 const ALERT_RULES_DEST = resolve(DEFAULT_STORAGE_PATH, 'alerts', 'rules.json');
@@ -138,7 +146,7 @@ function loadExisting(): Partial<z.infer<typeof ConfigFileSchema>> {
   return filtered;
 }
 
-export type WizardMode = 'cloud' | 'local' | 'both';
+export type WizardMode = Mode;
 
 export function buildConfig(
   existing: Partial<z.infer<typeof ConfigFileSchema>>,
@@ -148,6 +156,7 @@ export function buildConfig(
     developer: string;
     teamId: string | null;
     projectId: string | null;
+    repoUrlEnabled: boolean;
     sessionBudgetUsd: number | null;
     mode?: WizardMode;
     dashboardPort?: number | null;
@@ -159,11 +168,12 @@ export function buildConfig(
   const includeNrCreds = mode !== 'local';
   return {
     ...existing,
-    ...(inputs.mode ? { mode } : {}),
+    mode,
     ...(includeNrCreds ? { accountId: inputs.accountId, licenseKey: inputs.licenseKey } : {}),
     developer: inputs.developer,
     ...(inputs.teamId ? { teamId: inputs.teamId } : {}),
     ...(inputs.projectId ? { projectId: inputs.projectId } : {}),
+    repoUrlEnabled: inputs.repoUrlEnabled,
     ...(inputs.sessionBudgetUsd !== null ? { sessionBudgetUsd: inputs.sessionBudgetUsd } : {}),
     ...(inputs.dashboardPort != null
       ? { dashboard: { port: inputs.dashboardPort, host: '127.0.0.1', openOnStart: false } }
@@ -182,7 +192,19 @@ function parseModeAnswer(raw: string, fallback: WizardMode): WizardMode {
   return fallback;
 }
 
-export async function runSetupWizard(): Promise<void> {
+// Maps the environment prompt's raw answer (numbered menu position, region
+// key, or one of its aliases) to a region key. staging is deliberately
+// unreachable here — see the caller's comment.
+export function resolveEnvironmentChoice(envRaw: string, defaultEnv: string): string {
+  if (envRaw === '' || envRaw === defaultEnv) return defaultEnv;
+  if (envRaw === '1' || envRaw === 'us') return 'us';
+  if (envRaw === '2' || envRaw === 'eu') return 'eu';
+  if (envRaw === '3' || envRaw === 'fedramp' || envRaw === 'gov') return 'gov';
+  if (envRaw === '4' || envRaw === 'jp' || envRaw === 'japan') return 'jp';
+  return defaultEnv;
+}
+
+export async function runSetupWizard(opts: { staging?: boolean } = {}): Promise<void> {
   migrateStoragePath(true);
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   // Safety net: process.exit() bypasses finally blocks but still runs 'exit' handlers.
@@ -261,43 +283,32 @@ export async function runSetupWizard(): Promise<void> {
         process.exit(1);
       }
 
-      // Step 2b: Environment / region
+      // Step 2b: Environment / region. --staging pre-selects the region and
+      // skips this question entirely — staging is never shown in the menu
+      // or matched against typed input; it's reachable only via the flag.
       const existingCollectorHost =
         typeof existing.collectorHost === 'string' ? existing.collectorHost : null;
-      const keyLower = licenseKey.toLowerCase();
-      const autoEnv = keyLower.startsWith('eu01')
-        ? 'eu'
-        : keyLower.startsWith('gov01')
-          ? 'gov'
-          : 'us';
+      const autoEnv = suggestRegionFromLicenseKey(licenseKey);
       const defaultEnv = existingCollectorHost ?? autoEnv;
-      print('Environment:');
-      print('  1) US      — api.newrelic.com');
-      print('  2) EU      — api.eu.newrelic.com');
-      print('  3) FedRAMP — api.newrelic.com (FedRAMP/GovCloud)');
-      const envRaw = (await rl.question(`Which environment? [${defaultEnv}]: `))
-        .trim()
-        .toLowerCase();
-      const resolvedEnv =
-        envRaw === '' || envRaw === defaultEnv
-          ? defaultEnv
-          : envRaw === '1' || envRaw === 'us'
-            ? 'us'
-            : envRaw === '2' || envRaw === 'eu'
-              ? 'eu'
-              : envRaw === '3' || envRaw === 'fedramp' || envRaw === 'gov'
-                ? 'gov'
-                : defaultEnv;
+      let resolvedEnv: string;
+      if (opts.staging) {
+        resolvedEnv = 'staging';
+        print('Environment: Staging (--staging flag)');
+      } else {
+        print('Environment:');
+        const menuLabelWidth = Math.max(...REGIONS.map((r) => r.menuLabel.length));
+        REGIONS.forEach((region, i) => {
+          print(`  ${i + 1}) ${region.menuLabel.padEnd(menuLabelWidth)} — ${region.displayHost}`);
+        });
+        const envRaw = (await rl.question(`Which environment? [${defaultEnv}]: `))
+          .trim()
+          .toLowerCase();
+        resolvedEnv = resolveEnvironmentChoice(envRaw, defaultEnv);
+      }
       collectorHost = resolvedEnv === 'us' ? null : resolvedEnv;
 
       // Warn if license key prefix contradicts selected environment.
-      const keyRegion = keyLower.startsWith('eu01')
-        ? 'eu'
-        : keyLower.startsWith('gov01')
-          ? 'gov'
-          : keyLower.startsWith('us01')
-            ? 'us'
-            : null;
+      const keyRegion = detectRegionFromLicenseKeyStrict(licenseKey);
       if (keyRegion && keyRegion !== resolvedEnv) {
         print(
           `  ⚠ Your license key looks like a ${keyRegion.toUpperCase()} key but you selected ${resolvedEnv.toUpperCase()}. Verify this is intentional.`,
@@ -401,6 +412,24 @@ export async function runSetupWizard(): Promise<void> {
     ).trim();
     const projectId = projectIdAnswer || existingProjectId;
 
+    const existingRepoUrlEnabled =
+      typeof existing.repoUrlEnabled === 'boolean' ? existing.repoUrlEnabled : true;
+    const repoUrlDefaultLabel = existingRepoUrlEnabled ? 'Y/n' : 'y/N';
+    const repoUrlAnswer = (
+      await rl.question(
+        `Send full repo URL (repo_url) — more sensitive than Project ID, may reveal an internal git host [${repoUrlDefaultLabel}]: `,
+      )
+    )
+      .trim()
+      .toLowerCase();
+    // Adaptive default: when the shown default is Y (existing/initial true),
+    // only an explicit decline flips it off — matching every other [Y/n]
+    // prompt in this wizard (e.g. installHooks below). When the shown
+    // default is N, only an explicit accept flips it on.
+    const repoUrlEnabled = existingRepoUrlEnabled
+      ? repoUrlAnswer !== 'n' && repoUrlAnswer !== 'no'
+      : repoUrlAnswer === 'y' || repoUrlAnswer === 'yes';
+
     // Step 5: Budget caps
     const existingBudget =
       typeof existing.sessionBudgetUsd === 'number' ? String(existing.sessionBudgetUsd) : null;
@@ -458,6 +487,7 @@ export async function runSetupWizard(): Promise<void> {
       developer,
       teamId,
       projectId,
+      repoUrlEnabled,
       sessionBudgetUsd,
       mode,
       dashboardPort,
@@ -577,6 +607,40 @@ export async function runSetupWizard(): Promise<void> {
       }
     }
 
+    // Step 6c: Copilot hook install (GitHub Copilot CLI + VS Code Copilot Chat)
+    // Always asked, unconditionally — mirrors the Claude Code hooks question
+    // above exactly. Independent of mode, matching that question's own
+    // independence from mode: hook-based tool-call capture works the same
+    // regardless of where telemetry ships.
+    //
+    // Unlike the Claude step above, credentials ARE passed here even though
+    // config.json already has them — the Copilot CLI's own `copilot mcp add`
+    // bakes the literal license key/account ID into Copilot's own MCP
+    // config, which is separate from and doesn't read our config.json.
+    const installCopilotHooks = (
+      await rl.question(
+        '\nInstall GitHub Copilot hooks now? Configures both the Copilot CLI and VS Code Copilot Chat [Y/n]: ',
+      )
+    )
+      .trim()
+      .toLowerCase();
+    if (installCopilotHooks !== 'n' && installCopilotHooks !== 'no') {
+      print('\nRunning Copilot installer...');
+      const copilotInstallArgs = ['install', '--copilot'];
+      if (mode !== 'local' && licenseKey && accountId) {
+        copilotInstallArgs.push('--license-key', licenseKey, '--account-id', accountId);
+      }
+      try {
+        await runInstallCli(copilotInstallArgs);
+        print('Copilot hooks installed.');
+      } catch {
+        // handleCopilotInstall already printed the specific error. Set exit
+        // code and continue — daemon, schedule, and dashboard steps do not
+        // depend on Copilot hook installation.
+        process.exitCode = 1;
+      }
+    }
+
     // Step 6b: Always-on background dashboard daemon
     if ((mode === 'local' || mode === 'both') && process.platform === 'darwin') {
       const binaryPath = resolveBinaryPath();
@@ -644,7 +708,14 @@ export async function runSetupWizard(): Promise<void> {
     }
 
     // Step 7: Auto-update schedule (macOS only)
-    if (process.platform === 'darwin') {
+    const updateSupport = process.platform === 'darwin' ? detectUpdateSupport() : null;
+    if (updateSupport !== null && !updateSupport.supported) {
+      print(
+        updateSupport.blocker === 'no-git'
+          ? '\n  ℹ Auto-update needs git on PATH. Install git (https://git-scm.com), then run: preflight schedule --time HH:MM'
+          : `\n  ℹ Auto-update needs a source clone. To upgrade, run: ${upgradeCommandFor(updateSupport.blocker)}`,
+      );
+    } else if (updateSupport !== null) {
       const enableUpdate = (await rl.question('\nEnable daily auto-updates? [Y/n]: '))
         .trim()
         .toLowerCase();
@@ -680,7 +751,8 @@ export async function runSetupWizard(): Promise<void> {
 
     // Step 8: Dashboard deploy — show manual command
     if (mode !== 'local') {
-      const regionFlag = collectorHost === 'eu' ? ' --eu' : '';
+      const regionCliFlag = getRegion(collectorHost ?? 'us').cliFlag;
+      const regionFlag = regionCliFlag ? ` ${regionCliFlag}` : '';
       // Mask the API key in printed commands — users copy these snippets to
       // terminals, docs, and chat messages, and the raw key could be captured.
       const apiKeyVar = nrApiKey

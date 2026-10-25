@@ -11,7 +11,9 @@ import { CostTracker } from '../metrics/cost-tracker.js';
 import { BudgetTracker } from '../metrics/budget-tracker.js';
 import { ContextWindowTracker } from '../metrics/context-window-tracker.js';
 import { TaskDetector } from '../metrics/task-detector.js';
+import { TurnCostAttributor } from '../metrics/turn-cost-attributor.js';
 import { SessionStore } from '../storage/session-store.js';
+import { GenericMcpAdapter } from '../platforms/generic-mcp-adapter.js';
 import { FeedbackCollector } from './workflow-tools.js';
 import {
   handleGetSessionStats,
@@ -23,7 +25,7 @@ import {
 } from './session-stats.js';
 import type { ConfigSummary, ToolRegistrationOptions } from './session-stats.js';
 import type { HeadlessInstallResult } from '../install/headless-install.js';
-import type { ToolCallRecord } from '../storage/types.js';
+import type { ToolCallRecord, TokenEvent } from '../storage/types.js';
 import type { WeeklySummaryGenerator } from '../storage/weekly-summary.js';
 import type { TrendAnalyzer } from '../metrics/trend-analyzer.js';
 import type { CollaborationProfiler } from '../metrics/collaboration-profile.js';
@@ -137,6 +139,29 @@ describe('handleGetSessionStats()', () => {
     const stats = JSON.parse(result.content[0].text);
 
     expect(stats.avg_tool_duration_ms).toBe(0);
+  });
+
+  it('surfaces session_name (redacted), session_name_source, and session_intent (redacted)', () => {
+    const tracker = new SessionTracker('name-session');
+    // Names/intent can contain secret-shaped text; the tool boundary must redact
+    // both before they leave the process.
+    tracker.setAuthoritativeName('proj AKIAIOSFODNN7EXAMPLE', 'ai-title');
+    tracker.setSessionIntent('deploy with AKIAIOSFODNN7EXAMPLE now');
+
+    const stats = JSON.parse(handleGetSessionStats(tracker).content[0].text);
+
+    expect(stats.session_name_source).toBe('ai-title');
+    expect(stats.session_name).not.toContain('AKIAIOSFODNN7EXAMPLE');
+    expect(stats.session_name).toContain('[REDACTED]');
+    expect(stats.session_intent).not.toContain('AKIAIOSFODNN7EXAMPLE');
+    expect(stats.session_intent).toContain('[REDACTED]');
+  });
+
+  it('reports null session_name_source and session_intent when unset', () => {
+    const tracker = new SessionTracker('bare-session');
+    const stats = JSON.parse(handleGetSessionStats(tracker).content[0].text);
+    expect(stats.session_name_source).toBeNull();
+    expect(stats.session_intent).toBeNull();
   });
 });
 
@@ -265,6 +290,31 @@ describe('handleHealth()', () => {
     expect(data.hooks_installed).toBe(false);
     expect(data.setup_required).toBe(true);
   });
+
+  it('omits event_send_status when eventSendHealth is not provided', () => {
+    const result = handleHealth({});
+    const data = JSON.parse(result.content[0].text);
+    expect('event_send_status' in data).toBe(false);
+    expect('consecutive_event_send_failures' in data).toBe(false);
+  });
+
+  it('reports event_send_status "ok" when there are no consecutive failures', () => {
+    const result = handleHealth({
+      eventSendHealth: { consecutiveFailures: 0, lastFailureAt: null, lastSuccessAt: Date.now() },
+    });
+    const data = JSON.parse(result.content[0].text);
+    expect(data.event_send_status).toBe('ok');
+    expect(data.consecutive_event_send_failures).toBe(0);
+  });
+
+  it('reports event_send_status "failing" when there are consecutive failures', () => {
+    const result = handleHealth({
+      eventSendHealth: { consecutiveFailures: 3, lastFailureAt: Date.now(), lastSuccessAt: null },
+    });
+    const data = JSON.parse(result.content[0].text);
+    expect(data.event_send_status).toBe('failing');
+    expect(data.consecutive_event_send_failures).toBe(3);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -282,6 +332,7 @@ function makeConfigSummary(overrides?: Partial<ConfigSummary>): ConfigSummary {
     storagePath: '/home/alice/.newrelic-preflight',
     dashboardUrl: 'http://127.0.0.1:9847',
     configFilePath: '/home/alice/.newrelic-preflight/config.json',
+    companionMode: false,
     ...overrides,
   };
 }
@@ -867,6 +918,7 @@ describe('registerPendingTools()', () => {
       storagePath: '/tmp/x',
       dashboardUrl: 'http://127.0.0.1:7777',
       configFilePath: '/tmp/x/config.json',
+      companionMode: false,
     };
     registerPendingTools(server.server, {
       sessionStartMs: Date.now(),
@@ -982,6 +1034,58 @@ describe('MCP protocol integration — direct registerTools() dispatch', () => {
     expect(body.forecastEndOfDayUsd).toBeGreaterThanOrEqual(0);
   });
 
+  // Regression: nr_observe_get_cost_per_tool calls TurnCostAttributor
+  // .getMetrics() with no argument, so a process-wide MCP tool with no
+  // single session in view must get a real aggregate across every session
+  // the tracker has seen — not whichever single session happened to be
+  // touched most recently.
+  it('nr_observe_get_cost_per_tool aggregates across every session when called with no session filter', async () => {
+    const turnCostAttributor = new TurnCostAttributor();
+    turnCostAttributor.recordToolCall(
+      makeRecord({ sessionId: 'session-a', toolUseId: 'a-1', toolName: 'Read', timestamp: 1000 }),
+    );
+    turnCostAttributor.recordTokenEvent({
+      mode: 'token',
+      timestamp: 1100,
+      inputTokens: 1_000,
+      outputTokens: 100,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      model: 'claude-sonnet-4',
+      sessionId: 'session-a',
+    } as TokenEvent);
+    turnCostAttributor.recordToolCall(
+      makeRecord({ sessionId: 'session-b', toolUseId: 'b-1', toolName: 'Write', timestamp: 5000 }),
+    );
+    turnCostAttributor.recordTokenEvent({
+      mode: 'token',
+      timestamp: 5100,
+      inputTokens: 2_000,
+      outputTokens: 200,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      model: 'claude-sonnet-4',
+      sessionId: 'session-b',
+    } as TokenEvent);
+
+    await connectDirect({ turnCostAttributor });
+
+    const result = await client.callTool({ name: 'nr_observe_get_cost_per_tool', arguments: {} });
+    expect(result.isError).toBeUndefined();
+    const body = JSON.parse((result.content as Array<{ text: string }>)[0].text);
+
+    // Both sessions' turns and cost are present — a "most recently touched
+    // session" fallback would have returned only session-b's data here.
+    expect(body.turns).toHaveLength(2);
+    expect(body.totalAttributedCost).toBeGreaterThan(0);
+    expect(body.totalAttributedCost).toEqual(
+      turnCostAttributor.getMetrics('session-a').totalAttributedCost +
+        turnCostAttributor.getMetrics('session-b').totalAttributedCost,
+    );
+    expect(body.costByToolType['Read']).toBeDefined();
+    expect(body.costByToolType['Write']).toBeDefined();
+  });
+
   it('nr_observe_get_session_history silently coerces a numeric "since" (documented as an ISO string) via new Date(number) instead of rejecting it', async () => {
     const sessionStore = new SessionStore({ storagePath: tmpDir });
     await connectDirect({ sessionStore });
@@ -1044,5 +1148,83 @@ describe('MCP protocol integration — direct registerTools() dispatch', () => {
     const body = JSON.parse((result.content as Array<{ text: string }>)[0].text);
     expect(body).toEqual(contextWindowTracker.getMetrics());
     expect(body.repeatedReadCount).toBe(1);
+  });
+
+  it('tools/list omits generic-mcp report tools when genericMcpAdapter is absent', async () => {
+    await connectDirect({});
+    const result = await client.listTools();
+    const names = result.tools.map((t) => t.name);
+    expect(names).not.toContain('nr_observe_report_tool_call');
+    expect(names).not.toContain('nr_observe_report_session_start');
+    expect(names).not.toContain('nr_observe_report_session_end');
+  });
+
+  it('tools/list includes generic-mcp report tools when genericMcpAdapter is provided', async () => {
+    await connectDirect({ genericMcpAdapter: new GenericMcpAdapter() });
+    const result = await client.listTools();
+    const names = result.tools.map((t) => t.name);
+    expect(names).toContain('nr_observe_report_tool_call');
+    expect(names).toContain('nr_observe_report_session_start');
+    expect(names).toContain('nr_observe_report_session_end');
+  });
+
+  it('calling nr_observe_report_tool_call records to SessionTracker and NrIngestManager', async () => {
+    const sessionTracker = new SessionTracker('gm-sess');
+    const ingestToolCall = jest.fn();
+    await connectDirect({
+      genericMcpAdapter: new GenericMcpAdapter(),
+      sessionTracker,
+      nrIngestManager: { ingestToolCall },
+      sessionTraceId: 'gm-sess',
+    });
+
+    const result = await client.callTool({
+      name: 'nr_observe_report_tool_call',
+      arguments: { tool: 'Read', success: true, duration_ms: 12 },
+    });
+
+    expect(result.isError).toBeUndefined();
+    const body = JSON.parse((result.content as Array<{ text: string }>)[0].text);
+    expect(body.recorded).toBe(true);
+    expect(body.tool).toBe('Read');
+    expect(sessionTracker.getMetrics().toolCallCount).toBe(1);
+    expect(ingestToolCall).toHaveBeenCalledTimes(1);
+  });
+
+  it('calling nr_observe_report_tool_call with invalid input returns an error, not a thrown exception', async () => {
+    await connectDirect({ genericMcpAdapter: new GenericMcpAdapter() });
+    const result = await client.callTool({
+      name: 'nr_observe_report_tool_call',
+      arguments: { success: true },
+    });
+    expect(result.isError).toBe(true);
+    const body = JSON.parse((result.content as Array<{ text: string }>)[0].text);
+    expect(body.error).toBe('Missing required field: tool');
+  });
+
+  it('calling nr_observe_report_session_start updates adapter session metadata', async () => {
+    const adapter = new GenericMcpAdapter();
+    await connectDirect({ genericMcpAdapter: adapter });
+
+    const result = await client.callTool({
+      name: 'nr_observe_report_session_start',
+      arguments: { platform: 'my-custom-ide', model: 'gpt-4o' },
+    });
+
+    expect(result.isError).toBeUndefined();
+    const body = JSON.parse((result.content as Array<{ text: string }>)[0].text);
+    expect(body.platform).toBe('my-custom-ide');
+    expect(adapter.getSessionMetadata().model).toBe('gpt-4o');
+  });
+
+  it('calling nr_observe_report_session_end acknowledges without requiring arguments', async () => {
+    await connectDirect({ genericMcpAdapter: new GenericMcpAdapter() });
+    const result = await client.callTool({
+      name: 'nr_observe_report_session_end',
+      arguments: {},
+    });
+    expect(result.isError).toBeUndefined();
+    const body = JSON.parse((result.content as Array<{ text: string }>)[0].text);
+    expect(body.recorded).toBe(true);
   });
 });

@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { calculateCost } from '../shared/index.js';
 import { SubagentTimelineStore } from './subagent-timeline-store.js';
 
 const STDERR_WRITE = process.stderr.write;
@@ -95,6 +96,51 @@ describe('SubagentTimelineStore', () => {
     // Window spans all agents.
     expect(result.window.startMs).toBe(agent.startMs);
     expect(result.window.endMs).toBe(agent.endMs);
+  });
+
+  it('prices each turn on its own so summed cache reads do not cross a tier threshold', () => {
+    // 5 turns x 30K cache read: no single request passes claude-haiku-5-5's
+    // 100K tier, but the 150K sum would.
+    const lines = [0, 1, 2, 3, 4].map((i) =>
+      assistantLine({
+        timestamp: `2026-06-16T12:00:0${i}.000Z`,
+        model: 'claude-haiku-5-5',
+        input: 1_000,
+        output: 1_000,
+        cacheRead: 30_000,
+      }),
+    );
+    writeFileSync(join(subDir, `agent-${AGENT_A}.jsonl`), lines.join('\n') + '\n');
+
+    const store = new SubagentTimelineStore({ projectsDir });
+    const agent = store.getSubagentsForSession(SESSION).agents[0]!;
+
+    const perTurn = calculateCost('claude-haiku-5-5', {
+      inputTokens: 1_000,
+      outputTokens: 1_000,
+      thinkingTokens: 0,
+      cacheReadTokens: 30_000,
+      cacheCreationTokens: 0,
+      totalTokens: 32_000,
+    }).totalUsd;
+    expect(agent.usd).toBeCloseTo(perTurn * 5, 10);
+  });
+
+  it('includes a named-subagent transcript (Agent tool `name` param spawn shape)', () => {
+    // Claude Code writes `agent-a<name>-<16-hex>.jsonl` for a subagent spawned
+    // with an explicit `name` param — distinct from the plain `a<16-hex>` shape
+    // used by anonymous Task spawns (AGENT_A/AGENT_B/WF_AGENT above).
+    const namedAgentId = 'aconfluence-istio-investigator-ca0143b626a86424';
+    writeFileSync(
+      join(subDir, `agent-${namedAgentId}.jsonl`),
+      assistantLine({ timestamp: '2026-06-16T12:00:00.000Z', input: 10, output: 5 }) + '\n',
+    );
+
+    const store = new SubagentTimelineStore({ projectsDir });
+    const result = store.getSubagentsForSession(SESSION);
+
+    expect(result.agents).toHaveLength(1);
+    expect(result.agents[0]!.agentId).toBe(namedAgentId);
   });
 
   it('dedups streaming-duplicate lines sharing one message.id (counts the turn once)', () => {
@@ -253,6 +299,52 @@ describe('SubagentTimelineStore', () => {
     expect(result.agents).toHaveLength(1);
     expect(result.agents[0]!.turnCount).toBe(2);
     expect(result.agents[0]!.totalTokens).toBe(10 + 5 + 20 + 5);
+  });
+
+  it('rejects a line with no timestamp field (no Date.now() fallback, unlike SubagentWatcher)', () => {
+    const lineWithNoTimestamp = JSON.stringify({
+      type: 'assistant',
+      uuid: 'u-no-ts',
+      message: {
+        id: 'msg-no-ts',
+        model: KNOWN_MODEL,
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
+    });
+    writeFileSync(
+      join(subDir, `agent-${AGENT_A}.jsonl`),
+      [
+        assistantLine({ timestamp: '2026-06-16T12:00:00.000Z', input: 20, output: 5 }),
+        lineWithNoTimestamp,
+      ].join('\n') + '\n',
+    );
+
+    const store = new SubagentTimelineStore({ projectsDir });
+    const result = store.getSubagentsForSession(SESSION);
+    expect(result.agents).toHaveLength(1);
+    // Only the line WITH a timestamp counts; the other is silently rejected.
+    expect(result.agents[0]!.turnCount).toBe(1);
+    expect(result.agents[0]!.totalTokens).toBe(20 + 5);
+  });
+
+  it('accepts a line with no model field, defaulting to "" (unlike SubagentWatcher, which rejects)', () => {
+    const lineWithNoModel = JSON.stringify({
+      type: 'assistant',
+      timestamp: '2026-06-16T12:00:00.000Z',
+      uuid: 'u-no-model',
+      message: {
+        id: 'msg-no-model',
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
+    });
+    writeFileSync(join(subDir, `agent-${AGENT_A}.jsonl`), lineWithNoModel + '\n');
+
+    const store = new SubagentTimelineStore({ projectsDir });
+    const result = store.getSubagentsForSession(SESSION);
+    expect(result.agents).toHaveLength(1);
+    expect(result.agents[0]!.turnCount).toBe(1);
+    expect(result.agents[0]!.model).toBe('');
+    expect(result.agents[0]!.totalTokens).toBe(10 + 5);
   });
 
   it('skips files larger than the 64 MiB cap', () => {

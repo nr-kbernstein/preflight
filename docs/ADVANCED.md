@@ -1,3 +1,8 @@
+---
+title: Advanced Configuration
+description: Power-user features — OTLP export, proxy mode, local alerts, per-developer alerts, session backfill, and Terraform deployment.
+---
+
 # NR AI Coding Observability: Preflight — Advanced Configuration
 
 Power-user features: OTLP export, proxy mode, local alerts, per-developer alerts, session backfill, and Terraform deployment.
@@ -42,7 +47,7 @@ export NEW_RELIC_AI_TRANSPORT=both
 
 ## Inbound OTLP Receiver (Proxy Mode)
 
-When running in proxy mode, you can also enable an **inbound OTLP receiver** that acts as a local OpenTelemetry Collector. Any OTel-instrumented app pointing at `http://localhost:4318` will have its telemetry enriched with the current coding session context (`ai.session.id`, `ai.developer`, `ai.project_id`) and forwarded to NR, linking application traces to the AI session that produced them. **This enrichment only applies to JSON-encoded OTLP payloads** — most production OTel SDKs (Node, Python, Java) default to protobuf, which is forwarded unmodified without enrichment; see the note below.
+When running in proxy mode, you can also enable an **inbound OTLP receiver** that acts as a local OpenTelemetry Collector. Any OTel-instrumented app pointing at `http://localhost:4318` will have its telemetry enriched with the current coding session context (`ai.session.id`, `ai.developer`, `ai.project_id`, and `ai.team_id` when `teamId` is configured) and forwarded to NR, linking application traces to the AI session that produced them. Both JSON and protobuf OTLP/HTTP payloads are enriched. Protobuf payloads are decoded and re-encoded through a vendored schema descriptor (`src/proxy/otlp-descriptor.ts`), which carries one caveat: a sender running a newer OTLP schema than the descriptor's vintage (opentelemetry-proto @ dfd0b0e) loses any fields the descriptor does not know about during re-encoding. The JSON path has no such limit. The descriptor file's header documents the exact regeneration command.
 
 Add to `~/.newrelic-preflight/config.json`:
 
@@ -72,13 +77,225 @@ export NR_AI_OTLP_FORWARD_HEADERS="api-key=your-license-key"
 | `otlpForwardEndpoint`     | Where enriched payloads are forwarded. Set to `null` to receive and enrich only.                                                                                                                                                                                                                                                          | `https://otlp.nr-data.net` (when `licenseKey` is set) |
 | `otlpForwardHeaders`      | HTTP headers added to every forwarded request                                                                                                                                                                                                                                                                                             | `{ "api-key": <licenseKey> }`                         |
 
-Point your application's OTel SDK at `http://localhost:4318`. JSON OTLP payloads are enriched; protobuf payloads are forwarded as-is.
+Point your application's OTel SDK at `http://localhost:4318`. JSON and protobuf OTLP payloads are both enriched. A payload that fails to decode is forwarded unmodified rather than dropped, and protobuf senders on a newer OTLP schema are subject to the descriptor-vintage caveat above.
+
+---
+
+## OTLP Config Field Names and Legacy Compatibility
+
+The fields above (`otlpEndpoint`, `otlpHeaders`, `transport`, `otlpReceiverEnabled`, `otlpReceiverPort`, `otlpReceiverBindAddress`, `otlpForwardEndpoint`, `otlpForwardHeaders`) are the legacy flat top-level keys. On the resolved `McpServerConfig` (in code), all 8 live nested under an `otlp: {...}` object instead — matching the `dashboard`/`alerts` nesting precedent (e.g. `otlp.endpoint`, `otlp.receiverEnabled`).
+
+The config-file schema (`ConfigFileSchema`) still accepts the flat legacy keys shown above for backward compatibility — using one logs a deprecation warning naming the specific legacy keys consulted (`pickOtlpValue()` in `loadMcpConfig()`). Env var names are unchanged either way.
+
+`configVersion` (optional, defaults to `1`) is a config-file-only field with no env var or CLI flag — it exists purely as a documented convention (`CURRENT_CONFIG_VERSION` in `src/config.ts`) to bump when a future change to `config.json`'s shape is non-additive (a field renamed, moved, or removed), so a migration path has something to branch on. Every change to date, including the `otlp` nesting above, has been additive.
+
+---
+
+## Cost / Pricing Corrections
+
+Every dollar figure Preflight reports — session cost, budget-threshold alerts, cost-per-outcome, everything downstream of `CostTracker` — is computed the same way regardless of how your organization is actually billed: `tokens × Preflight's own vendored public list-price table`. Two config options narrow that gap, and one config option (already existing, undocumented until now) lets you close it exactly:
+
+**`customPricingFile`** (env: `NEW_RELIC_AI_CUSTOM_PRICING_FILE`): path to a JSON file of `{ "model-id": { "inputPerMTok": ..., "outputPerMTok": ..., ... } }` entries (see `ModelPricing` in `src/shared/pricing.ts`) that fully replaces the vendored table for the models it lists. If your organization has contracted per-model rates, enter them here model-by-model and Preflight reports at your real rate, no multiplier needed. Mutually exclusive with the bundled gap-fill pricing overlay — see the doc comment on `applyPricingOverlay()` in `src/metrics/pricing-overlay.ts`.
+
+**Model name matching.** Preflight strips Bedrock system inference-profile ARNs (`arn:aws:bedrock:<region>:<account>:inference-profile/us.anthropic.claude-sonnet-4-6`, `arn:aws:bedrock:<region>::foundation-model/...`) and a leading `<provider>/` segment (`bedrock/claude-sonnet-4-6`) down to the embedded model id before looking up a price. Application inference profile ARNs and names your gateway invents (`gw-claude-sonnet`) say nothing about the model behind them, so they price at $0 until you map them. Add an `aliases` object to the custom pricing file:
+
+```json
+{
+  "aliases": {
+    "gw-claude-sonnet": "claude-sonnet-4-6",
+    "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123xyz": "claude-sonnet-4-6"
+  }
+}
+```
+
+An alias reuses the target model's rates, so there is no rate table to keep current. The target must be a model Preflight can price, either built in or defined by a rate entry in the same file. An alias to an unknown model is logged once at startup and ignored. A file may hold only `aliases`, only rate entries, or both. A file with only `aliases` keeps the bundled gap-fill overlay, so an alias can target a model the overlay prices; a file with any rate entries replaces the overlay as before. Models that still cannot be priced are listed in `unpriced_models` in the `nr_observe_get_cost_breakdown` response.
+
+**`pricingRefresh`** (env: `NEW_RELIC_AI_PRICING_REFRESH`, default `true`): fetches LiteLLM's community price file in the background at server start, caches it at `<storagePath>/pricing-cache.json`, and refetches at a later start once the cache is a day old. It prices models the bundled table, the pricing overlay, and `customPricingFile` do not resolve, by exact model ID only, and takes precedence over family estimates. Set it to `false` to make no request and read or write no cache file. `highSecurity=true` forces it off.
+
+**`costRateMultiplier`** (env: `NEW_RELIC_AI_COST_RATE_MULTIPLIER`): a flat discount factor, `0 < x ≤ 1`, applied to every dollar figure `CostTracker` computes — a cheaper alternative to `customPricingFile` when you have a single blended discount off list price rather than distinct per-model contracted rates. Mirrors the semantics of Claude Code's own `modelPricing.multiplier` managed setting.
+
+```json
+{
+  "costRateMultiplier": 0.85
+}
+```
+
+**`dataResidencyPremium`** (env: `NEW_RELIC_AI_DATA_RESIDENCY_PREMIUM`, boolean): applies the same 1.1× US-only-inference premium Claude Code itself applies for data-residency workspaces ([pricing docs](https://platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing)). Combines multiplicatively with `costRateMultiplier` when both are set.
+
+Both are resolved once at startup into a single combined factor passed to `CostTracker`'s constructor, and every downstream consumer — `ModelUsageTracker`, `BudgetTracker`'s threshold alerts, day/task/workflow-run cost buckets — inherits the correction automatically, since they all read from the same `CostBreakdown` this factor scales. `nr_observe_get_cost_breakdown` reports the factor actually in effect as `rate_multiplier_applied` (see [COMMANDS_TABLE.md](./COMMANDS_TABLE.md)) so a consumer can tell whether a figure is still raw list price.
+
+**What this doesn't do:** Preflight does not read Claude Code's own `modelPricing` managed setting automatically. That setting is Managed-only scope, delivered through one of four mechanisms (server-managed settings from the claude.ai console, MDM/OS policy, a `managed-settings.json` file, or a policy helper program) — only one of which is a static file at a documented path, and by default only the single highest-priority source that's actually present is the one in effect. Reading the file unconditionally would risk silently applying a stale or overridden rate whenever a different mechanism is the one Claude Code actually selected. If you know your organization's contracted rate, enter it directly via `costRateMultiplier` or `customPricingFile` instead — the same numbers you'd put in Claude Code's own `modelPricing.overrides`/`multiplier` (see [Report spend at your contracted rates](https://code.claude.com/docs/en/costs#report-spend-at-your-contracted-rates)) work here too.
+
+Similarly, Preflight cannot detect the data-residency premium per-response the way Claude Code's own `/usage` figure does (that requires seeing which specific API responses were billed at the residency rate, which no hook or event exposes) — `dataResidencyPremium` is an explicit opt-in flag for "always apply 1.1×," not automatic detection.
+
+---
+
+## Companion Mode (Running Alongside Claude Code's Built-in OTel)
+
+Claude Code has its own built-in OTel export for cost, tokens, lines-of-code, and session-time metrics. Preflight's `session_id` equals that export's `session.id` for Claude Code sessions, so the two streams join cleanly — which also means an org that enables both, feeding them into one blended "org AI spend" dashboard, roughly doubles the true cost and token counts. `companionMode` exists to stop that without losing either signal.
+
+Companion mode turns on by itself when Preflight sees Claude Code's OTel metrics export going to New Relic. It checks the environment Claude Code passes to the MCP server: `CLAUDE_CODE_ENABLE_TELEMETRY` is on, `OTEL_METRICS_EXPORTER` includes `otlp`, and the OTLP endpoint (`OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, else `OTEL_EXPORTER_OTLP_ENDPOINT`) is an `nr-data.net` host. An export to any other backend, or through a collector on another host, is not detected. Set companion mode explicitly in those cases.
+
+An explicit setting always wins over detection. In `~/.newrelic-preflight/config.json`:
+
+```json
+{
+  "companionMode": true
+}
+```
+
+Or in the environment:
+
+```bash
+export NR_AI_COMPANION_MODE=false
+```
+
+`preflight doctor` shows the resolved value and where it came from, using the environment of the shell it runs in. If Claude Code's OTel settings come from its own settings `env` rather than your shell, doctor can report `false (source: default)` while the MCP server detected the export and resolved `true`.
+
+| Setting         | What it does                                                       | Default                                                               |
+| --------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| `companionMode` | Suppresses `ai.cost.*` gauges and tags cost-bearing events (below) | `true` when Claude Code's OTel export goes to New Relic, else `false` |
+
+With `companionMode: true`:
+
+- **Suppressed** — the whole `ai.cost.*` gauge family (`session_total_usd`, `tokens_input`/`tokens_output`/`tokens_thinking`/`tokens_cache_read`/`tokens_cache_creation`, `cache_savings_usd`, `cost_per_line_of_code`, `cost_per_file_modified`, `report_count`, `estimation_count`, `subagent_usd`, `parent_usd`) is not emitted from `emitSessionGauges()`. Gauges carry no per-datapoint platform attribute, so suppression is the only way to stop the blended-dashboard double-count — there's no field to tag instead.
+- **Tagged, not dropped** — cost-bearing events keep every field they'd normally carry and gain `cost_authority: 'external'`: `AiCodingTask` (when the task's `platform` is `claude-code` — a task from another platform has no OTel twin, so it's left untagged), `AiTurnCost` (when the turn's `platform` is `claude-code` for the same reason), `AiSubagentTurn`, and `AiWorkflowRun` (both are always derived from a Claude Code transcript, so they're tagged unconditionally whenever companion mode is on).
+- **Unchanged** — everything else: task detection, efficiency scoring, anti-pattern detection, the audit trail, context tracking, MCP proxy metrics, and git outcome counts keep flowing normally and are never double-counted. Claude Code's OTel export carries repository and commit identity rather than counts; see [Repository identity across both streams](#repository-identity-across-both-streams). The local dashboard and budget tracking are unaffected too — both read `CostTracker`'s own totals directly, never the exported gauges.
+
+For a blended deployment, treat each signal's canonical source this way:
+
+| Signal                                                                                       | Canonical source                                                                                        |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| Cost / tokens                                                                                | Claude Code's OTel export                                                                               |
+| Tasks, efficiency, anti-patterns, audit, context, MCP proxy, git outcome counts (`ai.git.*`) | Preflight                                                                                               |
+| Commit identity (SHA, branch)                                                                | Claude Code's OTel export, `vcs.ref.head.*` on `git commit` tool results with `OTEL_LOG_TOOL_DETAILS=1` |
+
+Because cost-bearing fields are tagged rather than removed, reconciliation is still possible — a query that needs Preflight's cost breakdown for some other purpose can filter to `cost_authority = 'external'` and cross-reference against the OTel-sourced total, joined on `session_id` / `session.id`.
+
+### Repository identity across both streams
+
+Claude Code v2.1.269 and later tags its metrics and events with `vcs.repository.url.full`, `vcs.owner.name`, `vcs.repository.name`, and `vcs.provider.name` when `OTEL_METRICS_INCLUDE_REPOSITORY=true` (default `false`). It derives them once per session from the `origin` remote, lowercases the values, and strips credentials.
+
+Preflight's `project_id` carries the same fact in a different shape. When no `projectId` is configured, `projectIdFromRemote()` in `src/lib/git-remote.ts` takes the last two path segments of `git remote get-url origin` with case preserved, or the lone segment of a one-segment path such as a Gerrit or gitolite remote, and never the host. So a checkout of `https://github.com/NewRelic-Experimental/preflight` reports `project_id = 'NewRelic-Experimental/preflight'` to Preflight and `vcs.owner.name = 'newrelic-experimental'` plus `vcs.repository.name = 'preflight'` to Claude Code's export. The two fields do not string-match, and NRQL has no case-folding function to bridge them. Join on the session id instead and facet Preflight's events by the repository Claude Code reported:
+
+```sql
+FROM AiCodingTask
+  JOIN (FROM Log SELECT latest(`vcs.repository.url.full`) AS repo WHERE `vcs.repository.url.full` IS NOT NULL FACET `session.id` LIMIT MAX)
+  ON session_id = `session.id`
+SELECT count(*) FACET repo
+```
+
+The join also sidesteps GitLab subgroups, where `vcs.owner.name` holds the full group path while `project_id` keeps only the last two segments, so a repo at `group/subgroup/repo` is `group/subgroup` plus `repo` on the Claude Code side and `subgroup/repo` on the Preflight side.
+
+If Claude Code's OTLP export points at Preflight's inbound receiver, the `vcs.*` keys reach New Relic untouched alongside the `ai.session.id`, `ai.developer`, `ai.project_id`, and `ai.team_id` enrichment keys. The receiver appends only the keys it does not find and never renames, drops, or overwrites an attribute the sender set. It speaks HTTP/1.1 only, so gRPC never reaches it. Set `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` or `http/protobuf` on the Claude Code side.
+
+Commit identity lives only in Claude Code's stream. With `OTEL_LOG_TOOL_DETAILS=1`, a successful `git commit` run through the Bash or PowerShell tool adds `vcs.ref.head.revision` (the SHA), `vcs.ref.head.name` (the branch), and `vcs.ref.head.type` to that `claude_code.tool_result` event. Preflight's `ai.git.commit_count`, `ai.git.push_count`, `ai.git.force_push_count`, `ai.git.pr_created`, and `ai.git.pr_merged` gauges count commits, pushes, force-pushes, and PRs but never carry a SHA or branch. The two do not overlap, and companion mode changes neither.
+
+One consequence to plan for: two of the shipped alert conditions query the suppressed gauge family — `alerts/conditions/05-session-cost-budget.json` and `alerts/conditions-personal/02-personal-session-cost.json` both alert on `ai.cost.session_total_usd`. With companion mode on, those conditions receive no data and go quiet. Rebuild the equivalent alerts on Claude Code's OTel cost metrics (the canonical cost source in this deployment), or don't deploy those two conditions.
+
+---
+
+## Multi-Tier Telemetry Routing
+
+Route each event type to a different destination — your own New Relic account, a shared team account, and/or a directory on disk — from a single Preflight process.
+
+Requires `mode: "cloud"` or `mode: "both"`. Tiers fan out the cloud export path; an explicit `tiers` array while `mode` is `"local"` is a config-load error.
+
+```jsonc
+{
+  "mode": "cloud",
+  "licenseKey": "...",
+  "accountId": "12345",
+  "tiers": [
+    {
+      "name": "personal",
+      "destination": { "type": "nr", "licenseKey": "...", "accountId": "12345" },
+      "eventTypes": ["*"],
+    },
+    {
+      "name": "team",
+      "destination": { "type": "nr", "licenseKey": "...", "accountId": "67890" },
+      "eventTypes": ["AiCodingTask", "AiSubagentTurn"],
+    },
+    {
+      "name": "org",
+      "destination": { "type": "local", "path": "/shared/nas/preflight-org" },
+      "eventTypes": ["AiCodingTask"],
+    },
+  ],
+}
+```
+
+### Tier fields
+
+| Field                    | Required     | Notes                                                                                                                                |
+| ------------------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`                   | yes          | Unique, non-empty. `"default"` is the reserved name of the implicit tier and is the only name exempt from the personal-only warning. |
+| `destination.type`       | yes          | `"nr"` or `"local"`.                                                                                                                 |
+| `destination.licenseKey` | `nr` only    | This tier's own NR ingest license key.                                                                                               |
+| `destination.accountId`  | `nr` only    | 1–12 decimal digits, as a JSON string.                                                                                               |
+| `destination.path`       | `local` only | Directory for JSONL output. Relative paths are resolved to absolute at config load.                                                  |
+| `eventTypes`             | yes          | Non-empty. Either `["*"]` (everything) or an explicit list of known event types.                                                     |
+
+There is no environment variable or CLI flag for `tiers` — config file only.
+
+### Event-type sensitivity
+
+| Category                                                                                                                   | Event types                                                                                                                                       |
+| -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `safe-shared` — aggregated counts/durations/costs, no raw paths/commands/user text                                         | `AiProxyRequest`, `AiCodingTask`, `AiSubagentTurn`, `AiRetryAlert`, `AiTurnCost`, `AiContextSnapshot`, `AiBudgetWarning`, `AiObservabilityHealth` |
+| `personal-only` — raw or lightly-redacted per-call detail (bash commands, file paths, agent descriptions, audit specifics) | `AiToolCall`, `AiMcpToolCall`, `AiWorkflowRun`, `AiAntiPattern`, `AiAuditEvent`, `SecurityAlert`                                                  |
+
+Routing a `personal-only` type to a tier other than `default` logs a warning on stderr and proceeds — it is a deliberate, informed operator choice, not an error. Routing is **event-type-level only**: there is no per-tier field redaction or projection, so a tier that receives `AiToolCall` receives the whole event.
+
+### Primary tier
+
+The first `nr`-type tier in the array is the **primary tier**. It carries:
+
+- the aggregated Metric API stream (all `ai.*` gauges)
+- NR Logs API audit entries
+- the OTLP exporter, when `otlp.transport` is `otlp` or `both`
+- the `nr_observe_health` event-send health counters
+
+Per-tier metrics, per-tier logs, and per-tier OTLP are out of scope. At least one `nr`-type tier is required; a `tiers` array containing only `local` destinations fails config load.
+
+### Local-tier output
+
+Each `local` tier appends to `<path>/events-YYYY-MM-DD.jsonl` (one file per UTC day, one JSON object per line), creating directories with mode `0o700` and files with mode `0o600` — the same permission invariant as `~/.newrelic-preflight/`. Writes are best-effort: a failure (unmounted share, permission denied) logs a warning, increments a counter, and never throws, so a broken local tier cannot affect any other tier or the MCP server.
+
+### Failure isolation
+
+Every `nr` tier gets its own `HarvestScheduler`, so each keeps an independent retry buffer and backoff. One unreachable NR account retries on its own schedule while every other tier continues delivering normally.
+
+### Backward compatibility
+
+Omit `tiers` entirely and nothing changes: the flat `licenseKey`/`accountId` become one implicit tier (`name: "default"`, `eventTypes: ["*"]`), resolved in memory and never written back to the config file.
+
+### Misconfiguration is fatal at startup
+
+The following throw at config load with a specific message, following the same fail-fast convention as the `licenseKey`/`accountId`/`homelabServerUrl` checks: an empty `tiers` array, a duplicate tier name, a blank name, an unknown `destination.type`, an `nr` destination missing `licenseKey` or with a malformed `accountId`, a `local` destination missing `path`, an empty or unknown-valued `eventTypes`, and an array with no `nr`-type tier.
+
+### Not covered
+
+Homelab forwarding (`homelabServerUrl`, see [homelab.md](./homelab.md)) is a separate mechanism and is unaffected by tiers.
 
 ---
 
 ## Setup Wizard — Environment Variable Pre-Fill
 
 If `NEW_RELIC_LICENSE_KEY`, `NEW_RELIC_ACCOUNT_ID`, or `NEW_RELIC_API_KEY` are set in the environment when `preflight setup` is run, the wizard pre-fills those prompts and shows the env var name as the hint (`$NEW_RELIC_LICENSE_KEY`). Pressing Enter accepts the value — no copy-paste needed. This makes the wizard scriptable in CI pipelines or Docker-based dev environments where credentials are already injected as environment variables.
+
+---
+
+## Running `--local` Standalone (No `--stdio` Session)
+
+The subagent transcript watcher runs in both `--stdio` and `--local` processes. A `--stdio` process watches only its own session; a `--local` process watches every session that does not already have a live `--stdio` owner, so a standalone deployment (container, systemd unit, Raspberry Pi, any platform with no MCP client to auto-launch `--stdio`) tracks subagent cost with no configuration. Set `NR_AI_ENABLE_SUBAGENT_WATCHER=0` to turn it off everywhere.
+
+| Setting                         | What it does                                           | Default  |
+| ------------------------------- | ------------------------------------------------------ | -------- |
+| `NR_AI_ENABLE_SUBAGENT_WATCHER` | Set to `0` to disable subagent cost tracking entirely. | enabled  |
+| `NR_AI_ENABLE_WORKFLOW_WATCHER` | Set to `1` to enable script-workflow tracking.         | disabled |
+| `NR_AI_WATCHER_DISCOVERY_HOURS` | Cold-scan eligibility window for transcript discovery. | `24`     |
 
 ---
 
@@ -183,7 +400,7 @@ The script queries NR for your past sessions, reconstructs session summaries, wr
 
 ## Terraform Deployment
 
-A Terraform module in `terraform/` is an IaC alternative to the deploy scripts. It deploys all 7 dashboards via `newrelic_one_dashboard_json` and the full alert policy with all 10 conditions (5 shared + 5 personal). Use it for GitOps workflows or when you want Terraform state tracking.
+A Terraform module in `terraform/` is an IaC alternative to the deploy scripts. It deploys all 8 dashboards via `newrelic_one_dashboard_json` and the full alert policy with all 10 conditions (5 shared + 5 personal). Use it for GitOps workflows or when you want Terraform state tracking.
 
 ### Prerequisites
 
@@ -214,6 +431,7 @@ terraform apply
 | `account_id`                    | Yes      | —       | New Relic account ID                                           |
 | `api_key`                       | Yes      | —       | User API key (`NRAK-...`)                                      |
 | `region`                        | No       | `US`    | `US` or `EU`                                                   |
+| `staging`                       | No       | `false` | Target the New Relic staging environment                       |
 | `developer`                     | No       | `""`    | Developer name — enables personal alert conditions when set    |
 | `personal_daily_cost_usd`       | No       | `10`    | Personal daily cost alert threshold (USD)                      |
 | `personal_session_cost_usd`     | No       | `5`     | Personal per-session cost alert threshold (USD)                |
@@ -257,13 +475,10 @@ A single failure followed by a success does not count. The streak resets only on
 
 ### Unused large outputs
 
-**Triggered when:** a tool returns 4,000 bytes or more and the output is never acted on. This applies to all tool calls except file-modifying operations (edits, writes, commands). For `Read` calls, the penalty is waived if the same file is subsequently edited or written in the session.
+**Triggered when:** a tool returns 20,000 bytes or more and the output is never acted on. Discovery/search tools (`Grep`, `Glob`, `WebFetch`, `WebSearch`, and any MCP tool) are exempt entirely: their output is consumed by informing the agent's reasoning, not by producing a downstream edit, so requiring one would penalize ordinary investigation. For `Read`, the penalty is waived if the same file is subsequently edited or written in the session — in practice `Read` is almost always the tool this penalty applies to, though a handful of less common tool types get no such waiver either.
 
-**How to avoid:** Prefer targeted reads over broad ones when you only need to understand something, not change it. Use `grep`/`Bash` for lookups rather than reading entire files.
+**How to avoid:** Prefer targeted reads over reading whole files you only need to skim once. This penalty is rare in practice — a single Read has to exceed ~20,000 bytes (a genuinely large file) and never lead to an edit of that same file.
 
-- Instead of: _"Read `src/metrics/` for background."_
-- Use: _"Search for all callers of `getMetrics()` in `src/metrics/`."_
+### Normalization and score floor
 
-### Score floor
-
-Even with many penalties the score won't drop below 0.3, so the metric is intended to track trends over time, not penalize individual sessions heavily.
+Penalties are normalized against session size before being applied, one-sided: sessions of 15 calls or fewer apply the raw penalty as-is, while sessions above 15 calls have the raw penalty total scaled down by `15 / totalCalls`, so the same absolute number of violations counts for much less in a 1000-call session. This keeps busy sessions (e.g. many parallel subagent calls) from scoring worse than a short session with an identical defect rate, without the reverse effect of making short sessions score worse than before. After normalization, the score still won't drop below 0.3, so the metric is intended to track trends over time, not penalize individual sessions heavily.

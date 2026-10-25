@@ -1,131 +1,175 @@
 #!/usr/bin/env node
 import 'dotenv/config';
 
+import { Command, Option } from 'commander';
 import { readFileSync, realpathSync } from 'node:fs';
+import { timingSafeEqual } from 'node:crypto';
 import { resolve } from 'node:path';
-import { Command } from 'commander';
-import { createLogger } from './shared/index.js';
-import { VERSION } from './version.js';
-import { createServer } from './server.js';
-import { loadMcpConfig, DEFAULT_STORAGE_PATH } from './config.js';
+import { AlertLog } from './alerts/alert-log.js';
+import { AlertSnapshotCollector } from './alerts/alert-snapshot-collector.js';
+import { LocalAlertEngine } from './alerts/local-alert-engine.js';
+import { parseLocalAlertRules } from './alerts/local-alert-rule.js';
+import { OsNotifier } from './alerts/os-notifier.js';
 import type { McpServerConfig } from './config.js';
-import { ProxyManager } from './proxy/index.js';
-import type { ProxyToolCallRecord, ProxyRequestRecord } from './proxy/index.js';
-import { LocalStore } from './storage/index.js';
-import type { ToolCallRecord } from './storage/types.js';
-import {
-  SessionStore,
-  buildSessionSummary,
-  sessionSummaryToDriftRecord,
-} from './storage/session-store.js';
-import { WeeklySummaryGenerator } from './storage/weekly-summary.js';
-import { purgeOldSessions, purgeOldWeeklySummaries } from './storage/retention.js';
+import { DEFAULT_STORAGE_PATH, loadMcpConfig, redactSensitive } from './config.js';
+import { checkBasicAuthToken } from './dashboard/basic-auth.js';
+import { DashboardServer } from './dashboard/dashboard-server.js';
+import { LiveEventBus } from './dashboard/index.js';
+import type { ObservabilityHealthSnapshot } from './dashboard/routes/api-handler.js';
+import { SubagentTimelineStore } from './dashboard/subagent-timeline-store.js';
+import { WorkflowStore } from './dashboard/workflow-store.js';
+import { isCopilotSdkExtensionMissing } from './hooks/copilot-sdk-extension-health.js';
+import { CopilotAppUsageWatcher } from './hooks/copilot-app-usage-watcher.js';
+import { CopilotUsageWatcher } from './hooks/copilot-usage-watcher.js';
 import { HookEventProcessor } from './hooks/index.js';
-import { SessionTracker } from './metrics/session-tracker.js';
-import { CostTracker } from './metrics/cost-tracker.js';
-import { buildCostForecastFromInputs } from './metrics/cost-forecast.js';
-import { BudgetTracker } from './metrics/budget-tracker.js';
-import { TaskDetector } from './metrics/task-detector.js';
+import { isPlatformDetectionFellBack } from './hooks/platform-detection-health.js';
+import { ParentTranscriptWatcher } from './hooks/parent-transcript-watcher.js';
+import {
+  isSyntheticSessionId,
+  readJobState,
+  readTranscriptTitle,
+  resolveFromBreadcrumb,
+  resolveFromCwd,
+  resolveFromJobDir,
+  resolveSessionId,
+  resolveSessionName,
+  watchCwdBreadcrumbForCorrection,
+  watchPpidBreadcrumb,
+} from './hooks/session-resolver.js';
+import { SubagentWatcher, type SubagentTokenEvent } from './hooks/subagent-watcher.js';
+import { WorkflowWatcher } from './hooks/workflow-watcher.js';
+import { migrateStoragePath } from './install/migrate.js';
+import { checkNodeVersion } from './install/node-version-check.js';
+import { localDateKey } from './lib/date.js';
+import { repoNameFromRemote } from './lib/git-remote.js';
+import { SubagentAttributionIndex } from './metrics/subagent-attribution.js';
 import { AntiPatternDetector } from './metrics/anti-patterns.js';
-import { EfficiencyScorer } from './metrics/efficiency-score.js';
-import { TrendAnalyzer } from './metrics/trend-analyzer.js';
-import { CollaborationProfiler } from './metrics/collaboration-profile.js';
+import { ApiFailureTracker, mapClaudeCodeErrorType } from './metrics/api-failure-tracker.js';
+import { SessionResumeTracker } from './metrics/session-resume-tracker.js';
+import { BudgetTracker } from './metrics/budget-tracker.js';
 import { ClaudeMdTracker } from './metrics/claudemd-tracker.js';
-import { createDefaultRegistry } from './platforms/index.js';
-import { CostPerOutcomeAnalyzer } from './metrics/cost-per-outcome.js';
-import { PersonalCoach } from './metrics/personal-coach.js';
-import { PromptFeedbackEngine } from './metrics/prompt-feedback.js';
-import { RecommendationEngine } from './metrics/recommendation-engine.js';
-import { ContextWindowTracker } from './metrics/context-window-tracker.js';
-import { LatencyTracker } from './metrics/latency-tracker.js';
-import { TaskCompletionTracker } from './metrics/task-completion-tracker.js';
-import { ModelUsageTracker } from './metrics/model-usage-tracker.js';
-import { RetryDetector } from './metrics/retry-detector.js';
+import { CollaborationProfiler } from './metrics/collaboration-profile.js';
+import {
+  isTokenEventForThisProcess,
+  shouldApplyCostEstimate,
+} from './metrics/cost-estimate-gate.js';
 import { ContextCompositionTracker } from './metrics/context-composition-tracker.js';
 import { ContextTrackerRegistry } from './metrics/context-tracker.js';
-import { LatencyDecompositionTracker } from './metrics/latency-decomposition.js';
+import { ContextWindowTracker } from './metrics/context-window-tracker.js';
+import { applyPricingOverlay } from './metrics/pricing-overlay.js';
+import { startPricingRefresh } from './metrics/pricing-refresh.js';
+import { buildCostForecastFromInputs } from './metrics/cost-forecast.js';
+import { CostPerOutcomeAnalyzer } from './metrics/cost-per-outcome.js';
+import { buildCostTrackerSeed } from './metrics/cost-tracker-seed.js';
+import { CostTracker } from './metrics/cost-tracker.js';
 import { DecisionTracker } from './metrics/decision-tracker.js';
-import { InstructionDriftTracker } from './metrics/instruction-drift-tracker.js';
-import type { SessionOutcomeRecord } from './metrics/instruction-drift-tracker.js';
-import { ToolSelectionScorer } from './metrics/tool-selection-scorer.js';
-import { QualityProxyTracker } from './metrics/quality-proxy-tracker.js';
-import { ApiFailureTracker } from './metrics/api-failure-tracker.js';
-import { LiveSessionRegistry } from './metrics/live-session-registry.js';
-import { TurnCostAttributor } from './metrics/turn-cost-attributor.js';
-import { TurnTracker } from './metrics/turn-tracker.js';
+import { EfficiencyScorer } from './metrics/efficiency-score.js';
+import type { RepoContext } from './metrics/git-efficiency-tracker.js';
 import {
   GitEfficiencyTracker,
   parseDefaultBranchFromSymbolicRef,
 } from './metrics/git-efficiency-tracker.js';
-import { TranscriptMessageTracker } from './metrics/transcript-message-tracker.js';
-import { WorkflowRunTracker } from './metrics/workflow-run-tracker.js';
-import { SubagentWatcher } from './hooks/subagent-watcher.js';
-import { WorkflowWatcher } from './hooks/workflow-watcher.js';
-import { WorkflowStore } from './dashboard/workflow-store.js';
-import { SubagentTimelineStore } from './dashboard/subagent-timeline-store.js';
-import { NrIngestManager } from './transport/nr-ingest.js';
-import type { TokenUsage } from './shared/index.js';
-import { AuditTrailManager } from './security/audit-trail.js';
-import { LiveEventBus } from './dashboard/index.js';
-import { DashboardServer } from './dashboard/dashboard-server.js';
-import type { ObservabilityHealthSnapshot } from './dashboard/routes/api-handler.js';
-import { LocalAlertEngine } from './alerts/local-alert-engine.js';
-import { AlertSnapshotCollector } from './alerts/alert-snapshot-collector.js';
-import { AlertLog } from './alerts/alert-log.js';
-import { OsNotifier } from './alerts/os-notifier.js';
-import { parseLocalAlertRules } from './alerts/local-alert-rule.js';
-import { localDateKey, todayPortionOfSessionCost } from './lib/date.js';
-import { FeedbackCollector } from './tools/workflow-tools.js';
-import { registerTools, registerPendingTools } from './tools/session-stats.js';
-import type { ConfigSummary } from './tools/session-stats.js';
+import { WorktreeIdentityResolver } from './metrics/git-workspace-identity.js';
 import {
-  resolveSessionId,
-  resolveFromJobDir,
-  resolveFromBreadcrumb,
-  isSyntheticSessionId,
-} from './hooks/session-resolver.js';
+  GitWorkspaceReporter,
+  replaySessionToActivityRecords,
+} from './metrics/git-workspace-reporter.js';
+import type { SessionOutcomeRecord } from './metrics/instruction-drift-tracker.js';
+import { InstructionDriftTracker } from './metrics/instruction-drift-tracker.js';
+import { LatencyDecompositionTracker } from './metrics/latency-decomposition.js';
+import { LatencyTracker } from './metrics/latency-tracker.js';
+import { LiveSessionRegistry } from './metrics/live-session-registry.js';
+import {
+  collectCommitsAcrossRepos,
+  LocalSessionAggregator,
+  RepoNameResolver,
+  resolveAuthorEmail,
+} from './metrics/local-session-aggregator.js';
+import { ModelUsageTracker } from './metrics/model-usage-tracker.js';
+import { PersonalCoach } from './metrics/personal-coach.js';
+import { PromptFeedbackEngine } from './metrics/prompt-feedback.js';
+import { QualityProxyTracker } from './metrics/quality-proxy-tracker.js';
+import { RecommendationEngine } from './metrics/recommendation-engine.js';
+import { RetryDetector } from './metrics/retry-detector.js';
+import { SessionTracker } from './metrics/session-tracker.js';
+import { TaskCompletionTracker } from './metrics/task-completion-tracker.js';
+import { buildTaskDetectorSeed } from './metrics/task-detector-seed.js';
+import { TaskDetector } from './metrics/task-detector.js';
+import { ToolSelectionScorer } from './metrics/tool-selection-scorer.js';
+import { TranscriptMessageTracker } from './metrics/transcript-message-tracker.js';
+import { TrendAnalyzer } from './metrics/trend-analyzer.js';
+import { TurnCostAttributor } from './metrics/turn-cost-attributor.js';
+import { TurnTracker } from './metrics/turn-tracker.js';
+import { WorkflowRunTracker } from './metrics/workflow-run-tracker.js';
+import { createDefaultRegistry, GenericMcpAdapter } from './platforms/index.js';
+import type { ProxyRequestRecord, ProxyToolCallRecord } from './proxy/index.js';
+import { ProxyManager } from './proxy/index.js';
+import { AuditTrailManager } from './security/audit-trail.js';
+import { createServer } from './server.js';
+import type { CostBreakdown, TokenUsage } from './shared/index.js';
+import { createLogger } from './shared/index.js';
+import { LocalStore } from './storage/index.js';
+import { computeHistoricalCosts } from './storage/historical-costs.js';
+import { purgeOldSessions, purgeOldWeeklySummaries } from './storage/retention.js';
+import {
+  buildSessionSummary,
+  SessionStore,
+  sessionSummaryToDriftRecord,
+} from './storage/session-store.js';
+import type { ToolCallRecord } from './storage/types.js';
+import { WeeklySummaryGenerator } from './storage/weekly-summary.js';
+import type { ConfigSummary } from './tools/session-stats.js';
+import { registerPendingTools, registerTools } from './tools/session-stats.js';
+import { FeedbackCollector } from './tools/workflow-tools.js';
 import { initMcpTracer } from './tracing/mcp-tracer.js';
 import { SessionSpan } from './tracing/session-span.js';
 import { TaskSpanTracker } from './tracing/task-span-tracker.js';
 import { emitToolCallSpan } from './tracing/tool-call-span.js';
+import { NrIngestManager } from './transport/nr-ingest.js';
+import {
+  UNFORWARDED_SESSIONS_HINT,
+  UnforwardedSessionMonitor,
+  detectCloudForwardingGap,
+} from './transport/unforwarded-session-monitor.js';
 import type { CliOptions } from './types.js';
-import { migrateStoragePath } from './install/migrate.js';
+import { HomelabAccumulator, HomelabForwarder } from './homelab/index.js';
+import { VERSION } from './version.js';
 
-export { VERSION };
-export { NrMcpServer, createServer } from './server.js';
 export { loadMcpConfig, redactSensitive } from './config.js';
 export type { McpServerConfig } from './config.js';
-export { LocalStore } from './storage/index.js';
-export type { HookEvent, SessionSummary, AuditEntry } from './storage/index.js';
-export type { CliOptions, ServerOptions } from './types.js';
-export { ProxyManager } from './proxy/index.js';
-export type { ProxyToolCallRecord, ProxyRequestRecord, UpstreamConfig } from './proxy/index.js';
 export {
-  ClaudeCodeAdapter,
-  CursorAdapter,
-  WindsurfAdapter,
-  CopilotAdapter,
-  ZedAdapter,
-  ContinueAdapter,
   AmazonQAdapter,
-  parseCopilotUsageResponse,
-  GenericMcpAdapter,
-  validateReportToolCallInput,
-  REPORT_TOOL_CALL_TOOL,
-  REPORT_SESSION_START_TOOL,
-  REPORT_SESSION_END_TOOL,
-  PlatformRegistry,
+  ClaudeCodeAdapter,
+  ContinueAdapter,
+  CopilotAdapter,
   createDefaultRegistry,
+  CursorAdapter,
+  GenericMcpAdapter,
+  parseCopilotUsageResponse,
+  PlatformRegistry,
+  REPORT_SESSION_END_TOOL,
+  REPORT_SESSION_START_TOOL,
+  REPORT_TOOL_CALL_TOOL,
+  validateReportToolCallInput,
+  WindsurfAdapter,
+  ZedAdapter,
 } from './platforms/index.js';
 export type {
   NormalizedToolCall,
+  PlatformAdapter,
   PlatformConfig,
   PlatformSessionMetadata,
-  PlatformAdapter,
-  ReportToolCallInput,
-  ReportSessionStartInput,
   ReportSessionEndInput,
+  ReportSessionStartInput,
+  ReportToolCallInput,
 } from './platforms/index.js';
+export { ProxyManager } from './proxy/index.js';
+export type { ProxyRequestRecord, ProxyToolCallRecord, UpstreamConfig } from './proxy/index.js';
+export { createServer, NrMcpServer } from './server.js';
+export { LocalStore } from './storage/index.js';
+export type { AuditEntry, HookEvent, SessionSummary } from './storage/index.js';
+export type { CliOptions, ServerOptions } from './types.js';
+export { VERSION };
 
 const logger = createLogger('mcp-cli');
 
@@ -146,7 +190,7 @@ function loadConfigOrDie(options: Partial<CliOptions>): Readonly<McpServerConfig
     return loadMcpConfig(options);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`${msg}\n\nRun 'preflight doctor' to diagnose.`);
+    throw new Error(`${msg}\n\nRun 'preflight doctor' to diagnose.`, { cause: err });
   }
 }
 
@@ -246,6 +290,38 @@ export function getDashboardRepollIntervalMs(): number {
   return parsed;
 }
 
+/**
+ * Interval (ms) between periodic session-JSON checkpoints. Overridable via
+ * NR_AI_SESSION_PERSIST_INTERVAL_MS — kept simple to avoid threading a new
+ * config field through the loader for what is essentially a knob for tests.
+ */
+export const DEFAULT_SESSION_PERSIST_INTERVAL_MS = 30_000;
+
+export function getSessionPersistIntervalMs(): number {
+  const raw = process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS;
+  if (raw === undefined || raw === '') return DEFAULT_SESSION_PERSIST_INTERVAL_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_SESSION_PERSIST_INTERVAL_MS;
+  return parsed;
+}
+
+/**
+ * Cap (ms) on how long a cwd-fallback-resolved session id is treated as
+ * "pending confirmation" before periodic checkpointing resumes
+ * unconditionally. Overridable via NR_AI_PENDING_CONFIRMATION_CAP_MS — kept
+ * simple to avoid threading a new config field through the loader for what
+ * is essentially a knob for tests.
+ */
+export const DEFAULT_PENDING_CONFIRMATION_CAP_MS = 120_000;
+
+export function getPendingConfirmationCapMs(): number {
+  const raw = process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS;
+  if (raw === undefined || raw === '') return DEFAULT_PENDING_CONFIRMATION_CAP_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_PENDING_CONFIRMATION_CAP_MS;
+  return parsed;
+}
+
 const RETENTION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 export interface RetentionSweepDeps {
@@ -285,11 +361,14 @@ export interface MaintenanceGcDeps {
   readonly liveSessionRegistry: LiveSessionRegistry | undefined;
 }
 
+/** Default cold-scan window for SubagentWatcher/WorkflowWatcher — mirrors DEFAULT_DISCOVERY_HOURS in subagent-watcher.ts. */
+const WATCHER_DISCOVERY_HOURS_DEFAULT = 24;
+
 /**
- * One orphan-buffer/breadcrumb/dead-instance GC pass. `gcOrphanBuffers()` is
- * rename-based, so concurrent processes each running this independently just
- * means an occasional benign "already moved" warning — no leader election
- * needed to call this from every process.
+ * One orphan-buffer/breadcrumb/dead-instance/cursor-file GC pass.
+ * `gcOrphanBuffers()` is rename-based, so concurrent processes each running
+ * this independently just means an occasional benign "already moved"
+ * warning — no leader election needed to call this from every process.
  */
 export function runMaintenanceGcPass(deps: MaintenanceGcDeps): void {
   const log = createLogger('mcp-cli');
@@ -302,8 +381,20 @@ export function runMaintenanceGcPass(deps: MaintenanceGcDeps): void {
       for (const id of liveSessionRegistry.getLiveSessions({ includeSynthetic: true })) {
         live.add(id);
       }
+      // Also protect sessions seen at any point today but no longer within the
+      // 3-minute live window (e.g. an open Claude Code window idle between
+      // prompts) — without this, gcOrphanBuffers/gcWatcherCursors would treat
+      // an idle-but-still-open session as orphaned and delete its buffer file
+      // before it's ever persisted.
+      for (const id of liveSessionRegistry.getTodaySessionIds({ includeSynthetic: true })) {
+        live.add(id);
+      }
     }
     localStore.gcOrphanBuffers(live);
+    const envHours = parseInt(process.env.NR_AI_WATCHER_DISCOVERY_HOURS ?? '', 10);
+    const discoveryHours =
+      Number.isFinite(envHours) && envHours > 0 ? envHours : WATCHER_DISCOVERY_HOURS_DEFAULT;
+    localStore.gcWatcherCursors(live, discoveryHours);
   } catch (err) {
     log.warn('GC pass failed', { error: String(err) });
   }
@@ -431,6 +522,7 @@ export function startDashboardRepoll(opts: DashboardRepollOptions): NodeJS.Timeo
 const SUBCOMMAND_NAMES = [
   'deploy-dashboards',
   'deploy-alerts',
+  'server',
   'install',
   'uninstall',
   'setup',
@@ -438,14 +530,15 @@ const SUBCOMMAND_NAMES = [
   'update',
   'schedule',
   'doctor',
+  'local',
 ] as const;
 type SubcommandName = (typeof SUBCOMMAND_NAMES)[number];
 
 // Install-CLI subcommands — a subset of SUBCOMMAND_NAMES routed to runInstallCli.
 // Derived from SUBCOMMAND_NAMES to ensure a single source of truth: deploy-*
-// commands are excluded and handled by the commander path in dispatchSubcommand.
+// and server commands are excluded and handled by the commander path in dispatchSubcommand.
 const INSTALL_CLI_SUBCOMMANDS = SUBCOMMAND_NAMES.filter(
-  (s) => s !== 'deploy-dashboards' && s !== 'deploy-alerts',
+  (s) => s !== 'deploy-dashboards' && s !== 'deploy-alerts' && s !== 'server',
 ) as readonly string[];
 
 function isSubcommand(value: string | undefined): value is SubcommandName {
@@ -485,7 +578,9 @@ export async function dispatchSubcommand(argv: string[]): Promise<number | null>
       .option('--update', 'update existing dashboards in-place (matched by name)')
       .option('--teardown', 'delete deployed dashboards (matched by name)')
       .option('--print', 'print dashboard JSON with accountIds filled in (no API key required)')
+      .addOption(new Option('--staging', 'target the New Relic staging API').hideHelp())
       .option('--eu', 'target the New Relic EU API')
+      .option('--jp', 'target the New Relic Japan API')
       .option(
         '--developer <name>',
         'inject developer name into the dashboard "developer" variable default',
@@ -501,11 +596,114 @@ export async function dispatchSubcommand(argv: string[]): Promise<number | null>
           update: opts.update === true,
           teardown: opts.teardown === true,
           print: opts.print === true,
+          staging: opts.staging === true,
           eu: opts.eu === true,
+          jp: opts.jp === true,
           developer: typeof opts.developer === 'string' ? opts.developer : null,
           file: file ?? null,
         });
         process.exitCode = code;
+      });
+  } else if (sub === 'server') {
+    program
+      .command('server')
+      .description(
+        'Start Preflight in homelab server mode — receives events forwarded from remote clients, accumulates them to disk, and serves a Basic-Auth-protected dashboard (see docs/homelab.md)',
+      )
+      .option(
+        '--port <port>',
+        'Port to bind to (default: 7777 or NEW_RELIC_AI_HOMELAB_SERVER_PORT)',
+      )
+      .option(
+        '--token <token>',
+        'Bearer token for /ingest auth (default: NEW_RELIC_AI_HOMELAB_TOKEN)',
+      )
+      .option(
+        '--bind <address>',
+        'Bind address (default: 0.0.0.0 or NEW_RELIC_AI_HOMELAB_BIND_ADDRESS)',
+      )
+      .option('--config <path>', 'Path to config file')
+      .action(async (opts: { port?: string; token?: string; bind?: string; config?: string }) => {
+        if (opts.port) process.env.NEW_RELIC_AI_HOMELAB_SERVER_PORT = opts.port;
+        if (opts.token) process.env.NEW_RELIC_AI_HOMELAB_TOKEN = opts.token;
+        if (opts.bind) process.env.NEW_RELIC_AI_HOMELAB_BIND_ADDRESS = opts.bind;
+        // server mode never needs cloud credentials — force local so loadMcpConfig
+        // doesn't require licenseKey/accountId.
+        process.env.NR_AI_MODE = 'local';
+
+        const config = loadConfigOrDie({ config: opts.config });
+
+        const token = config.homelabToken;
+        if (!token) {
+          process.stderr.write(
+            '[preflight] error: homelab server requires a token. Set --token or NEW_RELIC_AI_HOMELAB_TOKEN.\n',
+          );
+          process.exit(1);
+        }
+
+        const accumulator = new HomelabAccumulator({ storagePath: config.storagePath });
+        accumulator.start();
+
+        // Resolve symlinks (e.g. npm link) before dirname so staticDir points
+        // to the actual dist/ directory, not the symlink's parent — same
+        // resolution local mode uses below for its own DashboardServer.
+        const { dirname, resolve: resolvePath } = await import('node:path');
+        const entryScript = realpathSync(process.argv[1] ?? process.cwd());
+        const staticDir = resolvePath(dirname(entryScript), 'web');
+        const sessionStore = new SessionStore({ storagePath: config.storagePath });
+
+        const bus = new LiveEventBus();
+        const dashboardServer = new DashboardServer({
+          port: config.homelabServer.port,
+          host: config.homelabServer.bindAddress,
+          bus,
+          serverMode: true,
+          staticDir,
+          api: { sessionStore },
+          // Browser-facing routes (dashboard HTML, /api/*, /sse) authenticate
+          // with the same shared token via HTTP Basic Auth, so the browser's
+          // native login prompt sends it automatically on every request,
+          // including static assets and SSE which can't carry custom headers.
+          // /api/health and /ingest are exempt (see DashboardServer docs) —
+          // /ingest keeps its own independent Bearer check below.
+          isAuthorized: (authHeader) => checkBasicAuthToken(authHeader, token),
+          ingestHandler: (authHeader, body) => {
+            const expected = `Bearer ${token}`;
+            const isAuthed =
+              authHeader !== undefined &&
+              authHeader.length === expected.length &&
+              timingSafeEqual(Buffer.from(authHeader), Buffer.from(expected));
+            if (!isAuthed) return 401;
+            const result = accumulator.handleIngest(body);
+            return result === 'ok' ? 204 : 400;
+          },
+        });
+
+        await dashboardServer.start();
+        logger.info('Homelab server ready', {
+          port: config.homelabServer.port,
+          bind: config.homelabServer.bindAddress,
+        });
+
+        // Keep the action (and therefore program.parseAsync) alive until a
+        // signal fires — without this, the action returns immediately and
+        // dispatchSubcommand exits the process.
+        await new Promise<void>((resolve) => {
+          let shutting = false;
+          const shutdown = async (): Promise<void> => {
+            if (shutting) return;
+            shutting = true;
+            accumulator.stop();
+            await dashboardServer.stop();
+            resolve();
+          };
+          process.on('SIGTERM', () => {
+            void shutdown();
+          });
+          process.on('SIGINT', () => {
+            void shutdown();
+          });
+        });
       });
   } else {
     program
@@ -514,7 +712,9 @@ export async function dispatchSubcommand(argv: string[]): Promise<number | null>
       .option('--dry-run', 'print the policy + conditions that would be created and exit')
       .option('--teardown', 'delete the alert policy and all its conditions')
       .option('--update', 'sync conditions on an existing policy in place (matched by name)')
+      .addOption(new Option('--staging', 'target the New Relic staging API').hideHelp())
       .option('--eu', 'target the New Relic EU API')
+      .option('--jp', 'target the New Relic Japan API')
       .option('--developer <name>', 'deploy a personal alert policy scoped to <name>')
       .action(async (opts: Record<string, unknown>) => {
         const { runDeployAlerts } = await import('./deploy/deploy-alerts.js');
@@ -522,7 +722,9 @@ export async function dispatchSubcommand(argv: string[]): Promise<number | null>
           dryRun: opts.dryRun === true,
           teardown: opts.teardown === true,
           update: opts.update === true,
+          staging: opts.staging === true,
           eu: opts.eu === true,
+          jp: opts.jp === true,
           developer: typeof opts.developer === 'string' ? opts.developer : null,
         });
         process.exitCode = code;
@@ -580,7 +782,21 @@ export function parseArgs(argv: string[]): CliOptions {
   };
 }
 
+function initModelPricing(config: McpServerConfig): void {
+  applyPricingOverlay(config.customPricingFile);
+  void startPricingRefresh({
+    enabled: config.pricingRefresh,
+    cachePath: resolve(config.storagePath, 'pricing-cache.json'),
+  });
+}
+
 async function main(): Promise<void> {
+  const nodeVersionError = checkNodeVersion();
+  if (nodeVersionError) {
+    process.stderr.write(`${nodeVersionError}\n`);
+    process.exit(1);
+  }
+
   // Subcommand dispatch (e.g. `preflight deploy-dashboards --all`)
   // happens before flag parsing — they don't share the option schema with the
   // server modes (--stdio / --local / --validate / proxy), and they exit
@@ -652,6 +868,11 @@ async function main(): Promise<void> {
   // independent of dashboard-bind status. Cleared in the shutdown handler.
   let maintenanceGcInterval: NodeJS.Timeout | undefined;
   let retentionInterval: NodeJS.Timeout | undefined;
+  // Periodic re-fetch of ahead/behind-main counts so the Git Efficiency
+  // dashboard's "behind main" KPI doesn't stay frozen at its startup value
+  // for the life of a long-running `--local` daemon. Cleared in the
+  // shutdown handler.
+  let branchDivergenceInterval: NodeJS.Timeout | undefined;
   // Periodic local session-JSON flush so a non-clean exit (crash/SIGKILL)
   // loses at most one interval of session data — persistSession otherwise runs
   // only on clean shutdown. Cleared in the shutdown handler. Synthetic /
@@ -665,9 +886,49 @@ async function main(): Promise<void> {
   // regardless of which mode (stdio vs. local) is active.
   let activeSubagentWatcher: SubagentWatcher | null = null;
   let activeWorkflowWatcher: WorkflowWatcher | null = null;
+  let activeParentTranscriptWatcher: ParentTranscriptWatcher | null = null;
+  let activeCopilotUsageWatcher: CopilotUsageWatcher | null = null;
+  let activeCopilotAppUsageWatcher: CopilotAppUsageWatcher | null = null;
   // Aborts the async resolveSessionId polling loop when shutdown fires so
   // the breadcrumb poll does not outlive the process.
   let sessionResolutionAbort: AbortController | undefined;
+  // Aborts the background watchPpidBreadcrumb() correction watch (armed
+  // only when the initial resolution came from the collision-prone cwd
+  // fallback — see resolvedViaCwdOnly) when shutdown fires.
+  let ppidCorrectionAbort: AbortController | undefined;
+  // That watch's listener for tool calls drained under the cwd guess, set
+  // while it runs (see subscribeToStaleIdActivity in session-resolver.ts).
+  let cwdGuessActivity: { readonly staleId: string; readonly onActivity: () => void } | null = null;
+
+  // True whenever the live sessionTraceId came from the collision-prone cwd
+  // fallback and hasn't yet been ppid-confirmed. While true, the periodic
+  // session-JSON checkpoint below is suppressed so a stale identity never
+  // gets written to disk as an orphaned, zero-activity session file. Cleared
+  // either by a real ppid confirmation/correction or by the cap timer in
+  // armPendingConfirmation below.
+  let pendingConfirmation = false;
+  let pendingConfirmationCapTimer: NodeJS.Timeout | undefined;
+
+  const clearPendingConfirmation = (): void => {
+    pendingConfirmation = false;
+    if (pendingConfirmationCapTimer) {
+      clearTimeout(pendingConfirmationCapTimer);
+      pendingConfirmationCapTimer = undefined;
+    }
+  };
+
+  const armPendingConfirmation = (): void => {
+    pendingConfirmation = true;
+    pendingConfirmationCapTimer = setTimeout(() => {
+      logger.warn(
+        'Session id confirmation cap elapsed with no PPID correction; resuming periodic checkpointing',
+      );
+      clearPendingConfirmation();
+    }, getPendingConfirmationCapMs());
+    pendingConfirmationCapTimer.unref?.();
+  };
+
+  let homelabForwarder: HomelabForwarder | null = null;
 
   let shuttingDown = false;
   const shutdown = async () => {
@@ -676,6 +937,7 @@ async function main(): Promise<void> {
     // Abort any in-progress session resolution so its polling loop exits
     // cleanly rather than continuing after process.exit() is called.
     sessionResolutionAbort?.abort();
+    ppidCorrectionAbort?.abort();
     logger.info('Shutting down...');
     try {
       persistSession?.();
@@ -693,8 +955,10 @@ async function main(): Promise<void> {
       if (alertEvaluationInterval) clearInterval(alertEvaluationInterval);
       if (maintenanceGcInterval) clearInterval(maintenanceGcInterval);
       if (retentionInterval) clearInterval(retentionInterval);
+      if (branchDivergenceInterval) clearInterval(branchDivergenceInterval);
       if (dashboardRepollInterval) clearInterval(dashboardRepollInterval);
       if (sessionPersistInterval) clearInterval(sessionPersistInterval);
+      if (pendingConfirmationCapTimer) clearTimeout(pendingConfirmationCapTimer);
       // Remove this MCP's heartbeat so the next dashboard-owner GC pass
       // doesn't have to mtime-archive our buffer file.
       localStoreForShutdown?.removeHeartbeat();
@@ -717,6 +981,9 @@ async function main(): Promise<void> {
       eventProcessor?.stop();
       activeSubagentWatcher?.stop();
       activeWorkflowWatcher?.stop();
+      activeParentTranscriptWatcher?.stop();
+      activeCopilotUsageWatcher?.stop();
+      activeCopilotAppUsageWatcher?.stop();
       liveSessionRegistry?.stopSampling();
       // Use allSettled so a failure in one stop() doesn't prevent the others.
       const stopResults = await Promise.allSettled([
@@ -724,6 +991,7 @@ async function main(): Promise<void> {
         nrIngest ? nrIngest.stop() : Promise.resolve(),
         mcpServer ? mcpServer.close() : Promise.resolve(),
         proxyManager ? proxyManager.stop() : Promise.resolve(),
+        homelabForwarder ? homelabForwarder.stop() : Promise.resolve(),
       ]);
       for (const r of stopResults) {
         if (r.status === 'rejected') {
@@ -748,6 +1016,19 @@ async function main(): Promise<void> {
 
   if (options.stdio || options.local) {
     let sessionTraceId: string;
+    // True when the synchronous resolution chain below succeeded ONLY via
+    // the cwd fallback — the collision-prone source (shared by every
+    // session that ever ran in this directory), unlike the ppid breadcrumb
+    // (precise, keyed to this MCP's own parent process). Set inside the
+    // `options.stdio` branch below; read much later, after the eager
+    // synchronous setup completes, to decide whether to arm a background
+    // correction watch (see `startPpidCorrectionWatch` below).
+    let resolvedViaCwdOnly = false;
+    // --local only: set when the config asked for cloud export but this
+    // process fell back to local mode for want of credentials, so every
+    // ownerless session it drains is kept locally and never sent to New
+    // Relic. Surfaced as a per-session warning and on GET /api/health (#479).
+    let unforwardedSessionMonitor: UnforwardedSessionMonitor | undefined;
     if (options.stdio) {
       // Connect stdio FIRST so the MCP handshake can complete immediately.
       // Tools are registered after initialization; tool calls before that
@@ -775,9 +1056,14 @@ async function main(): Promise<void> {
         process.exit(0);
       }
 
-      const synchronouslyResolved =
-        resolveFromJobDir(process.env.CLAUDE_JOB_DIR ?? null) ??
-        resolveFromBreadcrumb(config.storagePath, process.ppid);
+      initModelPricing(config);
+
+      const fromJobDir = resolveFromJobDir(process.env.CLAUDE_JOB_DIR ?? null);
+      const fromPpid = fromJobDir ? null : resolveFromBreadcrumb(config.storagePath, process.ppid);
+      const fromCwd =
+        fromJobDir || fromPpid ? null : resolveFromCwd(config.storagePath, process.cwd());
+      const synchronouslyResolved = fromJobDir ?? fromPpid ?? fromCwd;
+      resolvedViaCwdOnly = !!fromCwd && !fromJobDir && !fromPpid;
       if (synchronouslyResolved) {
         sessionTraceId = synchronouslyResolved;
         logger.info('Session ID resolved synchronously', { sessionTraceId });
@@ -807,14 +1093,36 @@ async function main(): Promise<void> {
         }
       }
     } else {
-      // --local: force local mode so config validation skips cloud credentials.
-      process.env.NR_AI_MODE = 'local';
-      config = loadConfigOrDie(options);
+      // --local: try normal config resolution first, so a config file that
+      // already sets mode: 'cloud'/'both' with real credentials still gets
+      // cloud ingest from --local — previously this branch unconditionally
+      // forced mode: 'local', which silently dropped any activity --local
+      // drained on behalf of an unowned session (e.g. a Copilot chat with no
+      // dedicated owning --stdio engine): captured and shown in the local
+      // dashboard, but never forwarded to New Relic even when the user had
+      // configured real credentials. Only fall back to forcing local mode
+      // when credentials are genuinely absent, preserving the original
+      // intent of letting --local run without requiring cloud credentials.
+      try {
+        config = loadConfigOrDie(options);
+      } catch (err) {
+        const gap = detectCloudForwardingGap(err);
+        if (!gap) throw err;
+        process.env.NR_AI_MODE = 'local';
+        config = loadConfigOrDie(options);
+        unforwardedSessionMonitor = new UnforwardedSessionMonitor({ gap });
+        logger.warn(
+          `Cloud export is configured (mode='${gap.requestedMode}') but this --local process has no ${gap.missingField}; sessions it drains will not reach New Relic`,
+          { reason: gap.reason, requestedMode: gap.requestedMode, hint: UNFORWARDED_SESSIONS_HINT },
+        );
+      }
 
       if (!config.enabled) {
         logger.info('Server disabled via config — exiting');
         process.exit(0);
       }
+
+      initModelPricing(config);
 
       // --local has no owning Claude Code session — derive a deterministic
       // identifier so the rest of the codebase can rely on a non-empty
@@ -863,10 +1171,16 @@ async function main(): Promise<void> {
       }) ?? undefined;
 
     sessionTracker = new SessionTracker(sessionTraceId);
-    const costTracker = new CostTracker(sessionTracker);
+    // Combine the two independent correction factors here so CostTracker only
+    // ever deals with one number (see its constructor doc comment) — the raw
+    // config fields (costRateMultiplier, dataResidencyPremium) stay unmerged
+    // in config.ts since they're set/documented independently.
+    const rateMultiplier =
+      (config.costRateMultiplier ?? 1) * (config.dataResidencyPremium ? 1.1 : 1);
+    const costTracker = new CostTracker(sessionTracker, { rateMultiplier });
     taskDetector = new TaskDetector({ costTracker });
     const antiPatternDetector = new AntiPatternDetector();
-    const efficiencyScorer = new EfficiencyScorer();
+    const efficiencyScorer = new EfficiencyScorer({ costTracker });
     const feedbackCollector = new FeedbackCollector();
 
     const contextWindowTracker = new ContextWindowTracker();
@@ -891,21 +1205,117 @@ async function main(): Promise<void> {
     });
     const toolSelectionScorer = new ToolSelectionScorer();
     const qualityProxyTracker = new QualityProxyTracker();
-    // ApiFailureTracker is instantiated but never fed: recordRequest()/recordFailure()
-    // require visibility into model-API-level traffic (LLM provider rate limits,
-    // timeouts, auth errors), which is not observable in either stdio mode (hooks
-    // only see Claude Code's own tool calls) or proxy mode (which forwards to MCP
-    // servers, not the model API). Kept dormant for a future LLM-facing proxy.
+    // Fed via Claude Code's StopFailure hook (see the onApiFailure callback on
+    // eventProcessor below) through recordFailure(). recordRequest() still has
+    // no caller — request-level latency/throughput stays unobservable — and
+    // recordFailure()'s tokensInFlight/recoveryMs/retryCount/totalRequests
+    // inputs stay at their "unknown" defaults for the same reason. See
+    // api-failure-tracker.ts's API_FAILURE_PARTIAL_DATA_NOTE for the full story.
     const apiFailureTracker = new ApiFailureTracker();
+    // Fed via Claude Code's SessionStart hook (see the onSessionStart
+    // callback on eventProcessor below), only for source: 'resume'/'fork'
+    // events that carry the resume-cost fields — a plain startup/clear/
+    // compact SessionStart has nothing to report and never calls recordResume().
+    const sessionResumeTracker = new SessionResumeTracker();
     liveSessionRegistry = new LiveSessionRegistry();
     liveSessionRegistry.startSampling();
     // Unconditional in every mode — decoupled from whether the `--local`
     // dashboard wins its port bind (see startMaintenanceGc()'s doc comment).
     maintenanceGcInterval = startMaintenanceGc({ localStore, liveSessionRegistry });
-    const turnCostAttributor = new TurnCostAttributor();
+
+    // Resolve the authoritative, human-readable session name for a real session
+    // id and push it into both trackers, so their streaming cwd-basename
+    // fallback only fills in when no better name exists (authoritative wins).
+    // Reads Claude Code's own name sources — the background-job state file and
+    // the transcript's last ai-title (see resolveSessionName's precedence).
+    // Best-effort and cheap; any failure just leaves the streaming fallback in
+    // place. A no-op for synthetic ids (local-/proxy-/pending-*), which own no
+    // single transcript. Called both here (eager synchronous resolution) and
+    // from adoptRealSessionId (pending -> real transition and PPID correction),
+    // so the name is refreshed against whichever id ends up being authoritative.
+    const applyAuthoritativeSessionName = (sessionId: string): void => {
+      if (isSyntheticSessionId(sessionId)) return;
+      try {
+        const cwd = process.cwd();
+        // `intent` (the first user prompt) from the job state is SENSITIVE
+        // content, so readJobState only populates it when recordContent is
+        // enabled (config.recordContent is already force-disabled under
+        // highSecurity upstream — never bypass). resolveSessionName still uses
+        // only name/nameSource, which are display labels; the intent is
+        // surfaced separately as session_intent below.
+        const jobState = readJobState(process.env.CLAUDE_JOB_DIR ?? null, {
+          recordContent: config?.recordContent ?? false,
+        });
+        const transcriptTitle = readTranscriptTitle({ sessionId });
+        const resolved = resolveSessionName({ jobState, transcriptTitle, cwd });
+        if (!resolved) return;
+        // Redact ONCE, before the name reaches either tracker, so it stays
+        // redacted in in-memory tracker state and every downstream sink is
+        // covered: the MCP tool responses, the persisted summaries, AND the
+        // dashboard HTTP reads (which read the tracker/registry name directly
+        // and do NOT redact on their own). The `ai-title` source is already
+        // redacted at readTranscriptTitle; the `user`/`auto` job-state names
+        // and the cwd basename are raw until here — redacting all of them
+        // makes the existing tool/persist redaction idempotent and harmless.
+        const safeName = redactSensitive(resolved.name);
+        // Both trackers enforce the no-downgrade invariant internally
+        // (shouldReplaceSessionName), so re-resolving on the persist/shutdown
+        // path can only upgrade or refresh the name — never demote a better
+        // one. `changed` reflects whether SessionTracker actually (re)named,
+        // so the periodic re-resolve stays quiet unless something moved.
+        const changed = sessionTracker?.setAuthoritativeName(safeName, resolved.source) ?? false;
+        liveSessionRegistry?.setAuthoritativeName(sessionId, safeName, resolved.source);
+        // Phase 3: surface the originating intent (first prompt) as
+        // session_intent. jobState.intent is already null unless recordContent
+        // is enabled (gated in readJobState); redact before it reaches the
+        // tracker so every downstream sink (tool response, persisted summary)
+        // stays redacted. When content recording is off, this is a no-op and
+        // session_intent stays null everywhere.
+        if (jobState?.intent) {
+          sessionTracker?.setSessionIntent(redactSensitive(jobState.intent));
+        }
+        if (changed) {
+          logger.info('Resolved authoritative session name', {
+            source: resolved.source,
+            name: safeName,
+          });
+        }
+      } catch (err) {
+        logger.debug('Authoritative session name resolution failed (continuing)', {
+          error: String(err),
+        });
+      }
+    };
+
+    // Eager synchronous stdio path: when the id was resolved up front (job dir
+    // / ppid / cwd breadcrumb), name it now. Provisional (pending-*) and
+    // --local ids are synthetic, so this is a no-op for them — the provisional
+    // window is named later via adoptRealSessionId once its real id resolves.
+    if (options.stdio) applyAuthoritativeSessionName(sessionTraceId);
+    const turnCostAttributor = new TurnCostAttributor({ rateMultiplier });
     const turnTracker = new TurnTracker();
     const gitEfficiencyTracker = new GitEfficiencyTracker();
+    const gitWorkspaceReporter = new GitWorkspaceReporter();
+    // Day-boundary reset bookkeeping for gitEfficiencyTracker: the
+    // tracker has a reset() method but, unlike costTracker/modelUsageTracker/
+    // contextCompositionTracker/turnCostAttributor (reset at session
+    // boundaries just below), nothing ever called it for a day boundary. In
+    // a --local dashboard daemon that survives one midnight, "Today's
+    // activity across all sessions" would otherwise silently become an
+    // unbounded all-time counter. `capturedRepoContext`/
+    // `capturedBranchDivergence` are re-hydrated after each reset (see
+    // onRecord below) so resetting the day's activity counters doesn't also
+    // forget which repo/branch this process is watching — that identity is
+    // read from disk once at startup, not part of "today's activity".
+    let gitEfficiencyDayKey = localDateKey();
+    let capturedRepoContext: RepoContext | null = null;
+    let capturedBranchDivergence: { ahead: number; behind: number } | null = null;
     const workflowRunTracker = new WorkflowRunTracker();
+    // Always constructed (cheap, stateless until a client calls one of its
+    // report_* tools) so nr_observe_report_tool_call/_session_start/_session_end
+    // are available on every --stdio connection, matching docs/ADAPTERS.md's
+    // generic-mcp setup instructions.
+    const genericMcpAdapter = new GenericMcpAdapter();
 
     // Read-only filesystem reader for `/api/workflows` routes.
     // Constructed eagerly (not just inside the dashboard block) so when only
@@ -913,6 +1323,10 @@ async function main(): Promise<void> {
     // when the watcher's reconciliation pass needs them.
     const workflowStoreInstance = new WorkflowStore({
       getCostForRun: (runId) => costTracker.getCostForWorkflowRun(runId),
+      // Lets the "Workflow spend" KPI flag its total as partial (a partial
+      // mitigation) instead of silently treating "this process never
+      // observed the run's cost" the same as "confirmed $0".
+      hasCostForRun: (runId) => costTracker.hasCostForWorkflowRun(runId),
     });
 
     // Per-session subagent timeline reader — backs the "agent fan-out"
@@ -927,17 +1341,152 @@ async function main(): Promise<void> {
     };
 
     sessionStore = new SessionStore({ storagePath: config.storagePath });
+    // Non-null capture so the aggregator's callback (invoked lazily, long
+    // after this point) doesn't have to re-narrow `sessionStore: SessionStore
+    // | undefined` — same pattern as sessionStoreForCostBaseline below.
+    const sessionStoreForAggregator = sessionStore;
     const currentSessionId = sessionTracker.getMetrics().sessionId;
     let currentRepoName: string | null = null;
 
+    // An unscoped process (--local, or a provisional --stdio window) drains
+    // every unowned buffer and folds it into trackers keyed by its own
+    // synthetic id, which persistSession() skips — so without this rollup the
+    // sessions it observes are never written to disk at all. See
+    // local-session-aggregator.ts for why that hits Copilot but not Claude Code.
+    const localSessionAggregator = new LocalSessionAggregator({
+      // Restart survival: the first subagent turn this process sees for a
+      // session folds in whatever that session's file already says (a
+      // --stdio engine's final write, or this daemon's own last checkpoint)
+      // before adding the tail — see applyPersistedBaseline's doc comment.
+      persistedCostBaseline: (id) => sessionStoreForAggregator.loadSession(id),
+    });
+    const repoNameResolver = new RepoNameResolver();
+
+    const budgetTracker = new BudgetTracker({
+      sessionBudgetUsd: config.sessionBudgetUsd,
+      dailyBudgetUsd: config.dailyBudgetUsd,
+      weeklyBudgetUsd: config.weeklyBudgetUsd,
+    });
+
+    // Recover a resumed session's pre-restart cost/token totals — see
+    // CostTracker.seedFromPersisted()'s doc comment for the bug this fixes.
+    // Also seeds ModelUsageTracker and BudgetTracker, which have the identical
+    // in-memory-only, resets-on-restart problem for their own metrics — without
+    // this, their numbers would stay inconsistent with (short of) CostTracker's
+    // now-correct session total after a restart.
+    // Guarded per-id (not a single fired-once flag) because adoptRealSessionId
+    // below can call this again for a *different* id after a pending->real
+    // transition or a PPID correction.
+    const rehydratedTrackerSessionIds = new Set<string>();
+    const rehydrateTrackersIfResumed = (sessionId: string): void => {
+      if (isSyntheticSessionId(sessionId)) return;
+      if (rehydratedTrackerSessionIds.has(sessionId)) return;
+      rehydratedTrackerSessionIds.add(sessionId);
+      try {
+        const persisted = sessionStore!.loadSession(sessionId);
+        if (!persisted) return;
+        costTracker.seedFromPersisted(buildCostTrackerSeed(persisted));
+        sessionTracker!.seedFromPersisted({
+          toolCallCount: persisted.toolCallCount,
+          bashCommandCount: persisted.bashCommandCount,
+        });
+        budgetTracker.seedFiredThresholdsFromSessionTotal(
+          costTracker.getMetrics().sessionTotalCostUsd ?? 0,
+        );
+        modelUsageTracker.seedFromPersisted(persisted.modelBreakdown);
+        qualityProxyTracker.seedFromPersisted(persisted.qualityProxy);
+        // Non-null: taskDetector is assigned unconditionally earlier in this
+        // same setup path (see line ~980), before rehydrateTrackersIfResumed
+        // can be invoked — same pattern as the other `taskDetector!` use
+        // below, needed because its declared type stays `| undefined` for
+        // callers outside this path.
+        taskDetector!.seedFromPersisted(buildTaskDetectorSeed(persisted));
+        if (
+          persisted.efficiencyScore !== null &&
+          persisted.efficiencyScoreComponents &&
+          (persisted.efficiencyScoreSampleCount ?? 0) > 0
+        ) {
+          efficiencyScorer.seedFromPersisted({
+            score: persisted.efficiencyScore,
+            components: persisted.efficiencyScoreComponents,
+            sampleCount: persisted.efficiencyScoreSampleCount ?? 0,
+          });
+        }
+        logger.info('Rehydrated trackers from a prior checkpoint for this session', {
+          sessionId,
+          estimatedCostUsd: persisted.estimatedCostUsd,
+        });
+      } catch (err) {
+        logger.warn('Failed to rehydrate trackers from a prior checkpoint', {
+          sessionId,
+          error: String(err),
+        });
+      }
+    };
+    if (!isProvisional && !resolvedViaCwdOnly) rehydrateTrackersIfResumed(currentSessionId);
+
+    // Each command is isolated so a slow/missing git or remote doesn't block
+    // the others. Uses spawnSync (no shell) to avoid injection; stderr is
+    // suppressed via stdio rather than shell redirection. Timeout 2s per call.
+    const { spawnSync } = await import('node:child_process');
+    const GIT_OPTS = {
+      encoding: 'utf-8' as const,
+      timeout: 2000,
+      stdio: ['ignore', 'pipe', 'ignore'] as ['ignore', 'pipe', 'ignore'],
+    };
+    const BRANCH_DIVERGENCE_REFRESH_MS = 5 * 60 * 1000;
+
+    // Repo context for the dashboard header — hydrated BEFORE the
+    // today-sessions replay loop below so GitEfficiencyTracker.
+    // replayTimeline() can filter each session's timeline against this
+    // process's own repoContext.repoName instead of blending in another
+    // repo's commits/conflicts/force-pushes.
+    const remoteResult = spawnSync('git', ['remote', 'get-url', 'origin'], GIT_OPTS);
+    const branchResult = spawnSync('git', ['branch', '--show-current'], GIT_OPTS);
+    const remoteName = 'origin';
+    let defaultBranch = 'main';
+    if (remoteResult.status === 0 && branchResult.status === 0) {
+      const branch = branchResult.stdout.trim();
+      const repoName = repoNameFromRemote(remoteResult.stdout);
+      currentRepoName = repoName;
+
+      const symbolicRefResult = spawnSync(
+        'git',
+        ['symbolic-ref', '--short', `refs/remotes/${remoteName}/HEAD`],
+        GIT_OPTS,
+      );
+      if (symbolicRefResult.status === 0) {
+        defaultBranch = parseDefaultBranchFromSymbolicRef(symbolicRefResult.stdout, remoteName);
+      }
+
+      capturedRepoContext = {
+        repoName,
+        branch: branch || null,
+        remoteName,
+        defaultBranch,
+      };
+      gitEfficiencyTracker.hydrateRepoContext(capturedRepoContext);
+    }
+
     // Hydrate git efficiency tracker with today's prior sessions so the
     // dashboard shows all-day git activity, not just the current session.
+    // Each session's own repoName is passed through so a session
+    // worked on in a different repo earlier today doesn't get counted
+    // against whichever repo this process's header currently names.
     const todaySessions = sessionStore.loadSessionsOverlappingToday();
+    // Shared across every session in this loop (not one fresh resolver per
+    // session) so its per-directory cache stays warm across sessions that
+    // touch the same worktree.
+    const gitWorkspaceIdentityResolver = new WorktreeIdentityResolver();
     for (const session of todaySessions) {
       if (session.sessionId === currentSessionId) continue;
       if (session.timeline && session.timeline.length > 0) {
-        gitEfficiencyTracker.replayTimeline(session.timeline);
+        gitEfficiencyTracker.replayTimeline(session.timeline, session.repoName);
       }
+
+      const replayed = replaySessionToActivityRecords(session, gitWorkspaceIdentityResolver);
+      if (replayed.records.length === 0) continue;
+      gitWorkspaceReporter.ingestRecords(replayed.records, replayed.identities);
     }
 
     // Hydrate instruction-drift tracker with the last 7 days of prior
@@ -958,85 +1507,85 @@ async function main(): Promise<void> {
     // Also hydrate from git log — commit commands often aren't captured by
     // tool hooks (Claude Code commits internally), so we read the actual
     // repo history to get an accurate commit count for today.
-    // Each command is isolated so a slow/missing git or remote doesn't block
-    // the others. Uses spawnSync (no shell) to avoid injection; stderr is
-    // suppressed via stdio rather than shell redirection. Timeout 2s per call.
-    const { spawnSync } = await import('node:child_process');
-    const GIT_OPTS = {
-      encoding: 'utf-8' as const,
-      timeout: 2000,
-      stdio: ['ignore', 'pipe', 'ignore'] as ['ignore', 'pipe', 'ignore'],
-    };
-
     // spawnSync with ENOENT doesn't throw — it returns { status: null, error: Error }.
     // The status === 0 guard handles unavailable-git without a try/catch.
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const logResult = spawnSync(
-      'git',
-      ['log', `--since=${todayStr}T00:00:00Z`, '--format=%H %ct'],
-      GIT_OPTS,
-    );
-    if (logResult.status === 0 && logResult.stdout !== null) {
-      const commits = logResult.stdout
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => {
-          const [hash, epochStr] = line.split(' ');
-          return { hash: hash ?? '', timestamp: parseInt(epochStr ?? '0', 10) * 1000 };
-        });
-      gitEfficiencyTracker.hydrateGitLog(commits);
-    }
+    //
+    // Repos are collected from an explicit NR_AI_GIT_REPOS list plus every repo
+    // root seen in observed session cwds, rather than relying on this process's
+    // own cwd. A dashboard started in one repo would otherwise report that
+    // repo's history no matter which repos are actually being worked in — and,
+    // with no --author filter, count other contributors' commits as the user's.
+    const gitAuthorEmail = resolveAuthorEmail(process.cwd());
+    const configuredRepoRoots = (process.env.NR_AI_GIT_REPOS ?? '')
+      .split(/[,:]/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
 
-    // Repo context for the dashboard header
-    const remoteResult = spawnSync('git', ['remote', 'get-url', 'origin'], GIT_OPTS);
-    const branchResult = spawnSync('git', ['branch', '--show-current'], GIT_OPTS);
-    const remoteName = 'origin';
-    let defaultBranch = 'main';
-    if (remoteResult.status === 0 && branchResult.status === 0) {
-      const remoteUrl = remoteResult.stdout.trim();
-      const branch = branchResult.stdout.trim();
-      // Extract repo name from remote URL (handles both HTTPS and SSH)
-      const repoMatch = remoteUrl.match(/[/:]([^/]+\/[^/]+?)(?:\.git)?$/);
-      const repoName = repoMatch ? repoMatch[1] : null;
-      currentRepoName = repoName;
+    const collectRepoRoots = (): string[] => {
+      const roots = new Set<string>();
+      const selfRoot = repoNameResolver.root(process.cwd());
+      if (selfRoot) roots.add(selfRoot);
+      for (const dir of configuredRepoRoots) {
+        const root = repoNameResolver.root(dir);
+        if (root) roots.add(root);
+      }
+      for (const cwd of localSessionAggregator.cwds()) {
+        const root = repoNameResolver.root(cwd);
+        if (root) roots.add(root);
+      }
+      return [...roots];
+    };
 
-      const symbolicRefResult = spawnSync(
+    const hydrateGitCommits = (): void => {
+      // Recomputed per call so a long-lived dashboard rolls over at midnight
+      // instead of reporting "today" relative to the day it was started.
+      const todayStartMs = new Date().setHours(0, 0, 0, 0);
+      // The Git tab's tree shows 30 days of history — the shared git-log
+      // collection needs to reach that far even though the per-session
+      // GitEfficiencyTracker below only ever wants today's commits.
+      const hydrationSince = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+        .toISOString()
+        .slice(0, 10);
+      const commits = collectCommitsAcrossRepos(collectRepoRoots(), hydrationSince, gitAuthorEmail);
+      gitWorkspaceReporter.hydrateGitLog(commits);
+      const todaysCommits = commits.filter((c) => c.timestamp >= todayStartMs);
+      if (todaysCommits.length > 0) gitEfficiencyTracker.hydrateGitLog(todaysCommits);
+    };
+
+    hydrateGitCommits();
+    const gitHydrationInterval = setInterval(hydrateGitCommits, 5 * 60_000);
+    gitHydrationInterval.unref();
+
+    // Branch divergence from the real default branch — how far ahead/behind
+    // are we? The dashboard polls this every 5s, implying a live number, but
+    // without this re-hydration it would otherwise be computed once here at
+    // startup and then frozen for the life of the process. Re-running it on
+    // an interval (rather than only at startup) keeps it reasonably current
+    // in a long-running `--local` daemon.
+    const remoteDefaultBranch = `${remoteName}/${defaultBranch}`;
+    const refreshBranchDivergence = (): void => {
+      const aheadResult = spawnSync(
         'git',
-        ['symbolic-ref', '--short', `refs/remotes/${remoteName}/HEAD`],
+        ['rev-list', '--count', `${remoteDefaultBranch}..HEAD`],
         GIT_OPTS,
       );
-      if (symbolicRefResult.status === 0) {
-        defaultBranch = parseDefaultBranchFromSymbolicRef(symbolicRefResult.stdout, remoteName);
+      const behindResult = spawnSync(
+        'git',
+        ['rev-list', '--count', `HEAD..${remoteDefaultBranch}`],
+        GIT_OPTS,
+      );
+      if (aheadResult.status === 0 && behindResult.status === 0) {
+        const ahead = parseInt(aheadResult.stdout.trim(), 10);
+        const behind = parseInt(behindResult.stdout.trim(), 10);
+        if (!Number.isNaN(ahead) && !Number.isNaN(behind)) {
+          capturedBranchDivergence = { ahead, behind };
+          gitEfficiencyTracker.hydrateBranchDivergence(ahead, behind);
+        }
       }
-
-      gitEfficiencyTracker.hydrateRepoContext({
-        repoName,
-        branch: branch || null,
-        remoteName,
-        defaultBranch,
-      });
-    }
-
-    // Branch divergence from the real default branch — how far ahead/behind are we?
-    const remoteDefaultBranch = `${remoteName}/${defaultBranch}`;
-    const aheadResult = spawnSync(
-      'git',
-      ['rev-list', '--count', `${remoteDefaultBranch}..HEAD`],
-      GIT_OPTS,
-    );
-    const behindResult = spawnSync(
-      'git',
-      ['rev-list', '--count', `HEAD..${remoteDefaultBranch}`],
-      GIT_OPTS,
-    );
-    if (aheadResult.status === 0 && behindResult.status === 0) {
-      const ahead = parseInt(aheadResult.stdout.trim(), 10);
-      const behind = parseInt(behindResult.stdout.trim(), 10);
-      if (!Number.isNaN(ahead) && !Number.isNaN(behind)) {
-        gitEfficiencyTracker.hydrateBranchDivergence(ahead, behind);
-      }
-    }
+    };
+    refreshBranchDivergence();
+    branchDivergenceInterval = setInterval(refreshBranchDivergence, BRANCH_DIVERGENCE_REFRESH_MS);
+    branchDivergenceInterval.unref?.();
 
     // Cached prior-cost baseline. Refreshed lazily so:
     //   - sessions persisted by other MCPs during this session land in totals
@@ -1086,6 +1635,7 @@ async function main(): Promise<void> {
     const claudeMdTracker = new ClaudeMdTracker({
       sessionStore,
       instructionFilePaths: activeInstructionFilePaths,
+      costTracker,
     });
     const costPerOutcomeAnalyzer = new CostPerOutcomeAnalyzer();
     const personalCoach = new PersonalCoach(weeklySummaryGenerator, config.developer);
@@ -1095,24 +1645,18 @@ async function main(): Promise<void> {
       claudeMdTracker,
     });
     const recommendationEngine = new RecommendationEngine({
-      sessionStore,
       trendAnalyzer,
       collaborationProfiler,
       claudeMdTracker,
       promptFeedbackEngine,
       costPerOutcomeAnalyzer,
       taskDetector,
+      modelUsageTracker,
     });
 
     const sessionStartMs = Date.now();
 
     const liveBus = new LiveEventBus();
-
-    const budgetTracker = new BudgetTracker({
-      sessionBudgetUsd: config.sessionBudgetUsd,
-      dailyBudgetUsd: config.dailyBudgetUsd,
-      weeklyBudgetUsd: config.weeklyBudgetUsd,
-    });
 
     // Construct AuditTrailManager once and share it across NrIngestManager and the
     // DashboardServer. In local mode there is no NrIngestManager, but the dashboard
@@ -1123,7 +1667,12 @@ async function main(): Promise<void> {
       localStore,
     });
 
-    const dashboardEnabled = config.mode === 'local' || config.mode === 'both';
+    // options.local always gets a dashboard, regardless of what config.mode
+    // resolves to — the try/catch above only forces mode: 'local' when cloud
+    // credentials are absent, so `--local` combined with an explicit
+    // `mode: 'cloud'` config (real credentials present) would otherwise skip
+    // the dashboard the user explicitly asked for by passing --local.
+    const dashboardEnabled = options.local || config.mode === 'local' || config.mode === 'both';
     let alertEngine: LocalAlertEngine | undefined;
     let alertSnapshotCollector: AlertSnapshotCollector | undefined;
     let alertLog: AlertLog | undefined;
@@ -1223,6 +1772,13 @@ async function main(): Promise<void> {
         alertEvaluationInterval.unref?.();
       }
 
+      // Platform is env-derived and fixed for this process's lifetime —
+      // resolve it once here rather than inside observabilityHealth's
+      // getSnapshot() closure below, which fires on every dashboard poll
+      // (10-30s) and would otherwise re-run full platform detection (and
+      // its info-level log line) on every single request.
+      const activePlatformName = createDefaultRegistry().getActive().platformName;
+
       dashboardServer = new DashboardServer({
         port: config.dashboard.port,
         host: config.dashboard.host,
@@ -1243,11 +1799,19 @@ async function main(): Promise<void> {
             });
           },
           antiPatternDetector,
+          retryDetector,
+          apiFailureTracker,
+          instructionDriftTracker,
+          decisionTracker,
+          turnCostAttributor,
           weeklySummaryGenerator,
           budgetTracker,
           latencyTracker,
           personalCoach,
           trendAnalyzer,
+          recommendationEngine,
+          claudeMdTracker,
+          collaborationProfiler,
           alertLog,
           taskDetector,
           efficiencyScorer,
@@ -1257,8 +1821,11 @@ async function main(): Promise<void> {
           toolCallBuffer: toolCallBufferAccessor,
           liveSessionRegistry,
           gitEfficiencyTracker,
+          gitWorkspaceReporter,
           concurrencyTracker: liveSessionRegistry,
           contextTracker,
+          contextCompositionTracker,
+          contextEfficiencyTracker: contextWindowTracker,
           config,
           configFilePath: options.config ?? resolve(DEFAULT_STORAGE_PATH, 'config.json'),
           // eventProcessor isn't assigned until after this object is built —
@@ -1308,22 +1875,37 @@ async function main(): Promise<void> {
           observabilityHealth: {
             getSnapshot: (): ObservabilityHealthSnapshot => {
               // Read live counters off the SubagentWatcher when it's running.
-              // A null binding => watcher disabled (env flag off / wrong mode)
-              // => a zeroed "disabled" snapshot. costSelfCheckDeltaPct stays
-              // null until the 1h self-check is wired.
+              // A null binding => watcher disabled (env flag off) => a zeroed
+              // "disabled" snapshot. costSelfCheckDeltaPct stays null until
+              // the 1h self-check is wired.
               const stats = activeSubagentWatcher?.getHealthStats();
+              const watcherActive = activeSubagentWatcher !== null;
+              const watcherDisabledReason: ObservabilityHealthSnapshot['watcherDisabledReason'] =
+                watcherActive ? null : 'env_var';
               return {
-                watcherActive: activeSubagentWatcher !== null,
+                watcherActive,
                 filesWatched: stats?.filesWatched ?? 0,
                 parseErrors: stats?.parseErrors ?? 0,
                 watcherDisabledByLock: stats?.watcherDisabledByLock ?? false,
                 costSelfCheckDeltaPct: null,
+                watcherDisabledReason,
+                copilotDebugLoggingDisabled:
+                  activeCopilotUsageWatcher?.getHealth().debugLoggingLikelyDisabled ?? false,
+                copilotSdkExtensionMissing: isCopilotSdkExtensionMissing(activePlatformName),
+                platformDetectionFellBack: isPlatformDetectionFellBack(
+                  eventProcessor?.activePlatform ?? activePlatformName,
+                ),
               };
             },
           },
         },
         alertEngine,
         alertLog,
+        ...(unforwardedSessionMonitor
+          ? {
+              unforwardedSessions: () => unforwardedSessionMonitor!.getSnapshot(),
+            }
+          : {}),
       });
       let addr: { address: string; port: number } | undefined;
       try {
@@ -1390,6 +1972,12 @@ async function main(): Promise<void> {
     }
 
     let capturedNrIngest: NrIngestManager | undefined;
+    // Set once the first tool record arrives while cloud ingest is expected but
+    // not yet wired up (still-provisional session, or the async resolver hasn't
+    // finished). Without this, a session that never leaves the provisional
+    // window sends metrics normally (a separate path) while every AiToolCall/
+    // AiMcpToolCall/etc. event is silently dropped — see issue #320.
+    let warnedMissingIngest = false;
     if (config.mode !== 'local' && !isProvisional) {
       if (!config.licenseKey || !config.accountId) {
         throw new Error(
@@ -1409,6 +1997,9 @@ async function main(): Promise<void> {
         teamId: config.teamId,
         projectId: config.projectId,
         orgId: config.orgId,
+        repoUrl: config.repoUrl,
+        companionMode: config.companionMode,
+        tiers: config.tiers,
         sessionTracker,
         localStore,
         auditTrail,
@@ -1417,45 +2008,69 @@ async function main(): Promise<void> {
         costTracker,
         efficiencyScorer,
         feedbackCollector,
+        apiFailureTracker,
+        gitEfficiencyTracker,
         turnCostAttributor,
         sessionTraceId,
       });
       capturedNrIngest = nrIngest;
     }
 
+    // Start homelab forwarder if configured. Construction validates
+    // homelabServerUrl (scheme + cloud-metadata-endpoint check) and can
+    // throw — caught here so a bad/malicious URL only disables forwarding,
+    // matching the "forwarding failures are non-fatal" contract in
+    // docs/homelab.md, rather than crashing MCP startup.
+    if (config.homelabServerUrl && config.homelabToken) {
+      try {
+        homelabForwarder = new HomelabForwarder({
+          serverUrl: config.homelabServerUrl,
+          token: config.homelabToken,
+          developer: config.developer,
+          sessionId: sessionTraceId ?? 'unknown',
+        });
+        homelabForwarder.start();
+      } catch (err) {
+        homelabForwarder = null;
+        logger.error('Homelab forwarder failed to start — continuing without it', {
+          error: String(err),
+        });
+      }
+    }
+
     const capturedAlertEngine = alertEngine;
     const capturedAlertSnapshotCollector = alertSnapshotCollector;
+    // BudgetTracker invokes this from inside updateCost(), so an uncaught
+    // throw would skip its remaining periods and abort the caller's record
+    // handling. Guard it like the periodic evaluation tick, with the NR ingest
+    // and the local alert engine guarded separately so neither skips the other.
     budgetTracker.setOnThreshold((event) => {
-      capturedNrIngest?.ingestBudgetWarning(event);
       logger.warn('Budget threshold reached', {
         period: event.period,
         pct: event.thresholdPct,
         spentUsd: event.spentUsd.toFixed(4),
         budgetUsd: event.budgetUsd.toFixed(2),
       });
-      // Route into the local alert engine so configured rules can fire.
-      if (capturedAlertEngine) {
-        capturedAlertEngine.evaluate(
-          {
-            timestamp: event.timestamp,
-            cost: { sessionUsd: 0, todayUsd: 0, weekUsd: 0 },
-            efficiency: { score: null },
-            antiPatterns: [],
-            latency: [],
-            toolFailures: [],
-            budgetThresholds: [
-              {
-                period: event.period,
-                thresholdPct: event.thresholdPct,
-                spentUsd: event.spentUsd,
-                budgetUsd: event.budgetUsd,
-              },
-            ],
-          },
-          Date.now(),
-        );
+      try {
+        capturedNrIngest?.ingestBudgetWarning(event);
+      } catch (err) {
+        logger.warn('Budget warning ingest failed', { error: String(err) });
+      }
+      try {
+        // Route into the local alert engine so budget rules can fire.
+        capturedAlertEngine?.evaluateBudgetThreshold(event, Date.now());
+      } catch (err) {
+        logger.warn('Budget threshold alert evaluation failed', { error: String(err) });
       }
     });
+    // Attributes hook records to the subagent that made them where the hook
+    // envelope left agent_id/agent_type out (agentId via a toolUseId join
+    // against SubagentWatcher's transcript tail, agentType via the
+    // transcript's meta sidecar, the envelope, or the parent's own Agent tool
+    // call) and gives onSubagentTurn the type for cost breakdown. Size-capped
+    // with idle expiry so a long-running --local daemon doesn't keep one entry
+    // per subagent call forever.
+    const subagentAttribution = new SubagentAttributionIndex();
     eventProcessor = new HookEventProcessor({
       store: localStore,
       // --local mode and the provisional --stdio window own no specific Claude
@@ -1463,10 +2078,21 @@ async function main(): Promise<void> {
       // live sessions' events. After real session ID resolution the processor
       // is hot-swapped to the scoped store via replaceStore().
       drainAllSessions: !options.stdio || isProvisional,
-      onRecord: (rawRecord) => {
+      onRecord: (incomingRecord) => {
+        // Attributed before any consumer (notably auditTrail below) sees the
+        // record, so audit/security events carry agentId and agentType.
+        // The watcher's on-demand read is synchronous, which is what keeps it
+        // ahead of auditTrail.
+        const rawRecord = subagentAttribution.attributeAtIntake(
+          incomingRecord,
+          activeSubagentWatcher,
+        );
         if (!config || !sessionTracker || !taskDetector) {
           logger.warn('onRecord called before full initialization; skipping');
           return;
+        }
+        if (cwdGuessActivity && rawRecord.sessionId === cwdGuessActivity.staleId) {
+          cwdGuessActivity.onActivity();
         }
 
         // Capture active task ID before recordToolCall may close the current task
@@ -1475,9 +2101,14 @@ async function main(): Promise<void> {
 
         sessionTracker.recordToolCall(rawRecord);
         taskDetector.recordToolCall(rawRecord);
+        localSessionAggregator.recordToolCall(rawRecord);
         if (rawRecord.sessionId) {
           liveSessionRegistry!.touch(rawRecord.sessionId, rawRecord.cwd as string | undefined);
         }
+        // Fallback type source: the parent's Agent call, for subagents whose
+        // transcript has no meta sidecar (see onSubagentTurn). Its PostToolUse
+        // normally fires only after a foreground subagent returns.
+        subagentAttribution.recordAgentToolCall(rawRecord);
 
         if (config.otlp.transport !== 'nr-events-api' && taskSpanTracker && sessionSpan) {
           // Emit tool call span — parent is the active task span (or session span if no task)
@@ -1496,7 +2127,23 @@ async function main(): Promise<void> {
         contextWindowTracker.recordToolCall(rawRecord);
         contextTracker.recordToolCall(rawRecord);
         latencyTracker.recordToolCall(rawRecord);
-        retryDetector.recordToolCall(rawRecord);
+        const thrashingAlert = retryDetector.recordToolCall(rawRecord);
+        if (thrashingAlert) {
+          capturedNrIngest?.ingestRetryAlert(thrashingAlert, {
+            platform: typeof rawRecord.platform === 'string' ? rawRecord.platform : undefined,
+          });
+          liveBus.emit('retry-alert', {
+            // alert.sessionId (not sessionTraceId) — see RetryDetector's
+            // session-grouping comment: in --local mode this process's own
+            // RetryDetector drains every session's buffer, so only the
+            // alert's own sessionId can be trusted to name the offending one.
+            sessionId: thrashingAlert.sessionId ?? undefined,
+            toolName: thrashingAlert.toolName,
+            occurrences: thrashingAlert.occurrences,
+            tokensWasted: thrashingAlert.tokensWastedEstimate,
+            ts: thrashingAlert.timestamp,
+          });
+        }
         qualityProxyTracker.recordToolCall(rawRecord);
         const turnId = turnTracker.recordToolCall(rawRecord);
         const turnNumber = turnTracker.getCurrentTurnNumber();
@@ -1506,7 +2153,53 @@ async function main(): Promise<void> {
           rawRecord.transcriptPath as string | undefined,
         );
         instructionDriftTracker.recordToolCall(rawRecord);
+        // Day-boundary reset — checked on every record rather than on
+        // a timer so it fires promptly on the next real tool call after
+        // midnight without needing a separate interval. reset() clears
+        // repoContext/branch-divergence too, so both are re-hydrated
+        // immediately from what was captured at startup — this endpoint's
+        // "today's activity" counters reset, not the tracker's identity of
+        // which repo/branch it's watching.
+        const gitDayKey = localDateKey();
+        if (gitDayKey !== gitEfficiencyDayKey) {
+          gitEfficiencyDayKey = gitDayKey;
+          gitEfficiencyTracker.reset(sessionTraceId);
+          if (capturedRepoContext) gitEfficiencyTracker.hydrateRepoContext(capturedRepoContext);
+          if (capturedBranchDivergence) {
+            gitEfficiencyTracker.hydrateBranchDivergence(
+              capturedBranchDivergence.ahead,
+              capturedBranchDivergence.behind,
+            );
+          }
+          // Re-run the git-log hydration (mirrors the startup hydration
+          // above) scoped to the new local day. Without this, commits
+          // Claude Code makes internally (not captured by tool hooks — see
+          // the comment on the startup hydration) would only be visible via
+          // hook-observed `git commit` calls made *after* this reset, so
+          // "commits today" would under-report on day 2+ of a long-lived
+          // `--local` daemon. Uses local midnight (not UTC) since that's the
+          // boundary `localDateKey()` just crossed.
+          const newDayMidnight = new Date();
+          newDayMidnight.setHours(0, 0, 0, 0);
+          const dayBoundaryLogResult = spawnSync(
+            'git',
+            ['log', `--since=${newDayMidnight.toISOString()}`, '--format=%H %ct'],
+            GIT_OPTS,
+          );
+          if (dayBoundaryLogResult.status === 0 && dayBoundaryLogResult.stdout !== null) {
+            const dayBoundaryCommits = dayBoundaryLogResult.stdout
+              .trim()
+              .split('\n')
+              .filter(Boolean)
+              .map((line) => {
+                const [hash, epochStr] = line.split(' ');
+                return { hash: hash ?? '', timestamp: parseInt(epochStr ?? '0', 10) * 1000 };
+              });
+            gitEfficiencyTracker.hydrateGitLog(dayBoundaryCommits);
+          }
+        }
         gitEfficiencyTracker.recordToolCall(rawRecord);
+        gitWorkspaceReporter.recordToolCall(rawRecord);
 
         const record: ToolCallRecord = { ...rawRecord, turn_id: turnId, turn_number: turnNumber };
 
@@ -1516,7 +2209,18 @@ async function main(): Promise<void> {
         // populates regardless of mode. NrIngestManager (when present) reuses the
         // returned AuditRecord rather than recording a second time.
         const auditRecord = auditTrail.recordToolCall(record);
+        if (!capturedNrIngest && config.mode !== 'local' && !warnedMissingIngest) {
+          warnedMissingIngest = true;
+          logger.warn(
+            'Tool record arrived with cloud ingest not yet initialized — AiToolCall/AiMcpToolCall events are being dropped until session ID resolution completes',
+          );
+        }
         capturedNrIngest?.ingestToolCall(record, auditRecord);
+        // Only set on --local, whose unscoped drain skips every per-session
+        // buffer with a live owning engine. Records from the legacy shared
+        // buffer.jsonl are drained regardless and usually carry no sessionId,
+        // so the monitor counts them as untracked.
+        unforwardedSessionMonitor?.recordToolCall(record.sessionId);
 
         // SSE consumers filter by sessionId for the per-session live tail.
         // Records without a sessionId are legacy buffer entries that surfaced
@@ -1544,9 +2248,18 @@ async function main(): Promise<void> {
 
         // Fallback cost estimation from tool payload byte sizes.
         // Only fires when no exact token report has been received yet for this session,
-        // to avoid double-counting with explicit nr_observe_report_tokens calls.
+        // to avoid double-counting with explicit nr_observe_report_tokens calls — and
+        // only for this process's own session, since costTracker's total is persisted
+        // as that session's cost (see shouldApplyCostEstimate, #877).
         const estimateBytes = (record.inputSizeBytes ?? 0) + (record.outputSizeBytes ?? 0);
-        if (estimateBytes > 0 && costTracker.getMetrics().reportCount === 0) {
+        if (
+          shouldApplyCostEstimate({
+            estimateBytes,
+            reportCount: costTracker.getMetrics().reportCount,
+            recordSessionId: record.sessionId,
+            ownSessionId: sessionTraceId,
+          })
+        ) {
           // Prefer a model already learned from real token events over the config
           // default (which is just a guess). Falls back to config.model on cold start.
           const estimateModel = costTracker.getMetrics().model ?? config.model;
@@ -1606,7 +2319,8 @@ async function main(): Promise<void> {
             platform: typeof firstRecord?.platform === 'string' ? firstRecord.platform : undefined,
             taskId: task.taskId,
           };
-          const { patterns } = antiPatternDetector.analyze(task.toolCalls);
+          const enrichedToolCalls = task.toolCalls.map((r) => subagentAttribution.backfill(r));
+          const { patterns } = antiPatternDetector.analyze(enrichedToolCalls);
           efficiencyScorer.computeScore(task, patterns);
           for (const pattern of patterns) {
             capturedNrIngest?.ingestAntiPattern(pattern, context);
@@ -1632,10 +2346,22 @@ async function main(): Promise<void> {
             });
           }
         }
+        homelabForwarder?.enqueue(record);
       },
       onTokenEvent: (tokenEvent) => {
         if (!costTracker || !config) return;
-        turnCostAttributor.recordTokenEvent(tokenEvent);
+        // A --stdio engine's CostTracker total is persisted as its own
+        // session's cost and its AiTurnCost events carry its own session id, so
+        // another session's tokens (drained while the id is still provisional)
+        // are priced for that session's rollup only. --local owns no single
+        // session and keeps folding everything.
+        const isOwnEvent = isTokenEventForThisProcess({
+          stdio: options.stdio === true,
+          eventSessionId: tokenEvent.sessionId ?? null,
+          ownSessionId: sessionTraceId,
+        });
+        const closedTurn = turnCostAttributor.recordTokenEvent(tokenEvent);
+        if (closedTurn && isOwnEvent) capturedNrIngest?.ingestTurnCost(closedTurn);
         const usage = {
           inputTokens: tokenEvent.inputTokens,
           outputTokens: tokenEvent.outputTokens,
@@ -1644,13 +2370,26 @@ async function main(): Promise<void> {
           cacheCreationTokens: tokenEvent.cacheCreationTokens,
           totalTokens: tokenEvent.inputTokens + tokenEvent.outputTokens,
         };
-        const breakdown = costTracker.recordTokenUsage(usage, tokenEvent.model);
-        modelUsageTracker.recordUsage(
-          tokenEvent.model,
-          tokenEvent.inputTokens,
-          tokenEvent.outputTokens,
-          breakdown.totalUsd,
-        );
+        let breakdown: CostBreakdown;
+        if (!isOwnEvent) {
+          breakdown = costTracker.priceUsage(usage, tokenEvent.model);
+        } else {
+          breakdown = costTracker.recordTokenUsage(usage, tokenEvent.model, {
+            timestampMs: tokenEvent.timestamp,
+            replacesEstimates: true,
+            ...(tokenEvent.responseMs !== undefined && { responseMs: tokenEvent.responseMs }),
+          });
+          modelUsageTracker.recordUsage(tokenEvent.model, usage, breakdown.totalUsd);
+        }
+        localSessionAggregator.recordTokenUsage(tokenEvent.sessionId, {
+          timestamp: tokenEvent.timestamp,
+          costUsd: breakdown.totalUsd,
+          model: tokenEvent.model,
+          inputTokens: tokenEvent.inputTokens,
+          outputTokens: tokenEvent.outputTokens,
+          cacheReadTokens: tokenEvent.cacheReadTokens,
+          cacheCreationTokens: tokenEvent.cacheCreationTokens,
+        });
         contextCompositionTracker.recordTokenEvent(tokenEvent);
 
         const ctxSnapshot = contextTracker.recordTurn(tokenEvent);
@@ -1728,6 +2467,11 @@ async function main(): Promise<void> {
       // `AiSubagentTurn` event per turn for NR-side queryability.
       onSubagentTurn: (turn) => {
         if (!costTracker || !config) return;
+        // The watcher's onTurnRead already joined this turn when it read it;
+        // repeating it here covers turns an earlier process's watcher left in
+        // the buffer.
+        subagentAttribution.recordSubagentTurn(turn);
+        const agentType = subagentAttribution.agentTypeFor(turn.agentId);
         const usage: TokenUsage = {
           inputTokens: turn.inputTokens,
           outputTokens: turn.outputTokens,
@@ -1748,6 +2492,27 @@ async function main(): Promise<void> {
           timestampMs: turn.timestampMs,
           workflowRunId: turn.workflowRunId,
           agentId: turn.agentId,
+          agentType,
+        });
+        // Subagent turns are real model requests and cost real money, so they
+        // belong in the model breakdown too — recording them only in the cost
+        // tracker left Model Usage blind to every subagent-only session.
+        modelUsageTracker.recordUsage(turn.model, usage, breakdown.totalUsd);
+        // The only line that makes an orphan session's subagent spend durable:
+        // without it, an unscoped process's aggregator never learns about this
+        // session's subagent cost and persistSession() has nothing to write.
+        // `agentId` is the same discriminator costTracker.recordTokenUsage
+        // splits parent-vs-subagent on above, so the two trackers can't drift.
+        localSessionAggregator.recordTokenUsage(turn.parentSessionId, {
+          timestamp: turn.timestampMs,
+          costUsd: breakdown.totalUsd,
+          model: turn.model,
+          inputTokens: turn.inputTokens,
+          outputTokens: turn.outputTokens,
+          cacheReadTokens: turn.cacheReadTokens,
+          cacheCreationTokens: turn.cacheCreationTokens,
+          thinkingTokens: turn.reasoningTokens,
+          agentId: turn.agentId,
         });
         // Pricing miss → usd:null on the wire; we recompute here so
         // the breakdown view distinguishes "0 because pricing absent" from
@@ -1756,6 +2521,7 @@ async function main(): Promise<void> {
         capturedNrIngest?.ingestSubagentTurn({
           workflow_run_id: turn.workflowRunId,
           agent_id: turn.agentId,
+          ...(agentType ? { agent_type: agentType } : {}),
           parent_session_id: turn.parentSessionId,
           message_id: turn.messageId,
           turn_uuid: turn.turnUuid,
@@ -1790,18 +2556,96 @@ async function main(): Promise<void> {
             : {}),
         });
       },
+      onApiFailure: (frame) => {
+        if (!config) return;
+        const errorType = mapClaudeCodeErrorType(frame.rawErrorType);
+        // Prefer a model already learned from real token events over the
+        // config default, mirroring the estimateModel fallback above.
+        const model = costTracker.getMetrics().model ?? config.model ?? 'unknown';
+        const turnNumber = turnTracker.getCurrentTurnNumber();
+        // totalTurnsInSession is left unspecified: there is no reliable
+        // "total turns for this session" figure available at failure time
+        // (the session may still be ongoing), and recordFailure() already
+        // defaults it sensibly for sessionPhase bucketing.
+        const duringToolExecution = eventProcessor !== undefined && eventProcessor.pendingCount > 0;
+        apiFailureTracker.recordFailure({
+          errorType,
+          model,
+          turnNumber,
+          // Unobservable from StopFailure; see api-failure-tracker.ts's note constant.
+          tokensInFlight: 0,
+          // Known, not a placeholder: StopFailure only fires after Claude
+          // Code's own retries are exhausted with no successful recovery.
+          recoverySucceeded: false,
+          duringToolExecution,
+        });
+      },
+      onSessionStart: (frame) => {
+        // Only 'resume'/'fork' SessionStart events with the resume-cost
+        // fields present are actionable — a plain startup/clear/compact
+        // start (or a resume with no prior response, per the docs) has
+        // nothing to report.
+        if (
+          typeof frame.secondsSinceLastResponse !== 'number' ||
+          typeof frame.contextTokens !== 'number' ||
+          typeof frame.promptCacheLikelyExpired !== 'boolean' ||
+          typeof frame.estimatedCacheWriteUsd !== 'number'
+        ) {
+          return;
+        }
+        sessionResumeTracker.recordResume({
+          secondsSinceLastResponse: frame.secondsSinceLastResponse,
+          contextTokens: frame.contextTokens,
+          promptCacheLikelyExpired: frame.promptCacheLikelyExpired,
+          estimatedCacheWriteUsd: frame.estimatedCacheWriteUsd,
+          timestampMs: frame.timestamp,
+        });
+      },
+      onInstructionsLoaded: (frame) => {
+        instructionDriftTracker.recordInstructionsLoaded(frame.filePath, frame.loadReason);
+      },
+      onModelSwitch: (frame) => {
+        modelUsageTracker.recordModelSwitch({
+          fromModel: frame.fromModel,
+          toModel: frame.toModel,
+          source: frame.source,
+          requestedModel: frame.requestedModel,
+          timestampMs: frame.timestamp,
+        });
+      },
+      onUserPromptSubmit: (frame) => {
+        turnCostAttributor.recordSlashCommand(frame.sessionId, frame.slashCommand ?? null);
+        taskDetector!.startTaskIfNone(frame.timestamp);
+      },
+      onStop: (frame) => {
+        turnTracker.finalizeTurnAt(frame.timestamp);
+        taskDetector!.markBoundary(frame.timestamp);
+      },
     });
 
     persistSession = (opts?: { periodic?: boolean }) => {
       if (!sessionStore || !sessionTracker || !taskDetector || !config) return;
       try {
         transcriptMessageTracker.refresh();
+        // Phase 2 freshness: re-read Claude Code's own name sources (job-state
+        // title + transcript ai-title) right before building the summary, so a
+        // title refined after the first exchange — or a name a human assigns
+        // mid-session — wins over the first-prompt guess in the persisted/
+        // shutdown snapshot. Runs on both the periodic checkpoint and the
+        // terminal save (both flow through here). setAuthoritativeName enforces
+        // the no-downgrade invariant, so this can only upgrade or refresh —
+        // never demote a user name to auto/cwd. A no-op for synthetic ids.
+        applyAuthoritativeSessionName(sessionTraceId);
         const summary = buildSessionSummary({
           sessionTracker,
           costTracker,
+          turnCostAttributor,
           taskDetector,
           antiPatternDetector,
           efficiencyScorer,
+          toolSelectionScorer,
+          modelUsageTracker,
+          qualityProxyTracker,
           transcriptMessageTracker,
           developer: config.developer ?? 'unknown',
           repoName: currentRepoName,
@@ -1824,9 +2668,26 @@ async function main(): Promise<void> {
         // real session id is still being resolved).
         const isSyntheticId = isSyntheticSessionId(summary.sessionId);
         if (isSyntheticId) {
+          // This process owns no real session of its own, but it has been
+          // draining other sessions' buffers destructively — so if it returns
+          // here without writing them, those events are simply lost. Persist
+          // each real session it observed instead.
+          const rollups = localSessionAggregator.toSummaries({
+            developer: config.developer ?? 'unknown',
+            platform: eventProcessor?.activePlatform,
+            outcome: opts?.periodic ? 'in progress' : 'completed',
+            toolSelectionScorer,
+            repoResolver: repoNameResolver,
+          });
+          for (const rollup of rollups) {
+            sessionStore.saveSession(
+              rollup as unknown as Parameters<typeof sessionStore.saveSession>[0],
+            );
+          }
           if (!opts?.periodic) {
-            logger.info('Skipping synthetic session JSON persistence', {
+            logger.info('Persisted observed sessions on behalf of synthetic owner', {
               sessionId: summary.sessionId,
+              persistedSessions: rollups.length,
             });
           }
           return;
@@ -1856,8 +2717,13 @@ async function main(): Promise<void> {
     // exit (crash / SIGKILL) loses at most ~30s of data instead of the whole
     // session. persistSession() no-ops for synthetic / provisional ids, so this
     // is safe to arm immediately. unref'd so it never keeps the process alive.
-    const SESSION_PERSIST_INTERVAL_MS = 30_000;
+    const SESSION_PERSIST_INTERVAL_MS = getSessionPersistIntervalMs();
     sessionPersistInterval = setInterval(() => {
+      // Skip while the live session id is an unconfirmed cwd-fallback guess —
+      // see armPendingConfirmation's own comment. Persisting here would write
+      // a real, non-synthetic checkpoint file under an identity that might
+      // be corrected away moments later, orphaning the file on disk.
+      if (pendingConfirmation) return;
       try {
         persistSession?.({ periodic: true });
       } catch (err) {
@@ -1866,14 +2732,7 @@ async function main(): Promise<void> {
     }, SESSION_PERSIST_INTERVAL_MS);
     sessionPersistInterval.unref?.();
 
-    // Single-mode rule: the watcher runs in `--stdio` mode by default.
-    // Opt-in to watcher-in-dashboard via `NR_AI_WATCHER_MODE=local`.
-    const watcherMode = (process.env['NR_AI_WATCHER_MODE'] ?? 'stdio').toLowerCase();
     const isStdioWatcher = options.stdio === true;
-    const isLocalWatcher = !isStdioWatcher;
-    const watcherShouldRun =
-      (isStdioWatcher && (watcherMode === 'stdio' || watcherMode === '')) ||
-      (isLocalWatcher && watcherMode === 'local');
     // The SubagentWatcher is the ONLY thing that feeds per-agent (subagent)
     // token cost into the CostTracker (via onSubagentTurn → subagentCostUsd).
     // With it off, a session's persisted/headline cost silently excludes ALL
@@ -1884,9 +2743,35 @@ async function main(): Promise<void> {
     // (parentSessionId filter), so it only ever attributes that session's own
     // subagents — parent tokens (onTokenEvent, parent transcript) and subagent
     // tokens (onSubagentTurn, subagent transcripts) are disjoint, so there is no
-    // double count. The WorkflowWatcher stays opt-in (NR_AI_ENABLE_WORKFLOW_WATCHER=1).
+    // double count. Unfiltered (`--local`), the heartbeat exclusion
+    // (subagent-watcher.ts's discoverFiles) is what keeps it from racing a live
+    // `--stdio` session's own scoped watcher over the same cursor files — see
+    // that module's doc comment. The WorkflowWatcher stays engine-only: it has
+    // no heartbeat exclusion, so running it unfiltered would reintroduce that
+    // exact race for workflow transcripts.
     const subagentWatcherEnabled = process.env['NR_AI_ENABLE_SUBAGENT_WATCHER'] !== '0';
     const workflowWatcherEnabled = process.env['NR_AI_ENABLE_WORKFLOW_WATCHER'] === '1';
+    // Unlike WorkflowWatcher, ParentTranscriptWatcher is not gated
+    // by --stdio-vs-`--local` at all — see startWatchers() below for why. Do
+    // not "fix" this to match WorkflowWatcher; that would reintroduce the exact
+    // regression this divergence avoids.
+    const parentTranscriptWatcherEnabled =
+      process.env['NR_AI_ENABLE_PARENT_TRANSCRIPT_WATCHER'] !== '0';
+    // CopilotUsageWatcher is the Copilot analog of ParentTranscriptWatcher
+    // (token-exact cost from VS Code's Copilot debug logs) and follows the
+    // same always-run rationale: it feeds the primary cost signal, so it is
+    // gated only by its own opt-out. It no-ops cheaply when no VS Code
+    // workspaceStorage dirs exist.
+    const copilotUsageWatcherEnabled = process.env['NR_AI_ENABLE_COPILOT_USAGE_WATCHER'] !== '0';
+    // CopilotAppUsageWatcher is the GitHub Copilot desktop app's analog of
+    // CopilotUsageWatcher: token-exact cost, but read from the app's own
+    // data.db SQLite store instead of a debug-log tail (the app has no
+    // extensions/ mechanism to produce one — see copilot-app-adapter.ts).
+    // Same always-run rationale as the other two: it feeds the primary cost
+    // signal for that platform, so it is gated only by its own opt-out, and
+    // it no-ops cheaply (a single existsSync) when data.db is absent.
+    const copilotAppUsageWatcherEnabled =
+      process.env['NR_AI_ENABLE_COPILOT_APP_USAGE_WATCHER'] !== '0';
 
     // Construct + start the watchers for a given session id. In `--stdio` mode
     // the watchers filter discovered transcript dirs by `parentSessionId`; in
@@ -1895,46 +2780,115 @@ async function main(): Promise<void> {
     // provisional-session path so both produce identical wiring — see
     // repointWatchersToRealSession below.
     const startWatchers = (watcherSessionId: string): void => {
-      if (watcherShouldRun && subagentWatcherEnabled) {
-        activeSubagentWatcher = new SubagentWatcher({
+      // ParentTranscriptWatcher feeds parent-session token/cost tracking —
+      // the primary cost signal, not a secondary one like subagent/workflow
+      // cost. The old per-hook transcript scanner it replaces ran
+      // unconditionally in every mode with zero coupling to --stdio-vs-`--local`;
+      // gating this behind isStdioWatcher the same way WorkflowWatcher is
+      // gated would mean a standalone `--local` deployment (no --stdio
+      // sibling) goes from "buggy but nonzero" parent-cost tracking to
+      // "exactly zero" by default — a real regression. So it always runs,
+      // gated only by its own opt-out flag. Race-safety for "--stdio and
+      // --local both alive for the same session" comes for free from the
+      // same getActiveSessionIdsFromHeartbeats() exclusion SubagentWatcher's
+      // unscoped discovery already uses.
+      if (parentTranscriptWatcherEnabled) {
+        activeParentTranscriptWatcher = new ParentTranscriptWatcher({
           storagePath: config!.storagePath,
           parentSessionId: isStdioWatcher ? watcherSessionId : undefined,
-          // Runtime cost-self-check: a drift > 5% surfaces as an
-          // `AiObservabilityHealth { event: 'cost_self_check' }` event. We
-          // compare like-with-like from two INDEPENDENT code paths so a
-          // regression in either is caught:
-          //   - trackedUsd: subagent cost the live CostTracker accumulated from
-          //     the onSubagentTurn feed (the headline/persisted path), and
-          //   - groundTruthUsd: an independent re-parse of the same session's
-          //     subagent transcripts via SubagentTimelineStore (the trace path).
-          // Both dedup streaming-duplicate lines by message.id, so a healthy
-          // system reads ~0%; any divergence (e.g. one path regressing on dedup
-          // or pricing) shows up as a real, non-zero delta. Only meaningful in
-          // --stdio mode, where the watcher is scoped to this one session.
-          costSelfCheck: () => {
-            const trackedUsd = costTracker.getSubagentMetrics().subagentUsd;
-            let groundTruthUsd = trackedUsd;
-            try {
-              const tl = subagentTimelineInstance.getSubagentsForSession(watcherSessionId);
-              groundTruthUsd = tl.agents.reduce((sum, a) => sum + (a.usd ?? 0), 0);
-            } catch {
-              // On any re-parse error fall back to trackedUsd → 0% delta (no
-              // false alarm); the error is already surfaced via watcher health.
-              groundTruthUsd = trackedUsd;
-            }
-            return { trackedUsd, groundTruthUsd };
-          },
+          localStore,
         });
-        activeSubagentWatcher.start();
-        logger.info('SubagentWatcher started', {
-          mode: watcherMode,
+        activeParentTranscriptWatcher.start();
+        logger.info('ParentTranscriptWatcher started', {
           parentSessionId: isStdioWatcher ? watcherSessionId : null,
         });
       }
-      if (watcherShouldRun && workflowWatcherEnabled) {
-        activeWorkflowWatcher = new WorkflowWatcher({
+      if (copilotUsageWatcherEnabled) {
+        activeCopilotUsageWatcher = new CopilotUsageWatcher({
           storagePath: config!.storagePath,
           parentSessionId: isStdioWatcher ? watcherSessionId : undefined,
+          localStore,
+        });
+        activeCopilotUsageWatcher.start();
+        logger.info('CopilotUsageWatcher started', {
+          parentSessionId: isStdioWatcher ? watcherSessionId : null,
+        });
+      }
+      if (copilotAppUsageWatcherEnabled) {
+        activeCopilotAppUsageWatcher = new CopilotAppUsageWatcher({
+          storagePath: config!.storagePath,
+          parentSessionId: isStdioWatcher ? watcherSessionId : undefined,
+          localStore,
+        });
+        activeCopilotAppUsageWatcher.start();
+        logger.info('CopilotAppUsageWatcher started', {
+          parentSessionId: isStdioWatcher ? watcherSessionId : null,
+        });
+      }
+      if (subagentWatcherEnabled) {
+        // Base options are mode-independent. The scoped extras are a single
+        // ternary branch, not two independent fields, because the options
+        // type makes `costSelfCheck` without `parentSessionId` a compile
+        // error: the self-check compares this process's whole-tracker
+        // subagent total against a re-parse of ONE session, and those are
+        // the same population only while the watcher is filtered to that
+        // session.
+        const subagentWatcherBase = {
+          storagePath: config!.storagePath,
+          // Only meaningful when unfiltered (--local) — lets discoverFiles()
+          // skip sessions that already have a live --stdio owner tailing them.
+          localStore,
+          onTurnRead: (turn: SubagentTokenEvent) => subagentAttribution.recordSubagentTurn(turn),
+        };
+        activeSubagentWatcher = new SubagentWatcher(
+          isStdioWatcher
+            ? {
+                ...subagentWatcherBase,
+                parentSessionId: watcherSessionId,
+                // Runtime cost-self-check: a drift > 5% surfaces as an
+                // `AiObservabilityHealth { event: 'cost_self_check' }` event.
+                // We compare like-with-like from two INDEPENDENT code paths
+                // so a regression in either is caught:
+                //   - trackedUsd: subagent cost the live CostTracker
+                //     accumulated from the onSubagentTurn feed (the
+                //     headline/persisted path), and
+                //   - groundTruthUsd: an independent re-parse of the same
+                //     session's subagent transcripts via SubagentTimelineStore
+                //     (the trace path).
+                // Both dedup streaming-duplicate lines by message.id, so a
+                // healthy system reads ~0%; any divergence (e.g. one path
+                // regressing on dedup or pricing) shows up as a real, non-zero
+                // delta. Only meaningful in --stdio mode, where the watcher is
+                // scoped to this one session.
+                costSelfCheck: () => {
+                  const trackedUsd = costTracker.getSubagentMetrics().subagentUsd;
+                  let groundTruthUsd = trackedUsd;
+                  try {
+                    const tl = subagentTimelineInstance.getSubagentsForSession(watcherSessionId);
+                    groundTruthUsd = tl.agents.reduce((sum, a) => sum + (a.usd ?? 0), 0);
+                  } catch {
+                    // On any re-parse error fall back to trackedUsd → 0% delta
+                    // (no false alarm); the error is already surfaced via
+                    // watcher health.
+                    groundTruthUsd = trackedUsd;
+                  }
+                  return { trackedUsd, groundTruthUsd };
+                },
+              }
+            : subagentWatcherBase,
+        );
+        activeSubagentWatcher.start();
+        logger.info('SubagentWatcher started', {
+          parentSessionId: isStdioWatcher ? watcherSessionId : null,
+        });
+      }
+      // Engine-only: unlike SubagentWatcher, WorkflowWatcher has no heartbeat
+      // exclusion, so running it unfiltered in --local would reintroduce the
+      // same race for workflow transcripts.
+      if (isStdioWatcher && workflowWatcherEnabled) {
+        activeWorkflowWatcher = new WorkflowWatcher({
+          storagePath: config!.storagePath,
+          parentSessionId: watcherSessionId,
           getCostForRun: (runId) => costTracker.getCostForWorkflowRun(runId),
         });
         activeWorkflowWatcher.setOnRun((run) => {
@@ -1944,10 +2898,7 @@ async function main(): Promise<void> {
           capturedNrIngest?.ingestObservabilityHealth(health);
         });
         activeWorkflowWatcher.start();
-        logger.info('WorkflowWatcher started', {
-          mode: watcherMode,
-          parentSessionId: isStdioWatcher ? watcherSessionId : null,
-        });
+        logger.info('WorkflowWatcher started', { parentSessionId: watcherSessionId });
       }
     };
 
@@ -1958,6 +2909,18 @@ async function main(): Promise<void> {
     // real id — mirroring the eventProcessor.replaceStore() hot-swap. Only the
     // watchers that were actually started get rebuilt.
     const repointWatchersToRealSession = (realSessionId: string): void => {
+      if (activeParentTranscriptWatcher) {
+        activeParentTranscriptWatcher.stop();
+        activeParentTranscriptWatcher = null;
+      }
+      if (activeCopilotUsageWatcher) {
+        activeCopilotUsageWatcher.stop();
+        activeCopilotUsageWatcher = null;
+      }
+      if (activeCopilotAppUsageWatcher) {
+        activeCopilotAppUsageWatcher.stop();
+        activeCopilotAppUsageWatcher = null;
+      }
       if (activeSubagentWatcher) {
         activeSubagentWatcher.stop();
         activeSubagentWatcher = null;
@@ -1967,6 +2930,286 @@ async function main(): Promise<void> {
         activeWorkflowWatcher = null;
       }
       startWatchers(realSessionId);
+    };
+
+    // Adopts `realId` as the live session id: swaps LocalStore, hot-swaps
+    // the event processor's store, replaces the session span/task-span-
+    // tracker, (re)constructs NrIngestManager, repoints the watchers, and
+    // re-registers the full tool set. Used both for the initial pending ->
+    // real transition and for a later correction (see
+    // startPpidCorrectionWatch below) — safe to call more than once:
+    // accumulated tracker metrics are preserved (adoptSessionId() only
+    // reassigns the id field), and any already-live NrIngestManager is
+    // stopped first so its harvest interval never leaks on a second call.
+    const adoptRealSessionId = async (
+      realId: string,
+      opts?: { isCorrection?: boolean; viaCwdOnly?: boolean },
+    ): Promise<void> => {
+      if (opts?.isCorrection) {
+        // A real correction means the previously-adopted id was wrong, and
+        // anything these four trackers accumulated since startWatchers()
+        // scoped them to that wrong id (chiefly ParentTranscriptWatcher
+        // backfill from an unrelated old transcript) belongs to nobody.
+        // SessionTracker itself needs no reset here: real tool-call events
+        // only ever reach it via the per-session LocalStore/HookEventProcessor
+        // path, which is keyed by whatever id the hook collector script
+        // wrote — never the wrong guess — so toolCallCount/timeline stay
+        // clean through the whole unconfirmed window regardless.
+        costTracker.reset(realId);
+        modelUsageTracker.reset(realId);
+        contextCompositionTracker.reset(realId);
+        turnCostAttributor.reset(realId);
+      }
+      sessionTraceId = realId;
+      sessionTracker!.adoptSessionId(realId);
+      // Now that the real id (and thus its transcript path) is known, resolve
+      // and apply the authoritative name. On a correction this re-resolves
+      // against the corrected id's own transcript, replacing any name derived
+      // for the previously-adopted (wrong) id.
+      applyAuthoritativeSessionName(realId);
+      // viaCwdOnly means this id came from the collision-prone cwd fallback
+      // and hasn't been confirmed by the PPID breadcrumb yet — mirrors the
+      // resolvedViaCwdOnly gate on the synchronous resolution path's own
+      // eager-seed call. Seeding here would import a DIFFERENT session's
+      // real cost/token total on an unconfirmed guess; the caller arms
+      // startPpidCorrectionWatch right after this returns, whose
+      // confirmation branch (ppidId === staleId) calls
+      // rehydrateTrackersIfResumed itself once the guess is confirmed.
+      if (!opts?.viaCwdOnly) rehydrateTrackersIfResumed(realId);
+
+      // Replace the current LocalStore with one scoped to the real id.
+      const realLocalStore = new LocalStore(config!.storagePath, realId);
+      realLocalStore.initialize();
+      realLocalStore.writeHeartbeat();
+      localStoreForShutdown = realLocalStore;
+      try {
+        realLocalStore.migrateLegacyBuffer();
+      } catch (err) {
+        logger.warn('Legacy buffer migration failed (continuing)', { error: String(err) });
+      }
+
+      // Hot-swap the event processor to the scoped store so it only drains
+      // this session's events going forward.
+      eventProcessor!.replaceStore(realLocalStore, false);
+
+      // Replace the span with a real-ID span. End the previous one first
+      // (end() is a no-op if never started).
+      if (config!.otlp.transport !== 'nr-events-api') {
+        sessionSpan?.end(0, 0);
+        taskSpanTracker?.closeAll();
+        const detectedPlatform = createDefaultRegistry().getActive().platformName;
+        sessionSpan = new SessionSpan(realId, config!.developer, detectedPlatform);
+        taskSpanTracker = new TaskSpanTracker();
+        sessionSpan.start();
+      }
+
+      // Stop whatever NrIngestManager is already live before replacing it —
+      // load-bearing on a second (correction) call; a no-op the first time,
+      // since nrIngest is still undefined then.
+      if (nrIngest) {
+        await nrIngest.stop().catch((err) => {
+          logger.warn('Failed to stop previous NrIngestManager during session id correction', {
+            error: String(err),
+          });
+        });
+      }
+
+      if (config!.mode !== 'local') {
+        if (!config!.licenseKey || !config!.accountId) {
+          throw new Error(
+            'licenseKey and accountId must be defined for non-local mode. ' +
+              'This should have been caught by config validation.',
+          );
+        }
+        nrIngest = new NrIngestManager({
+          licenseKey: config!.licenseKey,
+          transportOptions: {
+            accountId: config!.accountId,
+            collectorHost: config!.collectorHost,
+          },
+          developer: config!.developer,
+          appName: config!.appName,
+          teamId: config!.teamId,
+          projectId: config!.projectId,
+          orgId: config!.orgId,
+          repoUrl: config!.repoUrl,
+          companionMode: config!.companionMode,
+          tiers: config!.tiers,
+          sessionTracker: sessionTracker!,
+          localStore: realLocalStore,
+          auditTrail,
+          eventHarvestIntervalMs: config!.harvestIntervalMs.events,
+          metricHarvestIntervalMs: config!.harvestIntervalMs.metrics,
+          costTracker,
+          efficiencyScorer,
+          feedbackCollector,
+          apiFailureTracker,
+          gitEfficiencyTracker,
+          turnCostAttributor,
+          sessionTraceId: realId,
+        });
+        capturedNrIngest = nrIngest;
+        nrIngest.start();
+      }
+
+      // Re-point the subagent/workflow watchers to the real session id. See
+      // repointWatchersToRealSession's own comment above for why this is
+      // necessary; a no-op if no watcher actually started.
+      repointWatchersToRealSession(realId);
+
+      // (Re-)register the full tool set — the second (correction) call
+      // replaces the closures registered by the first, so every tool
+      // handler observes the corrected sessionTraceId/nrIngestManager going
+      // forward.
+      const configFilePath = options.config ?? resolve(DEFAULT_STORAGE_PATH, 'config.json');
+      const configSummary: ConfigSummary = {
+        mode: config!.mode,
+        developer: config!.developer,
+        accountId: config!.accountId ?? null,
+        licenseKeyMasked: config!.licenseKey ? maskCredential(config!.licenseKey) : null,
+        nrApiKeyMasked: config!.nrApiKey ? maskCredential(config!.nrApiKey) : null,
+        region: config!.collectorHost ?? 'us',
+        storagePath: config!.storagePath,
+        dashboardUrl: `http://${config!.dashboard.host}:${config!.dashboard.port}`,
+        configFilePath,
+        companionMode: config!.companionMode,
+      };
+      registerTools(mcpServer!.server, {
+        sessionTracker: sessionTracker!,
+        costTracker,
+        budgetTracker,
+        taskDetector: taskDetector!,
+        antiPatternDetector,
+        efficiencyScorer,
+        feedbackCollector,
+        sessionStore,
+        weeklySummaryGenerator,
+        trendAnalyzer,
+        collaborationProfiler,
+        claudeMdTracker,
+        costPerOutcomeAnalyzer,
+        recommendationEngine,
+        contextWindowTracker,
+        contextTracker,
+        latencyTracker,
+        taskCompletionTracker,
+        modelUsageTracker,
+        retryDetector,
+        contextCompositionTracker,
+        latencyDecompositionTracker,
+        decisionTracker,
+        instructionDriftTracker,
+        toolSelectionScorer,
+        toolCallBuffer: toolCallBufferAccessor,
+        qualityProxyTracker,
+        apiFailureTracker,
+        sessionResumeTracker,
+        turnCostAttributor,
+        turnTracker,
+        gitEfficiencyTracker,
+        gitWorkspaceReporter,
+        genericMcpAdapter,
+        nrIngestManager: nrIngest,
+        sessionTraceId: realId,
+        sessionStartMs,
+        accountId: config!.accountId,
+        teamId: config!.teamId,
+        projectId: config!.projectId,
+        developer: config!.developer,
+        nrApiKey: config!.nrApiKey,
+        collectorHost: config!.collectorHost,
+        configFilePath,
+        configSummary,
+      });
+
+      // The client cached tools/list during the pending window, when only the
+      // health/install/config tools existed. Tell it to re-list now that the
+      // full set is registered, or it keeps the pending three for the whole
+      // connection.
+      void mcpServer!.notifyToolListChanged();
+    };
+
+    // Arms a background watch for the ppid breadcrumb after an initial
+    // resolution came from the collision-prone cwd fallback (see
+    // resolvedViaCwdOnly). If/when the ppid breadcrumb later reports a
+    // DIFFERENT, more precise session id, corrects the adoption via the
+    // same adoptRealSessionId() used for the pending -> real transition.
+    // A no-op-forever if the ppid breadcrumb never appears or always
+    // matches — never trusts cwd itself, so it can't be fooled twice.
+    const startPpidCorrectionWatch = (staleId: string): void => {
+      armPendingConfirmation();
+      ppidCorrectionAbort = new AbortController();
+      // Guards against both watches below firing: in practice only one ever
+      // can (see the win32 branch's own comment), but a shared flag makes
+      // that a documented invariant rather than an accident of timing.
+      let corrected = false;
+      let activityListener: typeof cwdGuessActivity = null;
+      void watchPpidBreadcrumb({
+        storagePath: config!.storagePath,
+        signal: ppidCorrectionAbort.signal,
+        includeParentOfPpid: true,
+        staleId,
+        subscribeToStaleIdActivity: (onActivity) => {
+          activityListener = { staleId, onActivity };
+          cwdGuessActivity = activityListener;
+        },
+      })
+        .then(async (ppidId) => {
+          if (ppidCorrectionAbort?.signal.aborted || corrected) return;
+          if (ppidId === staleId) {
+            // The cwd guess turned out to be correct, as confirmed by our own
+            // ppid's breadcrumb: the watch never resolves to staleId from an
+            // ancestor, whose breadcrumb may be a co-located session's. No
+            // correction needed, so no reason to keep suppressing checkpoints
+            // for the rest of the cap window. It was NOT seeded eagerly (see
+            // the resolvedViaCwdOnly gate on rehydrateTrackersIfResumed's
+            // first call site) precisely because it wasn't confirmed yet —
+            // seed it now that it is.
+            rehydrateTrackersIfResumed(staleId);
+            clearPendingConfirmation();
+            return;
+          }
+          corrected = true;
+          logger.info('Correcting cwd-sourced session id from PPID breadcrumb', {
+            staleId,
+            correctedId: ppidId,
+          });
+          await adoptRealSessionId(ppidId, { isCorrection: true });
+          clearPendingConfirmation();
+        })
+        .catch((err) => {
+          if (!ppidCorrectionAbort?.signal.aborted) {
+            logger.warn('PPID correction watch failed', { error: String(err) });
+          }
+          clearPendingConfirmation();
+        })
+        .finally(() => {
+          if (cwdGuessActivity === activityListener) cwdGuessActivity = null;
+        });
+
+      // On native Windows the ppid breadcrumb above never matches (see #686
+      // and watchCwdBreadcrumbForCorrection's own doc comment), so the watch
+      // just started is a permanent no-op there. Also watch the cwd
+      // breadcrumb directly, sharing the same abort controller so shutdown
+      // cancels both.
+      if (process.platform === 'win32') {
+        void watchCwdBreadcrumbForCorrection({
+          staleId,
+          storagePath: config!.storagePath,
+          signal: ppidCorrectionAbort.signal,
+        })
+          .then(async (cwdId) => {
+            if (ppidCorrectionAbort?.signal.aborted || corrected) return;
+            corrected = true;
+            await adoptRealSessionId(cwdId, { isCorrection: true });
+            clearPendingConfirmation();
+          })
+          .catch((err) => {
+            if (!ppidCorrectionAbort?.signal.aborted) {
+              logger.warn('Windows cwd correction watch failed', { error: String(err) });
+            }
+          });
+      }
     };
 
     startWatchers(sessionTraceId);
@@ -1995,16 +3238,21 @@ async function main(): Promise<void> {
             storagePath: config.storagePath,
             dashboardUrl: `http://${config.dashboard.host}:${config.dashboard.port}`,
             configFilePath: pendingConfigFilePath,
+            companionMode: config.companionMode,
           },
         });
         logger.info('Dashboard started early; awaiting session_id resolution (breadcrumb poll)');
 
         sessionResolutionAbort = new AbortController();
+        let resolvedSource: import('./hooks/session-resolver.js').SessionIdSource | undefined;
         void (async () => {
           try {
             const realId = await resolveSessionId({
               storagePath: config!.storagePath,
               signal: sessionResolutionAbort!.signal,
+              onResolutionSource: (info) => {
+                resolvedSource = info.source;
+              },
             });
 
             // Guard against a shutdown that fired while we were awaiting —
@@ -2015,146 +3263,24 @@ async function main(): Promise<void> {
               return;
             }
 
-            // Adopt the real session ID without clearing accumulated metrics.
-            sessionTraceId = realId;
-            sessionTracker!.adoptSessionId(realId);
-
-            // Replace the provisional unscoped LocalStore with the session-scoped one.
-            const realLocalStore = new LocalStore(config!.storagePath, realId);
-            realLocalStore.initialize();
-            realLocalStore.writeHeartbeat();
-            localStoreForShutdown = realLocalStore;
-            try {
-              realLocalStore.migrateLegacyBuffer();
-            } catch (err) {
-              logger.warn('Legacy buffer migration failed (continuing)', { error: String(err) });
-            }
-
-            // Hot-swap the event processor to the scoped store so it only
-            // drains this session's events going forward.
-            eventProcessor!.replaceStore(realLocalStore, false);
-
-            // Replace the provisional span with a real-ID span. End the
-            // provisional one first (end() is a no-op if never started).
-            // initMcpTracer() was already called in Phase A — skip it here.
-            if (config!.otlp.transport !== 'nr-events-api') {
-              sessionSpan?.end(0, 0);
-              // Close any task spans opened against the provisional tracker
-              // (cross-session events can open them during Phase A) before
-              // replacing it with a clean real-session instance.
-              taskSpanTracker?.closeAll();
-              const detectedPlatform = createDefaultRegistry().getActive().platformName;
-              sessionSpan = new SessionSpan(realId, config!.developer, detectedPlatform);
-              taskSpanTracker = new TaskSpanTracker();
-              sessionSpan.start();
-            }
-
-            // Complete NrIngest setup.
-            if (config!.mode !== 'local') {
-              if (!config!.licenseKey || !config!.accountId) {
-                throw new Error(
-                  'licenseKey and accountId must be defined for non-local mode. ' +
-                    'This should have been caught by config validation.',
-                );
-              }
-              nrIngest = new NrIngestManager({
-                licenseKey: config!.licenseKey,
-                transportOptions: {
-                  accountId: config!.accountId,
-                  collectorHost: config!.collectorHost,
-                },
-                developer: config!.developer,
-                appName: config!.appName,
-                teamId: config!.teamId,
-                projectId: config!.projectId,
-                orgId: config!.orgId,
-                sessionTracker: sessionTracker!,
-                localStore: realLocalStore,
-                auditTrail,
-                eventHarvestIntervalMs: config!.harvestIntervalMs.events,
-                metricHarvestIntervalMs: config!.harvestIntervalMs.metrics,
-                costTracker,
-                efficiencyScorer,
-                feedbackCollector,
-                turnCostAttributor,
-                sessionTraceId: realId,
-              });
-              capturedNrIngest = nrIngest;
-              nrIngest.start();
-            }
-
-            // Re-point the subagent/workflow watchers from the provisional
-            // `pending-<ts>` id to the resolved real session id. The watchers
-            // were constructed in the startup block with the provisional id and
-            // filter discovered transcript dirs by it; a `pending-*` id never
-            // matches a real UUID session dir, so without this re-point they
-            // capture nothing for the life of the process. Done after the
-            // NrIngest reassignment above so the rebuilt WorkflowWatcher's
-            // onRun/onHealth closures observe the live `capturedNrIngest`.
-            // Guarded inside repoint: only watchers that were actually started
-            // are stopped + reconstructed; if none ran this is a no-op.
-            repointWatchersToRealSession(realId);
-
-            // Register full tools, replacing the pending handlers.
-            const configFilePath = options.config ?? resolve(DEFAULT_STORAGE_PATH, 'config.json');
-            const configSummary: ConfigSummary = {
-              mode: config!.mode,
-              developer: config!.developer,
-              accountId: config!.accountId ?? null,
-              licenseKeyMasked: config!.licenseKey ? maskCredential(config!.licenseKey) : null,
-              nrApiKeyMasked: config!.nrApiKey ? maskCredential(config!.nrApiKey) : null,
-              region: config!.collectorHost ?? 'us',
-              storagePath: config!.storagePath,
-              dashboardUrl: `http://${config!.dashboard.host}:${config!.dashboard.port}`,
-              configFilePath,
-            };
-            registerTools(mcpServer!.server, {
-              sessionTracker: sessionTracker!,
-              costTracker,
-              budgetTracker,
-              taskDetector: taskDetector!,
-              antiPatternDetector,
-              efficiencyScorer,
-              feedbackCollector,
-              sessionStore,
-              weeklySummaryGenerator,
-              trendAnalyzer,
-              collaborationProfiler,
-              claudeMdTracker,
-              costPerOutcomeAnalyzer,
-              recommendationEngine,
-              contextWindowTracker,
-              contextTracker,
-              latencyTracker,
-              taskCompletionTracker,
-              modelUsageTracker,
-              retryDetector,
-              contextCompositionTracker,
-              latencyDecompositionTracker,
-              decisionTracker,
-              instructionDriftTracker,
-              toolSelectionScorer,
-              toolCallBuffer: toolCallBufferAccessor,
-              qualityProxyTracker,
-              apiFailureTracker,
-              turnCostAttributor,
-              turnTracker,
-              gitEfficiencyTracker,
-              sessionTraceId: realId,
-              sessionStartMs,
-              accountId: config!.accountId,
-              teamId: config!.teamId,
-              projectId: config!.projectId,
-              developer: config!.developer,
-              nrApiKey: config!.nrApiKey,
-              collectorHost: config!.collectorHost,
-              configFilePath,
-              configSummary,
-            });
+            // Adopt the real session ID without clearing accumulated
+            // metrics — see adoptRealSessionId's own comment above. Skip the
+            // eager cost/token seed for a cwd-resolved id (see viaCwdOnly's
+            // doc comment there) — startPpidCorrectionWatch below seeds it
+            // once confirmed, exactly like the synchronous resolution path.
+            await adoptRealSessionId(realId, { viaCwdOnly: resolvedSource === 'cwd' });
 
             logger.info('Session ID resolved, full initialization complete', {
               sessionTraceId: realId,
             });
+
+            // The ppid breadcrumb is precise (no cross-session collision);
+            // the cwd fallback is not, since it's shared by every session
+            // that ever ran in this directory. Only a cwd-sourced
+            // resolution needs the background correction watch.
+            if (resolvedSource === 'cwd') {
+              startPpidCorrectionWatch(realId);
+            }
           } catch (err) {
             // Use the signal's own aborted flag rather than matching the error
             // message string — robust against future changes to the throw site.
@@ -2179,6 +3305,7 @@ async function main(): Promise<void> {
           storagePath: config.storagePath,
           dashboardUrl: `http://${config.dashboard.host}:${config.dashboard.port}`,
           configFilePath,
+          companionMode: config.companionMode,
         };
         registerTools(mcpServer!.server, {
           sessionTracker,
@@ -2209,9 +3336,13 @@ async function main(): Promise<void> {
           toolCallBuffer: toolCallBufferAccessor,
           qualityProxyTracker,
           apiFailureTracker,
+          sessionResumeTracker,
           turnCostAttributor,
           turnTracker,
           gitEfficiencyTracker,
+          gitWorkspaceReporter,
+          genericMcpAdapter,
+          nrIngestManager: nrIngest,
           sessionTraceId,
           sessionStartMs,
           accountId: config.accountId,
@@ -2224,12 +3355,32 @@ async function main(): Promise<void> {
           configSummary,
         });
 
+        // Harmless if the client hasn't listed yet, and necessary if it listed
+        // in the window between connectStdio() and this call.
+        void mcpServer!.notifyToolListChanged();
+
         nrIngest?.start();
         logger.info('Server running on stdio transport');
         // stdin 'end' and 'error' handlers are registered immediately after
         // connectStdio() above so shutdown fires even during session-ID resolution.
+
+        // resolvedViaCwdOnly means the eager setup above adopted a session
+        // id from the collision-prone cwd fallback (see its declaration).
+        // Arm the same background correction watch used on the pending
+        // path — this eager path otherwise has no correction mechanism at
+        // all once initialization completes.
+        if (resolvedViaCwdOnly) {
+          startPpidCorrectionWatch(sessionTraceId);
+        }
       }
     } else {
+      // nrIngest is only constructed above when config.mode !== 'local' (see
+      // the try/catch at this branch's start) — i.e. only when real
+      // credentials are configured. Starting it here is what actually lets
+      // --local forward the unowned sessions it drains (see the comment on
+      // that try/catch): constructing NrIngestManager alone queues events
+      // in memory but never sends them until .start() runs its harvest loop.
+      nrIngest?.start();
       logger.info('Server running in local dashboard mode (Ctrl+C to stop)');
       // DashboardServer HTTP listener keeps the process alive.
       // SIGINT/SIGTERM are handled by the global shutdown handler registered above.
@@ -2278,6 +3429,14 @@ async function main(): Promise<void> {
       const proxyLocalStore = new LocalStore(config.storagePath);
       proxyLocalStore.initialize();
 
+      // Proxy mode never constructs a HookEventProcessor, so nothing ever
+      // calls recordFailure() on this instance (StopFailure is a Claude
+      // Code-side hook, not something proxied traffic can surface) — passed
+      // in anyway so NrIngestManager's emitMetrics() call is uniform across
+      // modes, legitimately reporting zero failures rather than being asked
+      // to handle a missing tracker.
+      const apiFailureTracker = new ApiFailureTracker();
+
       nrIngest = new NrIngestManager({
         licenseKey: config.licenseKey,
         transportOptions: {
@@ -2289,10 +3448,14 @@ async function main(): Promise<void> {
         teamId: config.teamId,
         projectId: config.projectId,
         orgId: config.orgId,
+        repoUrl: config.repoUrl,
+        companionMode: config.companionMode,
+        tiers: config.tiers,
         sessionTracker: new SessionTracker(sessionTraceId),
         localStore: proxyLocalStore,
         eventHarvestIntervalMs: config.harvestIntervalMs.events,
         metricHarvestIntervalMs: config.harvestIntervalMs.metrics,
+        apiFailureTracker,
         sessionTraceId,
         // Proxy mode has no single coherent session — sessionTracker above is
         // never fed per-client activity, so the ai.session.* gauges would
@@ -2380,21 +3543,6 @@ function loadAlertRulesFromDisk(engine: LocalAlertEngine, rulesPath: string): vo
         validCount: valid.length,
       });
     }
-    // Warn about cost.window rules with today/week period — the snapshot
-    // collector only populates sessionUsd, so today/week rules always read 0
-    // and never fire. Fires for both explicitly-configured AND defaulted
-    // values (default is 'session' but if a rules.json sets
-    // 'today' or 'week' explicitly, we still want the user to know it
-    // silently no-ops).
-    for (const rule of valid) {
-      if (rule.type === 'cost.window' && rule.costPeriod !== 'session') {
-        logger.warn(
-          `Rule '${rule.id}' uses costPeriod='${rule.costPeriod}', which is not yet implemented. ` +
-            `The rule will read 0 every cycle and never fire. ` +
-            `Use costPeriod='session' until daily/weekly cost aggregation is supported.`,
-        );
-      }
-    }
     engine.loadRules(valid);
     logger.info('Alert rules loaded', { rulesPath, count: valid.length });
   } catch (err) {
@@ -2403,46 +3551,6 @@ function loadAlertRulesFromDisk(engine: LocalAlertEngine, rulesPath: string): vo
       error: String(err),
     });
   }
-}
-
-// Compute cost baselines from prior sessions for daily/weekly budget tracking.
-//
-// Called on every cost-update emission, not just at session start. Three reasons:
-//   1) Sessions persisted by other MCP instances during this session need to
-//      land in the daily/weekly totals.
-//   2) Day rollover — a session running past midnight needs a refreshed
-//      "today" baseline. Snapshotting at startup left long-running sessions
-//      with stale yesterday-as-today bookkeeping forever.
-//   3) Cross-midnight prior sessions need today-portion attribution, not
-//      whole-session attribution by startTime. We use timeline-based
-//      pro-rating via todayPortionOfSessionCost() so a session that ran
-//      11pm→2am only contributes its 2-hour today slice to the daily total.
-//
-// The current in-flight session is excluded from the prior totals so we don't
-// double-count with costTracker.getCostForDay(today) on the caller side.
-function computeHistoricalCosts(
-  sessionStore: SessionStore,
-  currentSessionId: string,
-  refTs: number = Date.now(),
-): { priorDailyCostUsd: number; priorWeeklyCostUsd: number } {
-  const weekAgo = new Date(refTs - 7 * 24 * 60 * 60 * 1000);
-  let priorDailyCostUsd = 0;
-  let priorWeeklyCostUsd = 0;
-  try {
-    const sessions = sessionStore.loadAllSessions({ since: weekAgo });
-    for (const session of sessions) {
-      if (session.sessionId === currentSessionId) continue;
-      if (session.estimatedCostUsd === null) continue;
-      priorDailyCostUsd += todayPortionOfSessionCost(session, refTs);
-      priorWeeklyCostUsd += session.estimatedCostUsd;
-    }
-  } catch (err) {
-    // Non-fatal: fall back to session-only costs if history is unreadable
-    logger.warn('Failed to load historical costs — budget thresholds may be inaccurate', {
-      error: String(err),
-    });
-  }
-  return { priorDailyCostUsd, priorWeeklyCostUsd };
 }
 
 // Only run main() when executed directly (not when imported for testing).

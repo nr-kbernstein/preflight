@@ -1,16 +1,67 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import {
+  appendFileSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   utimesSync,
   writeFileSync,
   existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { SubagentWatcher, buildSubagentCursorPath } from './subagent-watcher.js';
+import {
+  MAX_META_SIDECAR_BYTES,
+  MAX_ON_DEMAND_BYTES,
+  MAX_ON_DEMAND_FILES,
+  SubagentWatcher,
+  buildSubagentCursorPath,
+  type SubagentTokenEvent,
+} from './subagent-watcher.js';
+import { LocalStore } from '../storage/local-store.js';
+
+// Only statSync, openSync, readdirSync and writeFileSync are wrapped as spies
+// (everything else delegates to the real implementation) — needed to prove the
+// unfiltered discovery prune skips a stale session's individual agent files
+// without ever statting them, and that an on-demand read of an unchanged
+// transcript never opens it, which a pass/fail on emitted output alone can't
+// distinguish from "touched them and then discarded them for some other
+// reason". writeFileSync is wrapped so a test can fail the cursor write alone.
+jest.mock('node:fs', () => {
+  const real = jest.requireActual<typeof import('node:fs')>('node:fs');
+  return {
+    ...real,
+    statSync: jest.fn(real.statSync),
+    openSync: jest.fn(real.openSync),
+    readdirSync: jest.fn(real.readdirSync),
+    writeFileSync: jest.fn(real.writeFileSync),
+  };
+});
+const mockStatSync = statSync as jest.Mock;
+const mockOpenSync = openSync as jest.Mock;
+const mockReaddirSync = readdirSync as jest.Mock;
+const mockWriteFileSync = writeFileSync as jest.Mock;
+const realWriteFileSync = jest.requireActual<typeof import('node:fs')>('node:fs').writeFileSync as (
+  ...args: unknown[]
+) => void;
+
+/** Makes every cursor-file write throw, as a disk error would, until restoreCursorWrites(). */
+function failCursorWrites(): void {
+  mockWriteFileSync.mockImplementation((...args: unknown[]) => {
+    if (String(args[0]).includes('.subagent-pos-')) {
+      throw Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' });
+    }
+    realWriteFileSync(...args);
+  });
+}
+
+function restoreCursorWrites(): void {
+  mockWriteFileSync.mockImplementation(realWriteFileSync);
+}
 
 const STDERR_WRITE = process.stderr.write;
 
@@ -80,6 +131,7 @@ describe('SubagentWatcher', () => {
 
   beforeEach(() => {
     process.stderr.write = jest.fn(() => true) as unknown as typeof process.stderr.write;
+    mockStatSync.mockClear();
     storagePath = mkTmp();
     projectsDir = mkTmp();
     sessionDir = join(projectsDir, 'project-slug', PARENT_SESSION);
@@ -120,6 +172,42 @@ describe('SubagentWatcher', () => {
       cacheCreationTokens: 200,
       workflowRunId: null,
     });
+  });
+
+  it('includes tool_use ids from the transcript line on the emitted subagent_token event', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      uuid: 'turn-uuid-1',
+      timestamp: '2026-06-15T12:00:00.000Z',
+      sessionId: PARENT_SESSION,
+      isSidechain: true,
+      message: {
+        id: 'msg_1',
+        role: 'assistant',
+        model: 'claude-opus-4-7',
+        stop_reason: 'end_turn',
+        content: [
+          { type: 'text', text: 'Running a command' },
+          { type: 'tool_use', id: 'toolu_xyz789', name: 'Bash', input: {} },
+        ],
+        usage: { input_tokens: 100, output_tokens: 50 },
+      },
+    });
+    writeFileSync(agentJsonl, line + '\n');
+    const watcher = new SubagentWatcher({
+      storagePath,
+      projectsDir,
+      parentSessionId: PARENT_SESSION,
+    });
+    watcher.poll();
+    const buf = readFileSync(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`), 'utf-8');
+    const tokenLines = buf
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((l) => l.mode === 'subagent_token');
+    expect(tokenLines).toHaveLength(1);
+    expect(tokenLines[0].toolUseIds).toEqual(['toolu_xyz789']);
   });
 
   it('does not re-emit lines on a second poll (cursor persisted)', () => {
@@ -209,6 +297,155 @@ describe('SubagentWatcher', () => {
     expect(tokenLines).toHaveLength(0);
   });
 
+  describe('unfiltered discovery (--local mode, no parentSessionId)', () => {
+    // High PID sentinel — see local-store.test.ts's gcOrphanBuffers() block
+    // for the same rationale (well above Linux/macOS pid_max ceilings).
+    const DEAD_PID = 9_999_999;
+
+    it('discovers files across every session when no parentSessionId filter is set', () => {
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+      const watcher = new SubagentWatcher({ storagePath, projectsDir });
+      watcher.poll();
+      const buf = readFileSync(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`), 'utf-8');
+      const tokenLines = buf
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .filter((l) => l.mode === 'subagent_token');
+      expect(tokenLines).toHaveLength(1);
+    });
+
+    it('REGRESSION: dedupes one (sessionId, agentId) across two project dirs, reading only the newest copy', () => {
+      // Repo-rename scenario, subagent side: the same session's subagent
+      // transcript exists under two project-slug dirs. The per-agent cursor is
+      // keyed by (parentSessionId, agentId) alone, so reading both copies
+      // cross-contaminates the cursor and double-counts subagent spend. Only
+      // the newest-mtime copy must be read.
+      const staleAgent = agentJsonl; // under project-slug (from beforeEach)
+      const newDir = join(projectsDir, 'project-new-slug', PARENT_SESSION, 'subagents');
+      mkdirSync(newDir, { recursive: true });
+      const activeAgent = join(newDir, `agent-${AGENT_ID}.jsonl`);
+      writeFileSync(
+        staleAgent,
+        makeAssistantLine({ messageId: 'msg_STALE', inputTokens: 9 }) + '\n',
+      );
+      writeFileSync(
+        activeAgent,
+        makeAssistantLine({ messageId: 'msg_ACTIVE', inputTokens: 111 }) + '\n',
+      );
+      const older = Date.now() / 1000 - 60;
+      const newer = Date.now() / 1000;
+      utimesSync(staleAgent, older, older);
+      utimesSync(activeAgent, newer, newer);
+
+      const watcher = new SubagentWatcher({ storagePath, projectsDir });
+      watcher.poll();
+      const buf = readFileSync(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`), 'utf-8');
+      const tokenLines = buf
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .filter((l) => l.mode === 'subagent_token');
+      expect(tokenLines).toHaveLength(1);
+      expect(tokenLines[0].messageId).toBe('msg_ACTIVE');
+      expect(tokenLines[0].inputTokens).toBe(111);
+    });
+
+    it('REGRESSION: resets the (sessionId,agentId) cursor when the canonical copy switches project dirs mid-stream', () => {
+      // Poll 1 tails a LARGE agent transcript under the old slug (cursor advances
+      // to a large bytePos, path=old). A repo rename then makes a SMALLER copy
+      // under a new slug the newest. Without a path-aware cursor reset the stale
+      // bytePos >= the new file's size, so processFile early-returns and drops
+      // every post-rename subagent turn.
+      const staleAgent = agentJsonl; // project-slug (from beforeEach)
+      const newDir = join(projectsDir, 'project-new-slug', PARENT_SESSION, 'subagents');
+      mkdirSync(newDir, { recursive: true });
+      const activeAgent = join(newDir, `agent-${AGENT_ID}.jsonl`);
+
+      writeFileSync(staleAgent, makeAssistantLine({ messageId: 'msg_OLD', padBytes: 4096 }) + '\n');
+      const t0 = Date.now() / 1000 - 60;
+      utimesSync(staleAgent, t0, t0);
+
+      const watcher = new SubagentWatcher({ storagePath, projectsDir });
+      watcher.poll();
+      const bufPath = join(storagePath, `buffer-${PARENT_SESSION}.jsonl`);
+      const idsAfter1 = readFileSync(bufPath, 'utf-8')
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .filter((l) => l.mode === 'subagent_token')
+        .map((l) => l.messageId);
+      expect(idsAfter1).toEqual(['msg_OLD']);
+
+      // Rename: new slug's copy is small and strictly newer.
+      writeFileSync(activeAgent, makeAssistantLine({ messageId: 'msg_AFTER_RENAME' }) + '\n');
+      const t1 = Date.now() / 1000;
+      utimesSync(activeAgent, t1, t1);
+
+      watcher.poll();
+      const idsAfter2 = readFileSync(bufPath, 'utf-8')
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .filter((l) => l.mode === 'subagent_token')
+        .map((l) => l.messageId);
+      expect(idsAfter2).toContain('msg_AFTER_RENAME');
+    });
+
+    it("skips a session whose --stdio owner is alive, so it doesn't race that session's own scoped watcher over the same cursor file", () => {
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+      // A live heartbeat means a --stdio process already owns and tails this
+      // session's subagent transcripts with its own scoped SubagentWatcher.
+      writeFileSync(join(storagePath, `active-${PARENT_SESSION}.pid`), String(process.pid));
+
+      const watcher = new SubagentWatcher({
+        storagePath,
+        projectsDir,
+        localStore: new LocalStore(storagePath),
+      });
+      watcher.poll();
+
+      const bufPath = join(storagePath, `buffer-${PARENT_SESSION}.jsonl`);
+      expect(existsSync(bufPath)).toBe(false);
+    });
+
+    it('still discovers a session whose heartbeat PID is dead (orphaned session)', () => {
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+      writeFileSync(join(storagePath, `active-${PARENT_SESSION}.pid`), String(DEAD_PID));
+
+      const watcher = new SubagentWatcher({
+        storagePath,
+        projectsDir,
+        localStore: new LocalStore(storagePath),
+      });
+      watcher.poll();
+
+      const buf = readFileSync(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`), 'utf-8');
+      const tokenLines = buf
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .filter((l) => l.mode === 'subagent_token');
+      expect(tokenLines).toHaveLength(1);
+    });
+
+    it('discovers every session when no localStore is provided (no regression for callers that omit it)', () => {
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+      writeFileSync(join(storagePath, `active-${PARENT_SESSION}.pid`), String(process.pid));
+
+      const watcher = new SubagentWatcher({ storagePath, projectsDir });
+      watcher.poll();
+
+      const buf = readFileSync(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`), 'utf-8');
+      const tokenLines = buf
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l))
+        .filter((l) => l.mode === 'subagent_token');
+      expect(tokenLines).toHaveLength(1);
+    });
+  });
+
   it('rejects synthetic models', () => {
     const line = JSON.stringify({
       type: 'assistant',
@@ -221,6 +458,68 @@ describe('SubagentWatcher', () => {
         model: '<synthetic>',
         usage: { input_tokens: 1, output_tokens: 1 },
         content: [{ type: 'text' }],
+      },
+    });
+    writeFileSync(agentJsonl, line + '\n');
+    const watcher = new SubagentWatcher({
+      storagePath,
+      projectsDir,
+      parentSessionId: PARENT_SESSION,
+    });
+    watcher.poll();
+    const bufPath = join(storagePath, `buffer-${PARENT_SESSION}.jsonl`);
+    const tokenLines = !existsSync(bufPath)
+      ? []
+      : readFileSync(bufPath, 'utf-8')
+          .split('\n')
+          .filter(Boolean)
+          .map((l) => JSON.parse(l))
+          .filter((l) => l.mode === 'subagent_token');
+    expect(tokenLines).toHaveLength(0);
+  });
+
+  it('accepts a line with no timestamp field, defaulting to Date.now()', () => {
+    const before = Date.now();
+    const line = JSON.stringify({
+      type: 'assistant',
+      agentId: AGENT_ID,
+      uuid: 'u',
+      sessionId: PARENT_SESSION,
+      message: {
+        id: 'msg_no_ts',
+        model: 'claude-opus-4-7',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    });
+    writeFileSync(agentJsonl, line + '\n');
+    const watcher = new SubagentWatcher({
+      storagePath,
+      projectsDir,
+      parentSessionId: PARENT_SESSION,
+    });
+    watcher.poll();
+    const after = Date.now();
+    const buf = readFileSync(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`), 'utf-8');
+    const tokenLines = buf
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((l) => l.mode === 'subagent_token');
+    expect(tokenLines).toHaveLength(1);
+    expect(tokenLines[0].timestamp).toBeGreaterThanOrEqual(before);
+    expect(tokenLines[0].timestamp).toBeLessThanOrEqual(after);
+  });
+
+  it('rejects a line with no model field (does not emit)', () => {
+    const line = JSON.stringify({
+      type: 'assistant',
+      agentId: AGENT_ID,
+      uuid: 'u',
+      timestamp: '2026-06-15T12:00:00.000Z',
+      sessionId: PARENT_SESSION,
+      message: {
+        id: 'msg_no_model',
+        usage: { input_tokens: 1, output_tokens: 1 },
       },
     });
     writeFileSync(agentJsonl, line + '\n');
@@ -373,6 +672,104 @@ describe('SubagentWatcher', () => {
     expect(tokenLines[1].messageId).toBe('msg_second');
   });
 
+  describe('agentType from the agent-<id>.meta.json sidecar', () => {
+    const metaPath = (): string => join(sessionDir, 'subagents', `agent-${AGENT_ID}.meta.json`);
+
+    function pollTokenLines(watcher: SubagentWatcher): Array<Record<string, unknown>> {
+      watcher.poll();
+      const bufPath = join(storagePath, `buffer-${PARENT_SESSION}.jsonl`);
+      if (!existsSync(bufPath)) return [];
+      return readFileSync(bufPath, 'utf-8')
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .filter((l) => l.mode === 'subagent_token');
+    }
+
+    function makeWatcher(): SubagentWatcher {
+      return new SubagentWatcher({ storagePath, projectsDir, parentSessionId: PARENT_SESSION });
+    }
+
+    function twoTurns(): string {
+      return (
+        makeAssistantLine({ messageId: 'msg_1' }) +
+        '\n' +
+        makeAssistantLine({ messageId: 'msg_2' }) +
+        '\n'
+      );
+    }
+
+    it('stamps agentType from the sidecar and copies no other sidecar field', () => {
+      // Shape of a real sidecar written by Claude Code 2.1.284 at spawn time.
+      writeFileSync(
+        metaPath(),
+        JSON.stringify({
+          agentType: 'Explore',
+          description: 'Find the config loader',
+          name: 'explorer',
+          toolUseId: 'toolu_parent_1',
+          spawnDepth: 1,
+        }),
+      );
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+
+      const lines = pollTokenLines(makeWatcher());
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0].agentType).toBe('Explore');
+      expect(lines[0].description).toBeUndefined();
+      expect(lines[0].name).toBeUndefined();
+    });
+
+    it('omits agentType when there is no sidecar', () => {
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+
+      const lines = pollTokenLines(makeWatcher());
+
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).not.toHaveProperty('agentType');
+    });
+
+    it('omits agentType when the sidecar is malformed or has no usable type', () => {
+      writeFileSync(metaPath(), '{not json');
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+      const watcher = makeWatcher();
+      expect(pollTokenLines(watcher)[0]).not.toHaveProperty('agentType');
+
+      writeFileSync(metaPath(), JSON.stringify({ agentType: 7 }));
+      writeFileSync(agentJsonl, twoTurns());
+      expect(pollTokenLines(watcher)[1]).not.toHaveProperty('agentType');
+    });
+
+    it('ignores a sidecar larger than MAX_META_SIDECAR_BYTES and accepts one at the limit', () => {
+      const sidecarOfSize = (bytes: number): string => {
+        const base = JSON.stringify({ agentType: 'Explore', description: '' });
+        return base.replace(
+          '"description":""',
+          `"description":"${'x'.repeat(bytes - base.length)}"`,
+        );
+      };
+      writeFileSync(metaPath(), sidecarOfSize(MAX_META_SIDECAR_BYTES + 1));
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+      const watcher = makeWatcher();
+      expect(pollTokenLines(watcher)[0]).not.toHaveProperty('agentType');
+
+      writeFileSync(metaPath(), sidecarOfSize(MAX_META_SIDECAR_BYTES));
+      writeFileSync(agentJsonl, twoTurns());
+      expect(pollTokenLines(watcher)[1].agentType).toBe('Explore');
+    });
+
+    it('picks the type up on a later poll when the sidecar appears after the transcript', () => {
+      writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_1' }) + '\n');
+      const watcher = makeWatcher();
+      expect(pollTokenLines(watcher)[0]).not.toHaveProperty('agentType');
+
+      writeFileSync(metaPath(), JSON.stringify({ agentType: 'Plan' }));
+      writeFileSync(agentJsonl, twoTurns());
+      expect(pollTokenLines(watcher)[1].agentType).toBe('Plan');
+    });
+  });
+
   it('emitted subagent_token events contain no message content or prompt text', () => {
     // The source JSONL line contains a full `message` object with content blocks.
     // The emitted event must strip all content fields — only metadata/counts allowed.
@@ -509,6 +906,71 @@ describe('SubagentWatcher', () => {
     expect(healthEvents).toHaveLength(1);
   });
 
+  it('discovers and processes a named subagent transcript (Agent tool `name` param)', () => {
+    // Claude Code writes `agent-a<name>-<16-hex>.jsonl` for a subagent spawned
+    // with an explicit `name` (Agent tool `name` param, addressable later via
+    // SendMessage) — distinct from the plain `agent-a<16-hex>.jsonl` shape used
+    // by anonymous Task spawns.
+    const namedAgentId = 'aconfluence-istio-investigator-ca0143b626a86424';
+    const namedFile = join(sessionDir, 'subagents', `agent-${namedAgentId}.jsonl`);
+    writeFileSync(namedFile, makeAssistantLine({ messageId: 'msg_named' }) + '\n');
+    const watcher = new SubagentWatcher({
+      storagePath,
+      projectsDir,
+      parentSessionId: PARENT_SESSION,
+    });
+    watcher.poll();
+    const bufPath = join(storagePath, `buffer-${PARENT_SESSION}.jsonl`);
+    const lines = readFileSync(bufPath, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    const healthEvents = lines.filter(
+      (l) => l.mode === 'observability_health' && l.event === 'discovery_skipped',
+    );
+    expect(healthEvents).toHaveLength(0);
+    const tokenLines = lines.filter((l) => l.mode === 'subagent_token');
+    expect(tokenLines).toHaveLength(1);
+    expect(tokenLines[0]).toMatchObject({
+      mode: 'subagent_token',
+      sessionId: PARENT_SESSION,
+      agentId: namedAgentId,
+      messageId: 'msg_named',
+    });
+  });
+
+  it('discovers and processes a named subagent transcript under a workflow run dir', () => {
+    const namedAgentId = 'aconfluence-istio-investigator-ca0143b626a86424';
+    const wfDir = join(sessionDir, 'subagents', 'workflows', 'wf_abc12345-6dd');
+    mkdirSync(wfDir, { recursive: true });
+    const namedFile = join(wfDir, `agent-${namedAgentId}.jsonl`);
+    writeFileSync(namedFile, makeAssistantLine({ messageId: 'msg_named_wf' }) + '\n');
+    const watcher = new SubagentWatcher({
+      storagePath,
+      projectsDir,
+      parentSessionId: PARENT_SESSION,
+    });
+    watcher.poll();
+    const bufPath = join(storagePath, `buffer-${PARENT_SESSION}.jsonl`);
+    const lines = readFileSync(bufPath, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+    const healthEvents = lines.filter(
+      (l) => l.mode === 'observability_health' && l.event === 'discovery_skipped',
+    );
+    expect(healthEvents).toHaveLength(0);
+    const tokenLines = lines.filter((l) => l.mode === 'subagent_token');
+    expect(tokenLines).toHaveLength(1);
+    expect(tokenLines[0]).toMatchObject({
+      mode: 'subagent_token',
+      sessionId: PARENT_SESSION,
+      agentId: namedAgentId,
+      workflowRunId: 'wf_abc12345-6dd',
+      messageId: 'msg_named_wf',
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Memory-bound regression tests (OOM fix)
   //
@@ -532,10 +994,9 @@ describe('SubagentWatcher', () => {
 
   it('emits a line larger than MAX_BYTES_PER_POLL exactly once and bounds memory under sustained polling', () => {
     // A single assistant turn whose serialized JSONL exceeds 64 KiB (here ~200
-    // KiB via padding). Under the pre-fix code this never emitted and leaked
-    // ~64 KiB per poll. Under the fix the cursor advances each poll, the line
-    // emits once its terminating newline is reached, and further polls are
-    // no-ops.
+    // KiB via padding). The cursor advances each poll regardless of whether a
+    // full line was read, so the line emits once its terminating newline is
+    // reached, and further polls are no-ops.
     const bigLine = makeAssistantLine({ messageId: 'msg_big', padBytes: 200 * 1024 });
     expect(Buffer.byteLength(bigLine)).toBeGreaterThan(64 * 1024);
     writeFileSync(agentJsonl, bigLine + '\n');
@@ -566,11 +1027,11 @@ describe('SubagentWatcher', () => {
   });
 
   it('keeps the persisted partial bounded for a never-terminated giant blob across many polls', () => {
-    // A file that is one enormous un-terminated token (no '\n' ever). This is
-    // the pathological case: the pre-fix code grew the partial without bound.
-    // The fix caps the retained partial at MAX_PARTIAL_LINE_BYTES (1 MiB) and
-    // drops the line, so the persisted partial can never exceed the cap (plus
-    // one chunk), no matter how long we poll.
+    // A file that is one enormous un-terminated token (no '\n' ever) — the
+    // pathological case for an unbounded partial-line buffer. The retained
+    // partial is capped at MAX_PARTIAL_LINE_BYTES (1 MiB) and the line is
+    // dropped once it exceeds that, so the persisted partial can never exceed
+    // the cap (plus one chunk), no matter how long we poll.
     const blob = 'x'.repeat(5 * 1024 * 1024); // 5 MiB, no newline
     writeFileSync(agentJsonl, blob);
 
@@ -785,5 +1246,514 @@ describe('SubagentWatcher', () => {
     expect(costEvents).toHaveLength(1);
     // (groundTruthUsd - trackedUsd) / groundTruthUsd * 100 = (10 - 8) / 10 * 100 = 20
     expect(costEvents[0]!.costSelfCheckDeltaPct).toBeCloseTo(20, 5);
+  });
+});
+
+describe('SubagentWatcher unfiltered discovery bounding', () => {
+  let storagePath: string;
+  let projectsDir: string;
+  let sessionDir: string;
+
+  beforeEach(() => {
+    process.stderr.write = jest.fn(() => true) as unknown as typeof process.stderr.write;
+    mockStatSync.mockClear();
+    storagePath = mkTmp();
+    projectsDir = mkTmp();
+    sessionDir = join(projectsDir, 'project-slug', PARENT_SESSION);
+    mkdirSync(join(sessionDir, 'subagents'), { recursive: true });
+  });
+
+  afterEach(() => {
+    process.stderr.write = STDERR_WRITE;
+    rmSync(storagePath, { recursive: true, force: true });
+    rmSync(projectsDir, { recursive: true, force: true });
+  });
+
+  function tokenLinesFrom(path: string): Array<Record<string, unknown>> {
+    if (!existsSync(path)) return [];
+    return readFileSync(path, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((l) => l.mode === 'subagent_token');
+  }
+
+  it('polls every 10s when unfiltered — 5x slower than the scoped 2s default', () => {
+    jest.useFakeTimers();
+    try {
+      const scoped = new SubagentWatcher({
+        storagePath,
+        projectsDir,
+        parentSessionId: PARENT_SESSION,
+      });
+      const scopedPoll = jest.spyOn(scoped, 'poll');
+      scoped.start();
+      jest.advanceTimersByTime(2_000);
+      expect(scopedPoll).toHaveBeenCalledTimes(1);
+      scoped.stop();
+
+      const unfiltered = new SubagentWatcher({ storagePath, projectsDir });
+      const unfilteredPoll = jest.spyOn(unfiltered, 'poll');
+      unfiltered.start();
+      jest.advanceTimersByTime(2_000);
+      expect(unfilteredPoll).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(8_000); // total 10s since start()
+      expect(unfilteredPoll).toHaveBeenCalledTimes(1);
+      unfiltered.stop();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('prunes a stale subagents/ directory without statting the agent files inside it', () => {
+    const agentJsonl = join(sessionDir, 'subagents', `agent-${AGENT_ID}.jsonl`);
+    // The FILE's own mtime is fresh — if the code fell back to per-file
+    // freshness instead of the directory-level prune, this turn would still
+    // be emitted. Pruning must happen before the file is ever statted.
+    writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_should_be_pruned' }) + '\n');
+    const stale = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
+    utimesSync(join(sessionDir, 'subagents'), stale, stale);
+
+    const watcher = new SubagentWatcher({ storagePath, projectsDir, discoveryHours: 24 });
+    watcher.poll();
+
+    expect(tokenLinesFrom(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`))).toHaveLength(0);
+    const statted = mockStatSync.mock.calls.map((args) => String(args[0]));
+    expect(statted).not.toContain(agentJsonl);
+  });
+
+  it('still descends into a session whose subagents/ dir is stale when subagents/workflows/ is fresh', () => {
+    const wfDir = join(sessionDir, 'subagents', 'workflows', 'wf_run1');
+    mkdirSync(wfDir, { recursive: true });
+    const wfAgentFile = join(wfDir, `agent-${AGENT_ID}.jsonl`);
+    writeFileSync(wfAgentFile, makeAssistantLine({ messageId: 'msg_wf_fresh' }) + '\n');
+    // Stale the subagents/ dir itself AFTER creating workflows/ under it —
+    // a new workflow run bumps workflows/'s mtime but not subagents/'s.
+    const stale = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
+    utimesSync(join(sessionDir, 'subagents'), stale, stale);
+
+    const watcher = new SubagentWatcher({ storagePath, projectsDir, discoveryHours: 24 });
+    watcher.poll();
+
+    const tokenLines = tokenLinesFrom(join(storagePath, `buffer-${PARENT_SESSION}.jsonl`));
+    expect(tokenLines).toHaveLength(1);
+    expect(tokenLines[0]?.messageId).toBe('msg_wf_fresh');
+  });
+
+  it('emits no discovery_skipped health event for a stale file when unfiltered', () => {
+    const agentJsonl = join(sessionDir, 'subagents', `agent-${AGENT_ID}.jsonl`);
+    writeFileSync(agentJsonl, makeAssistantLine({ messageId: 'msg_old' }) + '\n');
+    // Stale the FILE (not the directory), so discovery descends into
+    // subagents/ and reaches the per-file filterByMtime check.
+    const stale = (Date.now() - 25 * 60 * 60 * 1000) / 1000;
+    utimesSync(agentJsonl, stale, stale);
+
+    const watcher = new SubagentWatcher({ storagePath, projectsDir, discoveryHours: 24 });
+    watcher.poll();
+
+    // Unfiltered health rides the sessionless 'health' bucket.
+    const bufPath = join(storagePath, 'buffer-health.jsonl');
+    const events = existsSync(bufPath)
+      ? readFileSync(bufPath, 'utf-8')
+          .split('\n')
+          .filter(Boolean)
+          .map((l) => JSON.parse(l))
+          .filter((l) => l.mode === 'observability_health' && l.event === 'discovery_skipped')
+      : [];
+    expect(events).toHaveLength(0);
+  });
+});
+
+describe('SubagentWatcher.readLiveTails (on-demand read at hook intake)', () => {
+  let storagePath: string;
+  let projectsDir: string;
+  let subagentsDir: string;
+  let agentJsonl: string;
+  let turnsRead: SubagentTokenEvent[];
+
+  beforeEach(() => {
+    process.stderr.write = jest.fn(() => true) as unknown as typeof process.stderr.write;
+    storagePath = mkTmp();
+    projectsDir = mkTmp();
+    subagentsDir = join(projectsDir, 'project-slug', PARENT_SESSION, 'subagents');
+    mkdirSync(subagentsDir, { recursive: true });
+    agentJsonl = join(subagentsDir, `agent-${AGENT_ID}.jsonl`);
+    // What Claude Code writes when it spawns the subagent: the prompt, no turn yet.
+    writeFileSync(agentJsonl, promptLine() + '\n');
+    turnsRead = [];
+    mockStatSync.mockClear();
+    mockOpenSync.mockClear();
+    mockReaddirSync.mockClear();
+  });
+
+  afterEach(() => {
+    process.stderr.write = STDERR_WRITE;
+    restoreCursorWrites();
+    rmSync(storagePath, { recursive: true, force: true });
+    rmSync(projectsDir, { recursive: true, force: true });
+  });
+
+  function promptLine(): string {
+    return JSON.stringify({
+      type: 'user',
+      isSidechain: true,
+      sessionId: PARENT_SESSION,
+      timestamp: '2026-06-15T12:00:00.000Z',
+      message: { role: 'user', content: 'Find the config loader' },
+    });
+  }
+
+  function toolUseLine(messageId: string, toolUseId: string, padBytes = 0): string {
+    const content: Array<Record<string, unknown>> = [
+      { type: 'tool_use', id: toolUseId, name: 'Read', input: { file_path: '/repo/.env' } },
+    ];
+    if (padBytes > 0) content.unshift({ type: 'text', text: 'a'.repeat(padBytes) });
+    return JSON.stringify({
+      type: 'assistant',
+      isSidechain: true,
+      sessionId: PARENT_SESSION,
+      uuid: `uuid-${messageId}-${toolUseId}`,
+      timestamp: '2026-06-15T12:00:01.000Z',
+      message: {
+        id: messageId,
+        role: 'assistant',
+        model: 'claude-opus-4-7',
+        stop_reason: 'tool_use',
+        content,
+        usage: { input_tokens: 10, output_tokens: 5 },
+      },
+    });
+  }
+
+  function makeWatcher(): SubagentWatcher {
+    return new SubagentWatcher({
+      storagePath,
+      projectsDir,
+      parentSessionId: PARENT_SESSION,
+      onTurnRead: (turn) => turnsRead.push(turn),
+    });
+  }
+
+  function bufferedTurns(): Array<Record<string, unknown>> {
+    const bufPath = join(storagePath, `buffer-${PARENT_SESSION}.jsonl`);
+    if (!existsSync(bufPath)) return [];
+    return readFileSync(bufPath, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.mode === 'subagent_token');
+  }
+
+  function stattedPaths(): string[] {
+    return mockStatSync.mock.calls.map((args) => String(args[0]));
+  }
+
+  it('reads a turn appended since the last poll and reports it through onTurnRead', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    expect(turnsRead).toHaveLength(0);
+
+    appendFileSync(agentJsonl, toolUseLine('msg_1', 'toolu_sub_1') + '\n');
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(1);
+    expect(turnsRead).toHaveLength(1);
+    expect(turnsRead[0]).toMatchObject({ agentId: AGENT_ID, toolUseIds: ['toolu_sub_1'] });
+    expect(bufferedTurns().map((t) => t.messageId)).toEqual(['msg_1']);
+  });
+
+  it('reports every transcript line of a message to onTurnRead, not only the first', () => {
+    // Claude Code writes one line per content block, each repeating the
+    // message id, so a tool_use block usually follows a thinking or text line.
+    writeFileSync(
+      agentJsonl,
+      makeAssistantLine({ messageId: 'msg_1', contentTypes: ['thinking'] }) +
+        '\n' +
+        toolUseLine('msg_1', 'toolu_sub_1') +
+        '\n',
+    );
+
+    makeWatcher().poll();
+
+    expect(turnsRead.map((t) => t.toolUseIds)).toEqual([[], ['toolu_sub_1']]);
+  });
+
+  it('touches no file before the first poll has found any transcript', () => {
+    const watcher = makeWatcher();
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    expect(mockStatSync).not.toHaveBeenCalled();
+    expect(mockOpenSync).not.toHaveBeenCalled();
+    expect(mockReaddirSync).not.toHaveBeenCalled();
+  });
+
+  it('touches no file for a session the last poll found no subagents directory for', () => {
+    const watcher = new SubagentWatcher({ storagePath, projectsDir });
+    watcher.poll();
+    mockStatSync.mockClear();
+    mockReaddirSync.mockClear();
+
+    expect(watcher.readLiveTails('bbbbbbbb-cccc-dddd-eeee-ffffffffffff')).toBe(0);
+    expect(mockStatSync).not.toHaveBeenCalled();
+    expect(mockReaddirSync).not.toHaveBeenCalled();
+  });
+
+  it('reads a tracked transcript that resumes after a tool call longer than ten minutes', () => {
+    // The subagent's last line was written 12 minutes ago, before a long
+    // tool call; the poll still tracks the transcript.
+    const idle = (Date.now() - 12 * 60 * 1000) / 1000;
+    utimesSync(agentJsonl, idle, idle);
+    const watcher = makeWatcher();
+    watcher.poll();
+
+    appendFileSync(agentJsonl, toolUseLine('msg_1', 'toolu_sub_1') + '\n');
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(1);
+    expect(turnsRead[0]).toMatchObject({ agentId: AGENT_ID, toolUseIds: ['toolu_sub_1'] });
+  });
+
+  it("reads a subagent spawned since the last poll, from the session's subagents directory", () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    const spawnedId = 'a00000000000000ff';
+    writeFileSync(
+      join(subagentsDir, `agent-${spawnedId}.jsonl`),
+      promptLine() + '\n' + toolUseLine('msg_s', 'toolu_spawned') + '\n',
+    );
+    mockReaddirSync.mockClear();
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(1);
+    expect(mockReaddirSync).toHaveBeenCalledTimes(1);
+    expect(turnsRead[0]).toMatchObject({ agentId: spawnedId, toolUseIds: ['toolu_spawned'] });
+    // Tracked from then on: the next record and the next poll do not repeat it.
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    watcher.poll();
+    expect(bufferedTurns().map((t) => t.messageId)).toEqual(['msg_s']);
+  });
+
+  it('does not stat a transcript in that directory the poll skipped as stale', () => {
+    const stalePath = join(subagentsDir, 'agent-a00000000000000ee.jsonl');
+    writeFileSync(stalePath, promptLine() + '\n');
+    const stale = (Date.now() - 48 * 60 * 60 * 1000) / 1000;
+    utimesSync(stalePath, stale, stale);
+    const watcher = makeWatcher();
+    watcher.poll();
+    mockStatSync.mockClear();
+
+    watcher.readLiveTails(PARENT_SESSION);
+
+    expect(stattedPaths()).toEqual([agentJsonl]);
+  });
+
+  it('stats a live transcript once and opens nothing when its size is unchanged', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    mockStatSync.mockClear();
+    mockOpenSync.mockClear();
+    const bytesBefore = watcher.getHealthStats().bytesRead;
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    expect(stattedPaths()).toEqual([agentJsonl]);
+    expect(mockOpenSync).not.toHaveBeenCalled();
+    expect(watcher.getHealthStats().bytesRead).toBe(bytesBefore);
+  });
+
+  it("only checks the transcripts of the record's own session", () => {
+    const otherSession = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+    const otherDir = join(projectsDir, 'project-slug', otherSession, 'subagents');
+    mkdirSync(otherDir, { recursive: true });
+    const otherJsonl = join(otherDir, `agent-${AGENT_ID}.jsonl`);
+    writeFileSync(otherJsonl, promptLine() + '\n');
+    const watcher = new SubagentWatcher({ storagePath, projectsDir });
+    watcher.poll();
+    mockStatSync.mockClear();
+
+    watcher.readLiveTails(otherSession);
+
+    expect(stattedPaths()).toEqual([otherJsonl]);
+  });
+
+  it('never emits a turn twice across an on-demand read and the next poll', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    appendFileSync(agentJsonl, toolUseLine('msg_1', 'toolu_sub_1') + '\n');
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(1);
+    watcher.poll();
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+
+    expect(bufferedTurns().map((t) => t.messageId)).toEqual(['msg_1']);
+    expect(turnsRead).toHaveLength(1);
+  });
+
+  it('catches up past a backlog larger than one poll reads', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    // A large line ahead of the tool_use line, e.g. a big tool result.
+    appendFileSync(
+      agentJsonl,
+      toolUseLine('msg_1', 'toolu_sub_1', 200_000) +
+        '\n' +
+        toolUseLine('msg_2', 'toolu_sub_2') +
+        '\n',
+    );
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(2);
+    expect(turnsRead.map((t) => t.toolUseIds)).toEqual([['toolu_sub_1'], ['toolu_sub_2']]);
+  });
+
+  it('reads at most MAX_ON_DEMAND_BYTES per call and leaves the rest to the next read', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    const bigLine = (n: number): string => toolUseLine(`msg_${n}`, `toolu_sub_${n}`, 400_000);
+    appendFileSync(agentJsonl, [1, 2, 3, 4].map(bigLine).join('\n') + '\n');
+    const bytesBefore = watcher.getHealthStats().bytesRead;
+
+    watcher.readLiveTails(PARENT_SESSION);
+
+    const bytesRead = watcher.getHealthStats().bytesRead - bytesBefore;
+    expect(bytesRead).toBeGreaterThan(0);
+    expect(bytesRead).toBeLessThanOrEqual(MAX_ON_DEMAND_BYTES);
+    expect(turnsRead.length).toBeLessThan(4);
+    watcher.readLiveTails(PARENT_SESSION);
+    expect(turnsRead.map((t) => t.toolUseIds[0])).toEqual([
+      'toolu_sub_1',
+      'toolu_sub_2',
+      'toolu_sub_3',
+      'toolu_sub_4',
+    ]);
+  });
+
+  it('stats at most MAX_ON_DEMAND_FILES transcripts per call, spawned ones included', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    for (let i = 0; i < MAX_ON_DEMAND_FILES + 3; i++) {
+      const agentId = `a${i.toString(16).padStart(16, '0')}`;
+      writeFileSync(join(subagentsDir, `agent-${agentId}.jsonl`), promptLine() + '\n');
+    }
+    mockStatSync.mockClear();
+
+    watcher.readLiveTails(PARENT_SESSION);
+
+    expect(mockStatSync).toHaveBeenCalledTimes(MAX_ON_DEMAND_FILES);
+  });
+
+  it('checks at most MAX_ON_DEMAND_FILES transcripts per call', () => {
+    for (let i = 0; i < MAX_ON_DEMAND_FILES + 3; i++) {
+      const agentId = `a${i.toString(16).padStart(16, '0')}`;
+      writeFileSync(join(subagentsDir, `agent-${agentId}.jsonl`), promptLine() + '\n');
+    }
+    const watcher = makeWatcher();
+    watcher.poll();
+    mockStatSync.mockClear();
+
+    watcher.readLiveTails(PARENT_SESSION);
+
+    expect(mockStatSync).toHaveBeenCalledTimes(MAX_ON_DEMAND_FILES);
+  });
+
+  it('returns 0 without throwing when the transcript cannot be read, and leaves it to the poll', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    appendFileSync(agentJsonl, toolUseLine('msg_1', 'toolu_sub_1') + '\n');
+    mockOpenSync.mockImplementationOnce(() => {
+      throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
+    });
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    mockOpenSync.mockClear();
+    // A failed file is not retried on every hook record, only by the next poll.
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    expect(mockOpenSync).not.toHaveBeenCalled();
+
+    watcher.poll();
+    expect(bufferedTurns().map((t) => t.messageId)).toEqual(['msg_1']);
+    expect(turnsRead).toHaveLength(1);
+  });
+
+  it('emits nothing from a read whose cursor write fails, and the poll then emits each turn once', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    appendFileSync(
+      agentJsonl,
+      toolUseLine('msg_1', 'toolu_sub_1') + '\n' + toolUseLine('msg_2', 'toolu_sub_2') + '\n',
+    );
+    failCursorWrites();
+
+    watcher.poll();
+
+    expect(bufferedTurns()).toEqual([]);
+    expect(turnsRead).toEqual([]);
+    restoreCursorWrites();
+    watcher.poll();
+    expect(bufferedTurns().map((t) => t.messageId)).toEqual(['msg_1', 'msg_2']);
+    expect(turnsRead.map((t) => t.messageId)).toEqual(['msg_1', 'msg_2']);
+  });
+
+  it('neither repeats nor corrupts a line when the cursor write fails during an on-demand read', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    // Two small turns, then one that straddles the 64 KiB read boundary, so
+    // the first read ends with a partial line held in memory.
+    appendFileSync(
+      agentJsonl,
+      [
+        toolUseLine('msg_1', 'toolu_sub_1'),
+        toolUseLine('msg_2', 'toolu_sub_2'),
+        toolUseLine('msg_3', 'toolu_sub_3', 100_000),
+        toolUseLine('msg_4', 'toolu_sub_4'),
+      ].join('\n') + '\n',
+    );
+    failCursorWrites();
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    // Left to the poll, as after a failed read: the next record opens nothing.
+    mockOpenSync.mockClear();
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    expect(mockOpenSync).not.toHaveBeenCalled();
+    expect(bufferedTurns()).toEqual([]);
+
+    restoreCursorWrites();
+    watcher.poll();
+    watcher.poll();
+    expect(bufferedTurns().map((t) => t.messageId)).toEqual(['msg_1', 'msg_2', 'msg_3', 'msg_4']);
+    expect(turnsRead.map((t) => t.messageId)).toEqual(['msg_1', 'msg_2', 'msg_3', 'msg_4']);
+    expect(watcher.getHealthStats().parseErrors).toBe(0);
+  });
+
+  it('returns 0 when a tracked transcript has been removed since the poll', () => {
+    const watcher = makeWatcher();
+    watcher.poll();
+    rmSync(agentJsonl);
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+  });
+
+  it('keeps going when onTurnRead throws', () => {
+    const watcher = new SubagentWatcher({
+      storagePath,
+      projectsDir,
+      parentSessionId: PARENT_SESSION,
+      onTurnRead: () => {
+        throw new Error('consumer bug');
+      },
+    });
+    watcher.poll();
+    appendFileSync(agentJsonl, toolUseLine('msg_1', 'toolu_sub_1') + '\n');
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(1);
+    watcher.poll();
+    expect(bufferedTurns().map((t) => t.messageId)).toEqual(['msg_1']);
+  });
+
+  it('does nothing once the watcher has been stopped', () => {
+    const watcher = makeWatcher();
+    watcher.start();
+    watcher.poll();
+    watcher.stop();
+    appendFileSync(agentJsonl, toolUseLine('msg_1', 'toolu_sub_1') + '\n');
+    mockStatSync.mockClear();
+
+    expect(watcher.readLiveTails(PARENT_SESSION)).toBe(0);
+    expect(mockStatSync).not.toHaveBeenCalled();
   });
 });

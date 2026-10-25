@@ -7,6 +7,7 @@ import { SessionStore } from '../storage/session-store.js';
 import type { FullSessionSummary } from '../storage/session-store.js';
 import type { ToolCallRecord } from '../storage/types.js';
 import { ClaudeMdTracker, matchesInstructionFile } from './claudemd-tracker.js';
+import { ZERO_QUALITY_PROXY_COUNTS } from './quality-proxy-tracker.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let tmpDir: string;
@@ -34,6 +35,8 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
   return {
     sessionId: `sess-${now}-${Math.random().toString(36).slice(2)}`,
     sessionName: null,
+    sessionNameSource: null,
+    sessionIntent: null,
     repoName: null,
     startTime: now - 60_000,
     endTime: now,
@@ -42,6 +45,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     developer: 'alice',
     model: 'claude-sonnet-4-20250514',
     toolBreakdown: { Read: 5, Edit: 3, Bash: 2 },
+    skillBreakdown: {},
     filesRead: ['/src/index.ts'],
     filesModified: ['/src/index.ts'],
     linesAdded: 20,
@@ -52,6 +56,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     buildRunCount: 1,
     buildPassCount: 1,
     estimatedCostUsd: 0.05,
+    subagentCostUsd: 0,
     tokensInput: 5000,
     tokensOutput: 2000,
     tokensThinking: 1000,
@@ -59,6 +64,10 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     tokensCacheCreation: 0,
     cacheSavingsUsd: 0,
     efficiencyScore: 0.75,
+    toolSelectionMetrics: null,
+    modelBreakdown: {},
+    costByWorkflowRunId: {},
+    qualityProxy: { ...ZERO_QUALITY_PROXY_COUNTS },
     antiPatterns: [],
     taskCount: 1,
     taskSuccessRate: 1,
@@ -394,11 +403,26 @@ describe('ClaudeMdTracker', () => {
 
     expect(estimate.charCount).toBe(10_000);
     expect(estimate.estimatedTokens).toBe(2500);
-    // perTurnCost = (2500 / 1_000_000) * 3 = 0.0075
+    // No pricing/cacheHitRate passed → falls back to the Sonnet-4 default rate
+    // ($3/MTok) with no cache adjustment: (2500 / 1_000_000) * 3 = 0.0075
     expect(estimate.perTurnCostUsd).toBe(0.0075);
-    // perSessionCost = 0.0075 * 10 = 0.075
-    expect(estimate.perSessionCostUsd).toBe(0.075);
+    // perSessionCost = 0.0075 * 20 = 0.15
+    expect(estimate.perSessionCostUsd).toBe(0.15);
     expect(estimate.filePath).toBe(testFile);
+  });
+
+  it('estimateContextCost sources rates from the pricing table and blends in the cache-read rate', () => {
+    const testFile = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(testFile, 'x'.repeat(10_000));
+
+    const estimate = ClaudeMdTracker.estimateContextCost(testFile, {
+      pricing: { inputPerMTok: 10, outputPerMTok: 30, cacheReadPerMTok: 1, contextWindow: 200_000 },
+      cacheHitRate: 0.9,
+    });
+
+    // blended rate = 10 * 0.1 + 1 * 0.9 = 1.9 per MTok
+    // perTurnCost = (2500 / 1_000_000) * 1.9 = 0.00475
+    expect(estimate.perTurnCostUsd).toBeCloseTo(0.00475, 6);
   });
 
   // -------------------------------------------------------------------------
@@ -436,6 +460,48 @@ describe('ClaudeMdTracker', () => {
 
     // Should reflect actual file: 2000 chars * 0.25 = 500 tokens
     expect(report.contextTokensForClaudeMd).toBe(500);
+  });
+
+  it('computeImpact sources cache-adjusted cost from a wired CostTracker', () => {
+    const costTracker = {
+      getMetrics: () => ({ model: 'claude-sonnet-4-20250514', cacheHitRate: 0.9 }),
+    } as unknown as import('./cost-tracker.js').CostTracker;
+    const tracker = new ClaudeMdTracker({ sessionStore: store, costTracker });
+    const changeTimestamp = Date.now();
+
+    const claudeMdPath = join(tmpDir, 'CLAUDE.md');
+    writeFileSync(claudeMdPath, 'x'.repeat(2000));
+
+    tracker.detectChange(
+      makeToolCall({
+        toolName: 'Edit',
+        filePath: claudeMdPath,
+        newLineCount: 3,
+        oldLineCount: 0,
+        timestamp: changeTimestamp,
+      } as Partial<ToolCallRecord>),
+    );
+    store.saveSession(
+      makeSummary({ sessionId: 'before-1', startTime: changeTimestamp - 86_400_000 }),
+    );
+
+    const report = tracker.computeImpact(changeTimestamp);
+    const noCacheTracker = new ClaudeMdTracker({ sessionStore: store });
+    noCacheTracker.detectChange(
+      makeToolCall({
+        toolName: 'Edit',
+        filePath: claudeMdPath,
+        newLineCount: 3,
+        oldLineCount: 0,
+        timestamp: changeTimestamp,
+      } as Partial<ToolCallRecord>),
+    );
+    const uncachedReport = noCacheTracker.computeImpact(changeTimestamp);
+
+    // A high cache hit rate should make the cache-adjusted estimate cheaper
+    // than pricing every turn at the full uncached rate.
+    expect(report.estimatedPerTurnCostUsd).not.toBeNull();
+    expect(report.estimatedPerTurnCostUsd!).toBeLessThan(uncachedReport.estimatedPerTurnCostUsd!);
   });
 
   // -------------------------------------------------------------------------

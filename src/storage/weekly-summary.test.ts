@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { SessionStore } from './session-store.js';
 import type { FullSessionSummary } from './session-store.js';
 import { WeeklySummaryGenerator, getIsoWeekId, getWeekDateRange } from './weekly-summary.js';
+import { ZERO_QUALITY_PROXY_COUNTS } from '../metrics/quality-proxy-tracker.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let tmpDir: string;
@@ -36,6 +37,8 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
   return {
     sessionId: `sess-${now}-${Math.random().toString(36).slice(2)}`,
     sessionName: null,
+    sessionNameSource: null,
+    sessionIntent: null,
     repoName: null,
     startTime: now - 60_000,
     endTime: now,
@@ -44,6 +47,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     developer: 'alice',
     model: 'claude-sonnet-4-20250514',
     toolBreakdown: { Read: 5, Edit: 3, Bash: 2 },
+    skillBreakdown: {},
     filesRead: ['/src/index.ts'],
     filesModified: ['/src/index.ts'],
     linesAdded: 20,
@@ -54,6 +58,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     buildRunCount: 1,
     buildPassCount: 1,
     estimatedCostUsd: 0.05,
+    subagentCostUsd: 0,
     tokensInput: 5000,
     tokensOutput: 2000,
     tokensThinking: 1000,
@@ -61,6 +66,10 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     tokensCacheCreation: 0,
     cacheSavingsUsd: 0,
     efficiencyScore: 0.75,
+    toolSelectionMetrics: null,
+    modelBreakdown: {},
+    costByWorkflowRunId: {},
+    qualityProxy: { ...ZERO_QUALITY_PROXY_COUNTS },
     antiPatterns: [],
     taskCount: 1,
     taskSuccessRate: 1,
@@ -87,10 +96,12 @@ describe('aggregateSessions prototype-pollution resistance', () => {
         sessionId: 'proto-sess',
         startTime: start.getTime() + 1000,
         // keys that would shadow Object.prototype on a regular {} accumulator
-        toolBreakdown: { __proto__: 1, constructor: 2, Read: 5 } as unknown as Record<
-          string,
-          number
-        >,
+        toolBreakdown: {
+          __proto__: 1,
+          constructor: 2,
+          Read: 5,
+        } as unknown as Record<string, number>,
+        skillBreakdown: {},
       }),
     );
 
@@ -144,7 +155,8 @@ describe('WeeklySummaryGenerator', () => {
           testPassCount: 2,
           efficiencyScore: 0.8,
           toolBreakdown: { Read: 4, Edit: 3, Bash: 3 },
-          antiPatterns: [{ type: 'thrashing', count: 1 }],
+          skillBreakdown: {},
+          antiPatterns: [{ type: 'thrashing' }],
         }),
       );
     }

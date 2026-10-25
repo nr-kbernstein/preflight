@@ -13,8 +13,11 @@ The following is written to `~/.newrelic-preflight/` on the developer's machine 
 - Bash commands executed, after credential-pattern redaction.
 - Session-level counts: tool calls, files touched, session duration, token usage (counts only — not message text).
 - An audit log of every tool invocation, including flags for sensitive file access (`.env`, `.pem`, SSH keys) and destructive commands.
+- A per-developer collaboration profile — behavioral scores (specificity, autonomy, correction rate, task complexity) and a classification label (`"Power User"`, `"Delegator"`, `"Learning"`, or `"Collaborative"`) — computed on demand from local session history. Returned only to your own AI assistant when it calls the `nr_observe_get_collaboration_profile` MCP tool. This is never transmitted to New Relic, in any mode.
 
 Local storage uses restrictive permissions (`0o700` directories, `0o600` files). See [SECURITY.md](./SECURITY.md) for details on file system safety and redaction patterns.
+
+**A note on behavioral classification data:** the collaboration profile above differs from the rest of this list in what it characterizes — rather than recording what the AI assistant did, it's an inferred characterization of how a developer works. It stays local and is never queryable from a New Relic account, but organizations deploying this tool in a workplace context may still want to determine whether internal policy governs locally-computed behavioral characterizations of individual developers, independently of this document's cloud-telemetry guidance below.
 
 ---
 
@@ -22,25 +25,30 @@ Local storage uses restrictive permissions (`0o700` directories, `0o600` files).
 
 When `mode` is `cloud` or `both`, the following is transmitted to New Relic as custom events and metrics. The table below notes the privacy implication of each field — not just what it is, but why it warrants review before enabling.
 
-| Field                 | NR Event / Metric                               | Privacy note                                                                                                                                                                                           |
-| --------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Developer identifier  | All events, `developer` dimension               | Defaults to the OS username (`$USER`) or `git config user.name`. This is a real person's identifier attached to every event and metric in the account.                                                 |
-| Working directory     | `AiToolCall.cwd`                                | An absolute path that typically embeds the OS username (e.g. `/Users/jjang/...`).                                                                                                                      |
-| File paths            | `AiToolCall.filePath`, `AiAuditEvent.file_path` | Absolute paths for every file the AI reads, writes, or edits. May embed usernames and reveal project structure.                                                                                        |
-| Bash commands         | `AiToolCall.command`                            | Full command string after credential-pattern redaction. May contain hostnames, usernames in arguments, or internal service names.                                                                      |
-| Grep patterns         | `AiToolCall.pattern`                            | Search terms the AI used in the codebase. Can reveal what the AI was looking for, which may be sensitive.                                                                                              |
-| Agent descriptions    | `AiToolCall.agentDescription`                   | Free-text description of spawned sub-agent tasks. User-authored; no content scanning beyond credential redaction.                                                                                      |
-| Task subjects         | `AiToolCall.taskSubject`                        | Free-text subject from task creation. User-authored; may contain project names, customer references, or ticket numbers.                                                                                |
-| Session metrics       | `ai.session.*`                                  | Per-developer duration, file counts, cost in USD, efficiency scores.                                                                                                                                   |
-| Audit events          | `AiAuditEvent`, `SecurityAlert`                 | Every classified tool call; security alerts include the triggering file path or command.                                                                                                               |
-| Collaboration profile | `ai.collaboration.*`                            | Behavioral scores per developer (specificity, autonomy, correction rate, task complexity) and a classification label. Emitted with the `developer` dimension, queryable by any user in the NR account. |
-| Repository identifier | `project_id`                                    | Inferred from `git remote get-url origin` (e.g. `org/repo`) unless set explicitly. May expose internal repository names.                                                                               |
+| Field                       | NR Event / Metric                                                | Privacy note                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Developer identifier        | All events, `developer` dimension                                | Defaults to the OS username (`$USER`) or `git config user.name`. This is a real person's identifier attached to every event and metric in the account.                                                                                                                                                                                                                                                                       |
+| Working directory           | `AiToolCall.cwd`                                                 | An absolute path that typically embeds the OS username (e.g. `/Users/jjang/...`).                                                                                                                                                                                                                                                                                                                                            |
+| File paths                  | `AiToolCall.filePath`, `AiAuditEvent.file_path`                  | Absolute paths for every file the AI reads, writes, or edits. May embed usernames and reveal project structure.                                                                                                                                                                                                                                                                                                              |
+| Bash commands               | `AiToolCall.command`                                             | Full command string after credential-pattern redaction. May contain hostnames, usernames in arguments, or internal service names.                                                                                                                                                                                                                                                                                            |
+| Grep patterns               | `AiToolCall.pattern`                                             | Search terms the AI used in the codebase. Can reveal what the AI was looking for, which may be sensitive.                                                                                                                                                                                                                                                                                                                    |
+| Agent descriptions          | `AiToolCall.agentDescription`                                    | Free-text description of spawned sub-agent tasks. User-authored; no content scanning beyond credential redaction.                                                                                                                                                                                                                                                                                                            |
+| Workflow agent descriptions | `AiWorkflowRun.agent_description` (agent-tool-sourced runs only) | **Free text, redacted before egress.** The `Agent` tool prompt/description for the spawned agent, passed through the same credential-pattern redaction as `AiToolCall.command`. Redaction only catches known secret formats — same caveat as `recordContent` below. Not present on script-sourced `AiWorkflowRun` events.                                                                                                    |
+| Task subjects               | `AiToolCall.taskSubject`                                         | Free-text subject from task creation. User-authored; may contain project names, customer references, or ticket numbers.                                                                                                                                                                                                                                                                                                      |
+| Session metrics             | `ai.session.*`                                                   | Per-developer duration, file counts, cost in USD, efficiency scores.                                                                                                                                                                                                                                                                                                                                                         |
+| Subagent & workflow metrics | `AiSubagentTurn`, `AiWorkflowRun`, `AiObservabilityHealth`       | Per-turn token counts and cost, workflow run status/duration, and watcher self-health for the workflow/subagent pipeline. No free text beyond `agent_description` above.                                                                                                                                                                                                                                                     |
+| Retry-thrashing alerts      | `AiRetryAlert`                                                   | Tool name, occurrence count, and estimated tokens wasted when the same tool call repeats in a short window. No command/pattern/file-path content — just the flagged tool's name.                                                                                                                                                                                                                                             |
+| Audit events                | `AiAuditEvent`, `SecurityAlert`                                  | Every classified tool call; security alerts include the triggering file path or command.                                                                                                                                                                                                                                                                                                                                     |
+| Repository identifier       | `project_id`                                                     | Inferred from `git remote get-url origin` (e.g. `org/repo`) unless set explicitly. May expose internal repository names.                                                                                                                                                                                                                                                                                                     |
+| Repository URL              | `repo_url`                                                       | The full git remote URL (e.g. `https://github.com/org/repo`), inferred from the same `git remote get-url origin` read as `project_id`. More sensitive than `project_id`: it may reveal an internal git host, not just an org/repo pair. Embedded credentials (e.g. `https://user:token@host/...`) are stripped before egress. Sent by default; has its own opt-out (`repoUrlEnabled: false`), independent of `project_id`'s. |
+
+One additional event type, `NrAiObserveSetupCheck`, is sent directly to the Events API during license-key validation. It carries no session, developer, or file data — see [METRICS_TABLE.md → Setup Validation](./docs/METRICS_TABLE.md#setup-validation).
 
 ---
 
 ## Who Can See This Data in Your New Relic Account
 
-Data sent to New Relic is visible to any user in the target account who has NRQL query access. This includes the `developer` identifier, individual file paths and commands in `AiAuditEvent`, and the per-developer collaboration profile metrics.
+Data sent to New Relic is visible to any user in the target account who has NRQL query access. This includes the `developer` identifier and individual file paths and commands in `AiAuditEvent`.
 
 Before enabling cloud telemetry, review who has access to the account and what query permissions they hold. New Relic's user management documentation is here:
 
@@ -86,6 +94,12 @@ By default the tool runs `git remote get-url origin` and extracts `org/repo`. Th
 
 See [README.md → Key settings](./README.md#key-settings) for configuration.
 
+### `repoUrl` — inferred from the same git remote as `projectId`
+
+By default the tool also sends the full git remote URL as `repo_url`, derived from the same `git remote get-url origin` read used for `projectId`. Any embedded credentials in the URL are stripped before the value is sent. Override the value with the `NEW_RELIC_AI_REPO_URL` environment variable or the `repoUrl` key in `~/.newrelic-preflight/config.json`.
+
+**Privacy implication:** A full remote URL can reveal more than an `org/repo` pair alone, for example an internal git hostname. It has its own opt-out, independent of `projectId`'s: set `repoUrlEnabled: false` in `~/.newrelic-preflight/config.json`, or `NEW_RELIC_AI_REPO_URL_ENABLED=false`, to stop sending it while still sending `project_id`. The `preflight install` setup wizard prompts for this explicitly, so sending it is an informed choice rather than a silent default.
+
 ### `mode: 'local'` — no data leaves the machine
 
 Local mode disables all cloud transport entirely. The local dashboard and analytics still work.
@@ -93,6 +107,17 @@ Local mode disables all cloud transport entirely. The local dashboard and analyt
 **Privacy implication:** This is the appropriate starting point for evaluating the tool before deciding whether cloud telemetry is suitable for your environment or organization.
 
 See [README.md → Local mode](./README.md#local-mode) for the full local-mode setup.
+
+### `tiers` — routes events to additional destinations
+
+Off unless you configure it. When a `tiers` array is present (requires `mode: "cloud"` or `"both"`), each configured tier is an **additional egress destination** for the event types it names — another New Relic account, or a directory on disk that may be a shared network share.
+
+Two things to know before enabling it:
+
+1. **Routing is event-type-level, not field-level.** A tier that receives `AiToolCall` receives the whole event, including the redacted-but-present `command` and `filePath` attributes. There is no per-tier field projection.
+2. **Preflight warns, but does not stop you.** Routing a `personal-only` event type (`AiToolCall`, `AiMcpToolCall`, `AiWorkflowRun`, `AiAntiPattern`, `AiAuditEvent`, `SecurityAlert`) to any tier other than `default` logs a warning on stderr and proceeds.
+
+The conservative shape is to keep `["*"]` on your own `default`/personal tier and give every shared tier an explicit list drawn only from the `safe-shared` category (`AiCodingTask`, `AiSubagentTurn`, `AiTurnCost`, `AiRetryAlert`, `AiContextSnapshot`, `AiBudgetWarning`, `AiProxyRequest`, `AiObservabilityHealth`). See [docs/ADVANCED.md § Multi-Tier Telemetry Routing](./docs/ADVANCED.md#multi-tier-telemetry-routing) for the field reference and the full categorization table.
 
 ---
 
@@ -102,7 +127,7 @@ Data sent to New Relic is subject to your account's retention settings. New Reli
 
 > [docs.newrelic.com → Data retention](https://docs.newrelic.com/docs/data-apis/manage-data/manage-data-retention/)
 
-Relevant event types emitted by this tool: `AiToolCall`, `AiAuditEvent`, `SecurityAlert`, `AiCodingTask`, `AiAntiPattern`, `AiBudgetWarning`.
+Relevant event types emitted by this tool: `AiToolCall`, `AiMcpToolCall`, `AiProxyRequest`, `AiAuditEvent`, `SecurityAlert`, `AiCodingTask`, `AiAntiPattern`, `AiBudgetWarning`, `AiContextSnapshot`, `AiSubagentTurn`, `AiWorkflowRun`, `AiObservabilityHealth`, `AiRetryAlert`, `AiTurnCost`. Full per-field detail for every event type: [METRICS_TABLE.md](./docs/METRICS_TABLE.md).
 
 Local data retention is controlled by `retainSessionsDays` in the config file. See [README.md → Key settings](./README.md#key-settings).
 
@@ -110,7 +135,7 @@ Local data retention is controlled by `retainSessionsDays` in the config file. S
 
 ## NR Account Region
 
-Data routes to New Relic's US region by default. A license key beginning with `eu01` routes to the EU region automatically. This can also be set explicitly via `collectorHost`.
+Data routes to New Relic's US region by default. A license key beginning with `eu01` routes to the EU region automatically, and a `jp`-prefixed key routes to the Japan region. This can also be set explicitly via `collectorHost`.
 
 See [README.md → Key settings](./README.md#key-settings) for configuration. New Relic's regional data center documentation:
 
@@ -124,6 +149,7 @@ See [README.md → Key settings](./README.md#key-settings) for configuration. Ne
 - [ ] Checked who has access to the target NR account and what NRQL query permissions they hold.
 - [ ] Decided whether the auto-inferred `developer` value (OS username) is appropriate, or set it explicitly.
 - [ ] Decided whether `projectId` auto-inference (from git remote) is appropriate, or set it to `null`.
+- [ ] Decided whether `repoUrl` — more sensitive than `projectId`, may reveal an internal git host — should be sent, or set `repoUrlEnabled: false`.
 - [ ] Confirmed `recordContent` is `false` (the default) or, if enabling it, reviewed what content will be captured and what is and is not redacted.
 - [ ] If enabling `highSecurity`, set it in the config file.
 - [ ] Reviewed the NR account's data retention settings for the event types this tool emits.

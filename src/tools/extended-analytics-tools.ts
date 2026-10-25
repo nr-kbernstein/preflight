@@ -22,6 +22,8 @@ import type { InstructionDriftTracker } from '../metrics/instruction-drift-track
 import type { ToolSelectionScorer } from '../metrics/tool-selection-scorer.js';
 import type { QualityProxyTracker } from '../metrics/quality-proxy-tracker.js';
 import type { ApiFailureTracker } from '../metrics/api-failure-tracker.js';
+import type { AntiPatternDetector } from '../metrics/anti-patterns.js';
+import type { CostTracker } from '../metrics/cost-tracker.js';
 import {
   requireTracker,
   requireAvailable,
@@ -102,7 +104,15 @@ export const QUALITY_PROXY_TOOL = {
 export const API_FAILURES_TOOL = {
   name: 'nr_observe_get_api_failures',
   description:
-    "Get API failure tracking: per-model reliability scorecards, tokens lost, cost impact, throttle alerts, and mean time to recovery. LIMITATION: model-API-level failure data is not observable in Preflight's current architecture (see the note field in the response) — this tool currently always returns empty/zero metrics.",
+    "Get API failure tracking: per-model reliability scorecards, tokens lost, cost impact, throttle alerts, and mean time to recovery. Failures are captured via Claude Code's StopFailure hook, so totalFailures/byErrorType/bySessionPhase reflect real observed failures. LIMITATION: token loss, recovery time, retry count, and totalRequests-derived fields (failureRate, throttleFrequency, p95LatencyMs) remain unavailable or always zero -- StopFailure carries no token/retry data, and nothing currently calls recordRequest() (see the note field in the response).",
+  inputSchema: { type: 'object' as const, properties: {} },
+  annotations: { readOnlyHint: true },
+};
+
+export const COMPUTE_WASTE_TOOL = {
+  name: 'nr_observe_get_compute_waste',
+  description:
+    'Get compute waste summary: total tokens wasted on retried tool calls and anti-pattern activity (stuck loops, redundant reads, thrashing). Includes per-pattern breakdown and a status assessment (clean / moderate / needs_attention).',
   inputSchema: { type: 'object' as const, properties: {} },
   annotations: { readOnlyHint: true },
 };
@@ -205,6 +215,8 @@ export interface ExtendedAnalyticsToolsDeps {
   toolCallBuffer?: { getRecords(): readonly ToolCallRecord[] };
   qualityProxyTracker?: QualityProxyTracker;
   apiFailureTracker?: ApiFailureTracker;
+  antiPatternDetector?: AntiPatternDetector;
+  costTracker?: CostTracker;
 }
 
 export function registerExtendedAnalyticsTools(
@@ -308,5 +320,104 @@ export function registerExtendedAnalyticsTools(
         return handleGetApiFailures(check.value);
       },
     },
+    {
+      definition: COMPUTE_WASTE_TOOL,
+      available: !!deps.retryDetector && !!deps.antiPatternDetector,
+      handle: () => {
+        const missing = requireAvailable(
+          !!deps.retryDetector && !!deps.antiPatternDetector,
+          'RetryDetector or AntiPatternDetector not available',
+        );
+        if (missing) return missing;
+        return handleGetComputeWaste(
+          deps.retryDetector!,
+          deps.antiPatternDetector!,
+          deps.costTracker,
+        );
+      },
+    },
   ]);
+}
+
+// Ratio-based thresholds so "needs_attention" scales with session size
+// instead of a fixed token count — a modern session can legitimately
+// consume millions of tokens, so an absolute floor like 2,000 tokens fires
+// almost unconditionally and trains developers to ignore the signal. Hand-
+// picked judgment calls, not derived from data.
+const NEEDS_ATTENTION_WASTE_RATIO = 0.05;
+const MODERATE_WASTE_RATIO = 0.01;
+// Fallback absolute thresholds, used only when a session token total isn't
+// available (no CostTracker passed in) so the status doesn't silently
+// disappear — same values this function used before the ratio existed.
+const FALLBACK_NEEDS_ATTENTION_TOKENS = 2000;
+const FALLBACK_MODERATE_TOKENS = 500;
+
+export function handleGetComputeWaste(
+  retryDetector: RetryDetector,
+  antiPatternDetector: AntiPatternDetector,
+  costTracker?: CostTracker,
+): { content: Array<{ type: 'text'; text: string }> } {
+  const retryTokensWasted = retryDetector.getMetrics().totalTokensWasted;
+  const antiPatternTokensWasted = antiPatternDetector.getTotalAntiPatternWaste();
+  const totalTokensWasted = retryTokensWasted + antiPatternTokensWasted;
+
+  const patterns = antiPatternDetector.getCurrentPatterns();
+  const breakdown = [
+    ...patterns
+      .filter((p) => p.tokensWasted > 0)
+      .reduce<Map<string, { tokens_wasted: number; instances: number }>>((acc, p) => {
+        const existing = acc.get(p.type) ?? { tokens_wasted: 0, instances: 0 };
+        acc.set(p.type, {
+          tokens_wasted: existing.tokens_wasted + p.tokensWasted,
+          instances: existing.instances + 1,
+        });
+        return acc;
+      }, new Map())
+      .entries(),
+  ]
+    .map(([type, v]) => ({ type, ...v }))
+    .sort((a, b) => b.tokens_wasted - a.tokens_wasted);
+
+  const costMetrics = costTracker?.getMetrics();
+  const totalSessionTokens = costMetrics
+    ? costMetrics.totalInputTokens +
+      costMetrics.totalOutputTokens +
+      costMetrics.totalThinkingTokens +
+      costMetrics.totalCacheReadTokens +
+      costMetrics.totalCacheCreationTokens
+    : 0;
+  const wasteRatio = totalSessionTokens > 0 ? totalTokensWasted / totalSessionTokens : null;
+
+  const status =
+    wasteRatio !== null
+      ? wasteRatio >= NEEDS_ATTENTION_WASTE_RATIO
+        ? 'needs_attention'
+        : wasteRatio >= MODERATE_WASTE_RATIO
+          ? 'moderate'
+          : 'clean'
+      : totalTokensWasted >= FALLBACK_NEEDS_ATTENTION_TOKENS
+        ? 'needs_attention'
+        : totalTokensWasted >= FALLBACK_MODERATE_TOKENS
+          ? 'moderate'
+          : 'clean';
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(
+          {
+            total_tokens_wasted: totalTokensWasted,
+            retry_tokens_wasted: retryTokensWasted,
+            anti_pattern_tokens_wasted: antiPatternTokensWasted,
+            waste_ratio: wasteRatio,
+            breakdown,
+            status,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
 }

@@ -7,6 +7,7 @@ import { SessionStore } from '../storage/session-store.js';
 import type { FullSessionSummary } from '../storage/session-store.js';
 import { getWeekDateRange } from '../storage/weekly-summary.js';
 import { CollaborationProfiler } from './collaboration-profile.js';
+import { ZERO_QUALITY_PROXY_COUNTS } from './quality-proxy-tracker.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let tmpDir: string;
@@ -31,6 +32,8 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
   return {
     sessionId: `sess-${now}-${Math.random().toString(36).slice(2)}`,
     sessionName: null,
+    sessionNameSource: null,
+    sessionIntent: null,
     repoName: null,
     startTime: now - 60_000,
     endTime: now,
@@ -39,6 +42,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     developer: 'alice',
     model: 'claude-sonnet-4-20250514',
     toolBreakdown: { Read: 5, Edit: 3, Bash: 2 },
+    skillBreakdown: {},
     filesRead: ['/src/index.ts'],
     filesModified: ['/src/index.ts'],
     linesAdded: 20,
@@ -49,6 +53,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     buildRunCount: 1,
     buildPassCount: 1,
     estimatedCostUsd: 0.05,
+    subagentCostUsd: 0,
     tokensInput: 5000,
     tokensOutput: 2000,
     tokensThinking: 1000,
@@ -56,6 +61,10 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     tokensCacheCreation: 0,
     cacheSavingsUsd: 0,
     efficiencyScore: 0.75,
+    toolSelectionMetrics: null,
+    modelBreakdown: {},
+    costByWorkflowRunId: {},
+    qualityProxy: { ...ZERO_QUALITY_PROXY_COUNTS },
     antiPatterns: [],
     taskCount: 1,
     taskSuccessRate: 1,
@@ -191,8 +200,9 @@ describe('CollaborationProfiler', () => {
     );
     expect(profiler.computeProfile('power-user').classification).toBe('Power User');
 
-    // Delegator: low specificity (<0.6) + high autonomy (≥0.6)
-    // specificity: 15/10/10 = 0.15
+    // Delegator: high autonomy (≥0.6) + real subagent delegation
+    // (avg agentSpawns/task >= 1) — specificity/autonomy ratios alone no
+    // longer drive this classification.
     // autonomy: 15 toolCalls / 5 assistantMessages / 5 = 0.6
     store.saveSession(
       makeSummary({
@@ -202,6 +212,8 @@ describe('CollaborationProfiler', () => {
         userMessages: 10,
         assistantMessages: 5,
         userCorrections: 1,
+        agentSpawns: 2,
+        taskCount: 1,
       }),
     );
     expect(profiler.computeProfile('delegator-user').classification).toBe('Delegator');
@@ -272,6 +284,26 @@ describe('CollaborationProfiler', () => {
     expect(profiler.computeProfile('learning2-user').classification).toBe('Learning');
   });
 
+  it('classify() no longer mislabels a low-specificity, high-autonomy, non-delegating session as Delegator', () => {
+    const profiler = new CollaborationProfiler({ sessionStore: store });
+
+    // Low specificity (<0.6) + high autonomy (>=0.6), but zero agent spawns —
+    // this combination is algebraically just a chatty, high-user-message
+    // session, not real delegation, so it should NOT be 'Delegator'.
+    store.saveSession(
+      makeSummary({
+        sessionId: 'not-delegator',
+        developer: 'not-delegator-user',
+        toolCallCount: 15,
+        userMessages: 10,
+        assistantMessages: 5,
+        userCorrections: 1,
+        agentSpawns: 0,
+      }),
+    );
+    expect(profiler.computeProfile('not-delegator-user').classification).not.toBe('Delegator');
+  });
+
   // -------------------------------------------------------------------------
   // 5. computeTeamBaseline
   // -------------------------------------------------------------------------
@@ -323,6 +355,23 @@ describe('CollaborationProfiler', () => {
     expect(baseline.dimensions.specificity).toBe(0.6);
     // Team autonomy: (1.0 + 0.6 + 1.0) / 3 ≈ 0.867
     expect(baseline.dimensions.autonomy).toBeCloseTo(0.867, 2);
+  });
+
+  // With sessions from only one developer, the "team" baseline is really
+  // just that developer, so the dashboard needs developerCount to know when
+  // to caveat "vs team" comparisons as meaningless. Guards against
+  // computeTeamBaseline silently reporting a count that doesn't reflect a
+  // single-developer SessionStore.
+  it('computeTeamBaseline reports developerCount 1 for a single-developer fixture', () => {
+    const profiler = new CollaborationProfiler({ sessionStore: store });
+
+    store.saveSession(makeSummary({ sessionId: 'solo-1', developer: 'alice', toolCallCount: 60 }));
+    store.saveSession(makeSummary({ sessionId: 'solo-2', developer: 'alice', toolCallCount: 40 }));
+
+    const baseline = profiler.computeTeamBaseline();
+
+    expect(baseline.developerCount).toBe(1);
+    expect(baseline.sessionCount).toBe(2);
   });
 
   // -------------------------------------------------------------------------

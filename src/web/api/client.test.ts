@@ -6,6 +6,7 @@ import {
   fetchGitEfficiency,
   fetchWorkflowDetail,
   fetchSessionReplay,
+  fetchActivityHeatmap,
   patchSettings,
   postDigestSend,
   qk,
@@ -52,6 +53,22 @@ describe('api/client', () => {
     }) as unknown as typeof globalThis.fetch;
     await fetchAuditLog();
     expect(calledWith).toBe('/api/audit');
+  });
+
+  it('fetchAuditLog forwards an AbortSignal to fetch, so a caller can cancel it on unmount', async () => {
+    let receivedInit: RequestInit | undefined;
+    globalThis.fetch = ((_u: string, init?: RequestInit) => {
+      receivedInit = init;
+      return Promise.resolve(
+        new Response('[]', {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as unknown as typeof globalThis.fetch;
+    const controller = new AbortController();
+    await fetchAuditLog(controller.signal);
+    expect(receivedInit?.signal).toBe(controller.signal);
   });
 
   it('patchSettings throws HTTP status error when server returns non-JSON error body', async () => {
@@ -112,9 +129,9 @@ describe('api/client', () => {
     await expect(fetchRecentAlerts()).rejects.toMatchObject({ name: 'NotFoundError' });
   });
 
-  it('fetchGitEfficiency hits /api/git-efficiency and returns the full nested response', async () => {
+  it('fetchGitEfficiency hits /api/git-efficiency with window/scope query params and returns the full nested response', async () => {
     let calledWith = '';
-    const payload = {
+    const workspaceMetrics = {
       totalGitCommands: 12,
       mergeConflicts: 1,
       rebaseConflicts: 0,
@@ -131,7 +148,13 @@ describe('api/client', () => {
       staleBranchPulls: 0,
       gitCommandTimeline: [{ timestamp: 1, type: 'commit', success: true, durationMs: 100 }],
       conflictHistory: [
-        { timestamp: 1, resolution: 'resolved', resolutionTimeMs: 12000, command: 'git merge' },
+        {
+          timestamp: 1,
+          resolution: 'resolved',
+          resolutionTimeMs: 12000,
+          command: 'git merge',
+          files: [],
+        },
       ],
       suggestions: [{ severity: 'info', category: 'sync', message: 'msg', evidence: 'evidence' }],
       bestPractices: [{ id: 'sync', label: 'Sync often', status: 'pass', detail: 'ok' }],
@@ -175,12 +198,29 @@ describe('api/client', () => {
         prActivity: [{ timestamp: 1, action: 'create', prNumber: '42' }],
         avgTimeToCreateMs: 300000,
       },
-      repoContext: {
-        repoName: 'nr-ai-observatory',
-        branch: 'main',
-        remoteName: 'origin',
-        defaultBranch: 'main',
-      },
+      liveState: null,
+      commitTimestamps: [1],
+      lastPushTimestamp: null,
+      editedFiles: [],
+      hasUsedBareForcePush: false,
+      bareForcePushCount: 0,
+      hasForcePushedToDefaultBranch: false,
+      mergeEventCount: 0,
+      rebaseEventCount: 0,
+    };
+    const identity = {
+      repoKey: '/Users/x/repo/.git',
+      worktreeKey: '/Users/x/repo/.git',
+      repoName: 'org/nr-ai-observatory',
+      worktreeRoot: '/Users/x/repo',
+      worktreeLabel: 'primary',
+      branch: 'main',
+    };
+    const payload = {
+      scope: { kind: 'all' },
+      metrics: workspaceMetrics,
+      rows: [{ identity, metrics: workspaceMetrics }],
+      worstBehind: null,
     };
     globalThis.fetch = ((u: string) => {
       calledWith = u;
@@ -192,8 +232,28 @@ describe('api/client', () => {
       );
     }) as unknown as typeof globalThis.fetch;
     const result = await fetchGitEfficiency();
-    expect(calledWith).toBe('/api/git-efficiency');
+    expect(calledWith).toBe('/api/git-efficiency?window=today&scope=all');
     expect(result).toEqual(payload);
+  });
+
+  it('fetchGitEfficiency encodes window and scope, including scope ids containing slashes', async () => {
+    let calledWith = '';
+    globalThis.fetch = ((u: string) => {
+      calledWith = u;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({ scope: { kind: 'repo' }, metrics: {}, rows: [], worstBehind: null }),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      );
+    }) as unknown as typeof globalThis.fetch;
+    await fetchGitEfficiency('week', 'repo:/Users/x/repo/.git');
+    expect(calledWith).toBe(
+      '/api/git-efficiency?window=week&scope=repo%3A%2FUsers%2Fx%2Frepo%2F.git',
+    );
   });
 
   it('fetchWorkflowDetail hits /api/workflows/:runId and returns the run+agents+topology shape', async () => {
@@ -287,5 +347,40 @@ describe('api/client', () => {
     const result = await fetchSessionReplay('sess-1');
     expect(calledWith).toBe('/api/sessions/sess-1/replay');
     expect(result).toEqual(payload);
+  });
+
+  it('fetchActivityHeatmap sends the browser IANA timezone as a tz query param', async () => {
+    let calledWith = '';
+    const payload = { buckets: [1, 2], bucketSizeMs: 900_000, startTimestamp: 0, maxCount: 2 };
+    globalThis.fetch = ((u: string) => {
+      calledWith = u;
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as unknown as typeof globalThis.fetch;
+    const result = await fetchActivityHeatmap('today');
+    const expectedTz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    expect(calledWith).toBe(`/api/activity-heatmap?view=today&tz=${expectedTz}`);
+    expect(result).toEqual(payload);
+  });
+
+  it('fetchActivityHeatmap includes both weeks and tz for the history view', async () => {
+    let calledWith = '';
+    const payload = { days: [{ date: '2026-06-10', count: 3 }], maxCount: 3 };
+    globalThis.fetch = ((u: string) => {
+      calledWith = u;
+      return Promise.resolve(
+        new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as unknown as typeof globalThis.fetch;
+    await fetchActivityHeatmap('history', 12);
+    const expectedTz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    expect(calledWith).toBe(`/api/activity-heatmap?view=history&weeks=12&tz=${expectedTz}`);
   });
 });

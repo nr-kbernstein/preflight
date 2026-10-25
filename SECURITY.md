@@ -16,6 +16,7 @@ This document captures the security practices and invariants baked into this cod
 - [ ] Subprocess commands validated as absolute paths; dangerous env keys stripped
 - [ ] `MetricAggregator.record()` only called with values known to be finite
 - [ ] High security mode respected: never bypass `recordContent=false` when `highSecurity=true`
+- [ ] Outbound requests other than New Relic ingest are opt-out, forced off by `highSecurity`, fixed-host, size-capped, and schema-validated
 - [ ] Event listeners on long-lived streams use `once` + `removeAllListeners()` after terminal events
 - [ ] Error responses to HTTP clients contain only a generic code — detail goes to the logger
 - [ ] `randomUUID()` from `node:crypto` used for all IDs (not `Math.random()`)
@@ -151,6 +152,16 @@ Checking the literal hostname string is not sufficient on its own — DNS can be
 
 This is used by both `HttpUpstream` (MCP proxy forwarding) and `OtlpReceiver` (`otlpForwardEndpoint` config). Any new network client that takes a URL from config or user input should call `validateSsrfUrl()` at construction time, and — if it makes its own outbound connections rather than delegating to `HttpUpstream`/`OtlpReceiver` — should also use `createSsrfSafeLookup()` as its connection-time resolver.
 
+### LiteLLM price refresh — `src/metrics/pricing-refresh.ts`
+
+An outbound request made by default, unlike the opt-in webhook and forwarding clients. It fetches LiteLLM's community price file to price models the bundled table does not know.
+
+- The host and path are fixed (`raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json`). The request uses `redirect: 'error'`, a 30 s timeout that also covers the body read, and an 8 MB cap enforced while streaming.
+- The response is mapped by `parseLiteLlmPrices` and the cache is re-validated by the vendored custom-pricing loader, which applies its own size cap and rate ceiling.
+- Refreshed entries are exact-id gap fill. They live in their own table and cannot change a price the bundled table, overlay, or user custom file resolves. They do take precedence over family estimates. Context windows above 10M tokens and rates above 10,000 USD/MTok are dropped. A tampered entry can still misprice a model only the refresh knows, within those bounds, and each such model is logged once as "Pricing from the LiteLLM refresh".
+- The cache is `<storagePath>/pricing-cache.json`, written atomically through a per-process temp file with mode `0o600`. It is refetched at server start when older than a day; a long-running server does not refetch on its own.
+- Opt out with `NEW_RELIC_AI_PRICING_REFRESH=false` or `pricingRefresh: false`. `highSecurity=true` forces it off. When off, nothing is fetched and no cache file is read or written.
+
 ### Proxy body limits — `proxy-manager.ts`
 
 `readBody()` enforces:
@@ -244,12 +255,13 @@ Both `AgentConfig` and `McpServerConfig` are frozen with `Object.freeze()` immed
 `AuditTrailManager` (`src/security/audit-trail.ts`) classifies every tool call and flags:
 
 - **Sensitive file access** — `.env`, `.pem`, `.key`, credential and password files — severity: `high`
-- **Destructive commands** — `rm -rf`, `DROP TABLE`, pipe-to-shell patterns — severity: `critical`
+- **Destructive commands** — `rm -rf`, `git clean -f`, `find -delete`, `DROP TABLE`, pipe-to-shell patterns — severity: `critical`
 - **External network requests** — `curl`, `wget`, `nc`, `ssh` — severity: `medium`
+- **File deletion** (non-recursive rm / unlink) — severity: `medium`
 
 Records are persisted to disk in real time via `LocalStore.appendAuditLog()`, so the trail survives unclean shutdowns.
 
-Classification patterns are configurable via constructor options. The log is queryable via `getSensitiveAccessLog()` and is also sent as NR events for dashboarding.
+Classification patterns are configurable via constructor options. The log is queryable via `getSensitiveAccessLog()` and is also sent as NR events for dashboarding. Records carry `agentId` when a subagent (Task or Workflow tool) made the call, and `agentType` when it is known: the subagent's type, or on a parent call the session's own agent name when Claude Code runs with `--agent`. Subagent activity is therefore attributable on disk, in the dashboard, and in New Relic; filter on `agentId`, not `agentType`, to separate it from parent-session activity.
 
 ---
 

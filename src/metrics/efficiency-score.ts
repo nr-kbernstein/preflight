@@ -4,8 +4,14 @@
  * The score is a weighted average of four components, each in [0, 1]:
  *   1. Speed:                linesChanged / taskDuration, normalized to 1 line/s = 1.0
  *   2. Correctness:          test pass rate during the task (0.5 default if no tests)
- *   3. Autonomy:             1 - (userQuestions / toolCalls)
- *   4. First-attempt quality: 1 - (thrashIterations / 3), floored at 0
+ *   3. Autonomy:             1 free clarifying question, then 1 - (excessQuestions / 4)
+ *   4. First-attempt quality: 1 - (worstAntiPatternSeverity / 10), across all anti-pattern types
+ *
+ * Speed carries a deliberately small default weight (0.10 vs. 0.30 for the
+ * other three) — a raw lines/duration ratio rewards bulk regeneration as much
+ * as a careful fix, and zero-linesChanged tasks (investigation, review,
+ * delegated work) exclude speed from the composite entirely rather than
+ * scoring 0 on it, renormalizing across the remaining components instead.
  *
  * Final score = weighted average, clamped to [0, 1].
  */
@@ -14,6 +20,7 @@ import type { MetricAggregator } from '../shared/index.js';
 import type { AiCodingTask } from './task-detector.js';
 import type { AntiPattern } from './anti-patterns.js';
 import type { Resettable } from './tracker-contracts.js';
+import type { CostTracker } from './cost-tracker.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -31,6 +38,16 @@ export interface EfficiencyScore {
   readonly components: EfficiencyScoreComponents;
   readonly taskId: string;
   readonly timestamp: number;
+  /**
+   * The model current on `costTracker` when this task was first scored, not
+   * at emit time or on a later re-score — a later token report (e.g. a
+   * subagent on a different model) changes `costTracker`'s current model, so
+   * re-scoring the same task keeps the stored model. This is the model
+   * current at score time, which can itself be a subagent's if its report
+   * was the latest before the task was scored. `null` when no `costTracker`
+   * was supplied or it had no current model yet.
+   */
+  readonly model: string | null;
 }
 
 export interface EfficiencyScoreOptions {
@@ -39,19 +56,67 @@ export interface EfficiencyScoreOptions {
   readonly autonomyWeight?: number;
   readonly firstAttemptQualityWeight?: number;
   readonly speedBaselineLinesPerSecond?: number;
+  /**
+   * When provided, `computeScore()`/`updateScore()` read this tracker's
+   * current model (`CostTracker.getMetrics().model`) at score-compute time
+   * and store it on the resulting `EfficiencyScore`, which `emitMetrics()`
+   * later attaches as a `model` attr on that score's `ai.efficiency.*`
+   * gauges — matching `CostTracker.emitMetrics()`'s own `ai.cost.*`
+   * attribution, but captured per task rather than re-read at emit time, so
+   * a subagent's token report on a different model between compute and
+   * emit can't relabel an already-scored task. No delta computation is
+   * involved (unlike `TaskDetectorOptions.costTracker`), so there's no
+   * reset-ordering hazard — a null model just means that score's gauges are
+   * emitted without the attr.
+   */
+  readonly costTracker?: CostTracker;
+}
+
+/**
+ * Input shape for `EfficiencyScorer.seedFromPersisted()` — a previous
+ * process's last checkpoint of `getSessionAverage()` for this same session,
+ * built directly from `FullSessionSummary.efficiencyScore` +
+ * `.efficiencyScoreComponents` + `.efficiencyScoreSampleCount`
+ * (session-store.ts).
+ */
+export interface EfficiencyScoreSeed {
+  readonly score: number;
+  readonly components: EfficiencyScoreComponents;
+  readonly sampleCount: number;
 }
 
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
-const DEFAULT_SPEED_WEIGHT = 0.25;
-const DEFAULT_CORRECTNESS_WEIGHT = 0.25;
-const DEFAULT_AUTONOMY_WEIGHT = 0.25;
-const DEFAULT_FIRST_ATTEMPT_QUALITY_WEIGHT = 0.25;
+const DEFAULT_SPEED_WEIGHT = 0.1;
+const DEFAULT_CORRECTNESS_WEIGHT = 0.3;
+const DEFAULT_AUTONOMY_WEIGHT = 0.3;
+const DEFAULT_FIRST_ATTEMPT_QUALITY_WEIGHT = 0.3;
 const DEFAULT_SPEED_BASELINE_LPS = 1; // 1 line per second = perfect speed
 
 const MAX_SCORES = 1_000;
+
+// A single clarifying question on a genuinely ambiguous task is correct
+// behavior, not an efficiency failure, so it isn't penalized at all.
+// Hand-picked judgment call (not derived from data, like the other
+// threshold/scale constants in this codebase) — tune here if it fires too
+// often or too rarely in practice.
+const AUTONOMY_FREE_QUESTIONS = 1;
+// Each question beyond the free one costs 1/4 of the autonomy component,
+// independent of the task's tool-call count — unlike the ratio this
+// replaces, this doesn't swing 33x for the identical behavior depending on
+// unrelated task size.
+const AUTONOMY_QUESTION_PENALTY_SCALE = 4;
+
+// Every anti-pattern detector only reports an occurrence once its own
+// severity count meets its detection threshold (anti-patterns.ts's
+// *_THRESHOLD constants, all 3) — so a detected pattern's severity is always
+// >= 3. A ceiling well above that shared floor turns "any detected pattern"
+// into a gradient instead of arithmetic that can only ever yield 0 or 1.
+// Hand-picked judgment call, consistent with the threshold-of-3 convention
+// used across anti-patterns.ts.
+const FIRST_ATTEMPT_QUALITY_SEVERITY_CEILING = 10;
 
 // ---------------------------------------------------------------------------
 // EfficiencyScorer
@@ -63,9 +128,22 @@ export class EfficiencyScorer implements Resettable {
   private readonly autonomyWeight: number;
   private readonly firstAttemptQualityWeight: number;
   private readonly speedBaselineLps: number;
+  private readonly costTracker: CostTracker | null;
 
   private readonly scores: EfficiencyScore[] = [];
   private lastEmittedIndex = 0;
+
+  // Weighted seed from a previous process's last checkpoint for this same
+  // session — see seedFromPersisted()'s doc comment. The persisted
+  // checkpoint is already itself an average (not raw per-task scores), so
+  // seeding accumulates a weighted contribution (value * sampleCount) rather
+  // than raw per-task totals like CostTracker.seedFromPersisted() does.
+  private seededScoreSum = 0;
+  private seededSpeedSum = 0;
+  private seededCorrectnessSum = 0;
+  private seededAutonomySum = 0;
+  private seededFirstAttemptSum = 0;
+  private seededSampleCount = 0;
 
   constructor(options?: EfficiencyScoreOptions) {
     this.speedWeight = options?.speedWeight ?? DEFAULT_SPEED_WEIGHT;
@@ -74,6 +152,13 @@ export class EfficiencyScorer implements Resettable {
     this.firstAttemptQualityWeight =
       options?.firstAttemptQualityWeight ?? DEFAULT_FIRST_ATTEMPT_QUALITY_WEIGHT;
     this.speedBaselineLps = options?.speedBaselineLinesPerSecond ?? DEFAULT_SPEED_BASELINE_LPS;
+    this.costTracker = options?.costTracker ?? null;
+  }
+
+  private modelFor(taskId: string): string | null {
+    const existing = this.scores.find((s) => s.taskId === taskId);
+    if (existing) return existing.model;
+    return this.costTracker?.getMetrics().model ?? null;
   }
 
   /**
@@ -82,19 +167,14 @@ export class EfficiencyScorer implements Resettable {
    */
   computeScore(task: AiCodingTask, antiPatterns?: AntiPattern[]): EfficiencyScore {
     const components = this.computeComponents(task, antiPatterns);
-    const raw =
-      components.speed * this.speedWeight +
-      components.correctness * this.correctnessWeight +
-      components.autonomy * this.autonomyWeight +
-      components.firstAttemptQuality * this.firstAttemptQualityWeight;
-
-    const score = clamp(Math.round(raw * 1000) / 1000, 0, 1);
+    const score = this.computeWeightedScore(components, task);
 
     const result: EfficiencyScore = {
       score,
       components,
       taskId: task.taskId,
       timestamp: task.endTime,
+      model: this.modelFor(task.taskId),
     };
 
     const idx = this.scores.findIndex((s) => s.taskId === task.taskId);
@@ -108,16 +188,39 @@ export class EfficiencyScorer implements Resettable {
   }
 
   /**
+   * Seeds a weighted contribution to the session average from a previous
+   * process's last checkpoint for this same session — same restart-recovery
+   * problem as `CostTracker.seedFromPersisted()`/`ModelUsageTracker.seedFromPersisted()`,
+   * but adapted for a tracker whose own persisted checkpoint is already an
+   * average rather than raw per-task data — the per-task score list isn't
+   * reconstructable from a checkpoint, only the average is.
+   *
+   * Adds to current totals rather than overwriting, so callers must invoke
+   * this at most once per (re)adopted session id, before any real activity
+   * for that id has reached this tracker.
+   */
+  seedFromPersisted(seed: EfficiencyScoreSeed): void {
+    if (seed.sampleCount <= 0) return;
+    this.seededScoreSum += seed.score * seed.sampleCount;
+    this.seededSpeedSum += seed.components.speed * seed.sampleCount;
+    this.seededCorrectnessSum += seed.components.correctness * seed.sampleCount;
+    this.seededAutonomySum += seed.components.autonomy * seed.sampleCount;
+    this.seededFirstAttemptSum += seed.components.firstAttemptQuality * seed.sampleCount;
+    this.seededSampleCount += seed.sampleCount;
+  }
+
+  /**
    * Session-wide rolling average across all scored tasks.
    */
   getSessionAverage(): EfficiencyScore | null {
-    if (this.scores.length === 0) return null;
+    const n = this.scores.length + this.seededSampleCount;
+    if (n === 0) return null;
 
-    let totalScore = 0;
-    let totalSpeed = 0;
-    let totalCorrectness = 0;
-    let totalAutonomy = 0;
-    let totalFirstAttempt = 0;
+    let totalScore = this.seededScoreSum;
+    let totalSpeed = this.seededSpeedSum;
+    let totalCorrectness = this.seededCorrectnessSum;
+    let totalAutonomy = this.seededAutonomySum;
+    let totalFirstAttempt = this.seededFirstAttemptSum;
 
     for (const s of this.scores) {
       totalScore += s.score;
@@ -126,8 +229,6 @@ export class EfficiencyScorer implements Resettable {
       totalAutonomy += s.components.autonomy;
       totalFirstAttempt += s.components.firstAttemptQuality;
     }
-
-    const n = this.scores.length;
 
     return {
       score: Math.round((totalScore / n) * 1000) / 1000,
@@ -139,7 +240,20 @@ export class EfficiencyScorer implements Resettable {
       },
       taskId: 'session-average',
       timestamp: Date.now(),
+      // An average across tasks has no single model of its own.
+      model: null,
     };
+  }
+
+  /**
+   * Effective sample count behind getSessionAverage() — fresh scores plus
+   * any seeded weight from a previous process's checkpoint. Distinct from
+   * getScores().length, which is fresh-only and would silently drop or
+   * under-weight seeded history if used to persist the sample count that
+   * pairs with getSessionAverage()'s seed-inclusive score.
+   */
+  getSessionSampleCount(): number {
+    return this.scores.length + this.seededSampleCount;
   }
 
   /**
@@ -148,19 +262,14 @@ export class EfficiencyScorer implements Resettable {
   updateScore(task: AiCodingTask, antiPatterns?: AntiPattern[]): EfficiencyScore {
     const idx = this.scores.findIndex((s) => s.taskId === task.taskId);
     const components = this.computeComponents(task, antiPatterns);
-    const raw =
-      components.speed * this.speedWeight +
-      components.correctness * this.correctnessWeight +
-      components.autonomy * this.autonomyWeight +
-      components.firstAttemptQuality * this.firstAttemptQualityWeight;
-
-    const score = clamp(Math.round(raw * 1000) / 1000, 0, 1);
+    const score = this.computeWeightedScore(components, task);
 
     const result: EfficiencyScore = {
       score,
       components,
       taskId: task.taskId,
       timestamp: task.endTime,
+      model: this.modelFor(task.taskId),
     };
 
     if (idx >= 0) {
@@ -184,11 +293,19 @@ export class EfficiencyScorer implements Resettable {
   emitMetrics(aggregator: MetricAggregator): void {
     for (let i = this.lastEmittedIndex; i < this.scores.length; i++) {
       const s = this.scores[i]!;
-      aggregator.record('ai.efficiency.score', s.score);
-      aggregator.record('ai.efficiency.speed', s.components.speed);
-      aggregator.record('ai.efficiency.correctness', s.components.correctness);
-      aggregator.record('ai.efficiency.autonomy', s.components.autonomy);
-      aggregator.record('ai.efficiency.first_attempt_quality', s.components.firstAttemptQuality);
+      const attrs: Record<string, string | number> = {};
+      if (s.model) {
+        attrs.model = s.model;
+      }
+      aggregator.record('ai.efficiency.score', s.score, attrs);
+      aggregator.record('ai.efficiency.speed', s.components.speed, attrs);
+      aggregator.record('ai.efficiency.correctness', s.components.correctness, attrs);
+      aggregator.record('ai.efficiency.autonomy', s.components.autonomy, attrs);
+      aggregator.record(
+        'ai.efficiency.first_attempt_quality',
+        s.components.firstAttemptQuality,
+        attrs,
+      );
     }
     this.lastEmittedIndex = this.scores.length;
   }
@@ -196,6 +313,12 @@ export class EfficiencyScorer implements Resettable {
   reset(_sessionId: string): void {
     this.scores.length = 0;
     this.lastEmittedIndex = 0;
+    this.seededScoreSum = 0;
+    this.seededSpeedSum = 0;
+    this.seededCorrectnessSum = 0;
+    this.seededAutonomySum = 0;
+    this.seededFirstAttemptSum = 0;
+    this.seededSampleCount = 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -212,6 +335,33 @@ export class EfficiencyScorer implements Resettable {
       autonomy: this.computeAutonomy(task),
       firstAttemptQuality: this.computeFirstAttemptQuality(antiPatterns),
     };
+  }
+
+  /**
+   * Weighted average of the four components, clamped to [0, 1]. When zero
+   * lines changed, speed is excluded entirely rather than scored as 0 —
+   * investigation/review/delegated tasks make no edits by design, so the
+   * remaining weights are renormalized to sum to 1 on their own.
+   */
+  private computeWeightedScore(components: EfficiencyScoreComponents, task: AiCodingTask): number {
+    if (task.linesChanged === 0) {
+      const remainingWeight =
+        this.correctnessWeight + this.autonomyWeight + this.firstAttemptQualityWeight;
+      if (remainingWeight <= 0) return 0;
+      const raw =
+        (components.correctness * this.correctnessWeight +
+          components.autonomy * this.autonomyWeight +
+          components.firstAttemptQuality * this.firstAttemptQualityWeight) /
+        remainingWeight;
+      return clamp(Math.round(raw * 1000) / 1000, 0, 1);
+    }
+
+    const raw =
+      components.speed * this.speedWeight +
+      components.correctness * this.correctnessWeight +
+      components.autonomy * this.autonomyWeight +
+      components.firstAttemptQuality * this.firstAttemptQualityWeight;
+    return clamp(Math.round(raw * 1000) / 1000, 0, 1);
   }
 
   /**
@@ -236,30 +386,44 @@ export class EfficiencyScorer implements Resettable {
   }
 
   /**
-   * Autonomy: 1 - (userQuestions / toolCalls). 1.0 if no questions asked.
+   * Autonomy: a single clarifying question is free (not penalized — asking
+   * when a task is genuinely ambiguous is correct behavior); each question
+   * beyond that costs 1/AUTONOMY_QUESTION_PENALTY_SCALE. Deliberately
+   * independent of toolCallCount — normalizing by tool-call count made the
+   * same single question swing the score up to 33x differently purely based
+   * on unrelated task size.
    */
   private computeAutonomy(task: AiCodingTask): number {
-    if (task.toolCallCount === 0) return 1;
     if (task.askedUserQuestions === 0) return 1;
-    return clamp(1 - task.askedUserQuestions / task.toolCallCount, 0, 1);
+    const excessQuestions = Math.max(0, task.askedUserQuestions - AUTONOMY_FREE_QUESTIONS);
+    return clamp(1 - excessQuestions / AUTONOMY_QUESTION_PENALTY_SCALE, 0, 1);
   }
 
   /**
-   * First-attempt quality: 1 - (maxThrashIterations / 3), floored at 0.
-   * If no anti-patterns provided or no thrashing, score is 1.0.
+   * First-attempt quality: 1 - (worstSeverity / FIRST_ATTEMPT_QUALITY_SEVERITY_CEILING),
+   * where worstSeverity is the highest severity count across ALL detected
+   * anti-pattern types for the task (thrashing iterations, re-read count,
+   * stuck-loop repeat count, blind-edit count, over-delegation agent
+   * count) — not just thrashing. If no anti-patterns are provided or none
+   * were detected, score is 1.0.
    */
   private computeFirstAttemptQuality(antiPatterns?: AntiPattern[]): number {
     if (!antiPatterns || antiPatterns.length === 0) return 1;
 
-    let maxIterations = 0;
+    let worstSeverity = 0;
     for (const pattern of antiPatterns) {
-      if (pattern.type === 'thrashing' && pattern.iterations != null) {
-        maxIterations = Math.max(maxIterations, pattern.iterations);
-      }
+      const severity =
+        pattern.iterations ??
+        pattern.readCount ??
+        pattern.repeatCount ??
+        pattern.editCount ??
+        pattern.agentCount ??
+        0;
+      worstSeverity = Math.max(worstSeverity, severity);
     }
 
-    if (maxIterations === 0) return 1;
-    return clamp(1 - maxIterations / 3, 0, 1);
+    if (worstSeverity === 0) return 1;
+    return clamp(1 - worstSeverity / FIRST_ATTEMPT_QUALITY_SEVERITY_CEILING, 0, 1);
   }
 
   private appendScore(score: EfficiencyScore): void {

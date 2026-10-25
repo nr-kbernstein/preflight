@@ -9,6 +9,7 @@ import type { AuditRecord } from '../security/audit-trail.js';
 
 function makeAuditRecord(overrides?: Partial<AuditRecord>): AuditRecord {
   return {
+    id: 'audit-001',
     timestamp: 1_700_000_000_000,
     sessionId: 'sess-001',
     action: 'FileRead',
@@ -93,6 +94,14 @@ describe('auditRecordToLogEntry()', () => {
     const entry = auditRecordToLogEntry(record, 'my-app');
 
     expect(entry.attributes).not.toHaveProperty('session_id');
+  });
+
+  it('includes agent_id and agent_type when present', () => {
+    const record = makeAuditRecord({ agentId: 'a9f8', agentType: 'workflow' });
+    const entry = auditRecordToLogEntry(record, 'my-app');
+
+    expect(entry.attributes!.agent_id).toBe('a9f8');
+    expect(entry.attributes!.agent_type).toBe('workflow');
   });
 
   it('redacts secrets in detail, file_path, and command', () => {

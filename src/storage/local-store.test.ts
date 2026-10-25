@@ -271,6 +271,145 @@ describe('LocalStore', () => {
     });
   });
 
+  // Read-only cross-file merge, mirroring peekAllBuffers()'s pattern.
+  describe('peekAllAuditLogs()', () => {
+    it('returns [] when the audit directory does not exist yet', () => {
+      const store = new LocalStore(tmpDir);
+      store.initialize();
+      // No appendAuditLog() call — directory exists (initialize() creates
+      // it) but is empty.
+      expect(store.peekAllAuditLogs()).toEqual([]);
+    });
+
+    it('reads entries back from a single day file without deleting it', () => {
+      const store = new LocalStore(tmpDir);
+      store.initialize();
+      const entry = makeAudit({ timestamp: Date.now(), tool: 'Read', detail: 'src/a.ts' });
+      store.appendAuditLog(entry);
+
+      const peeked = store.peekAllAuditLogs();
+      expect(peeked).toEqual([entry]);
+
+      const dateStr = new Date(entry.timestamp).toISOString().slice(0, 10);
+      const filepath = resolve(tmpDir, 'audit', `${dateStr}.jsonl`);
+      expect(existsSync(filepath)).toBe(true); // read-only — file untouched
+    });
+
+    it('merges entries from multiple day files, across multiple simulated processes', () => {
+      const store = new LocalStore(tmpDir);
+      store.initialize();
+      const day1 = new Date('2025-06-15T12:00:00Z').getTime();
+      const day2 = new Date('2025-06-16T12:00:00Z').getTime();
+      store.appendAuditLog(makeAudit({ timestamp: day1, detail: 'from day 1' }));
+      store.appendAuditLog(makeAudit({ timestamp: day2, detail: 'from day 2' }));
+
+      // A second process's LocalStore instance, writing to the same shared
+      // storagePath, appends its own entry to today's file.
+      const otherProcessStore = new LocalStore(tmpDir);
+      otherProcessStore.appendAuditLog(makeAudit({ timestamp: Date.now(), detail: 'from proc 2' }));
+
+      const peeked = store.peekAllAuditLogs();
+      expect(peeked).toHaveLength(3);
+      expect(peeked.map((e) => e.detail).sort()).toEqual(
+        ['from day 1', 'from day 2', 'from proc 2'].sort(),
+      );
+    });
+
+    it('drops a malformed mid-file line but keeps the torn last line silent', () => {
+      const store = new LocalStore(tmpDir);
+      store.initialize();
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const filepath = resolve(tmpDir, 'audit', `${dateStr}.jsonl`);
+      const good = JSON.stringify(makeAudit({ detail: 'good' }));
+      writeFileSync(filepath, `${good}\nnot valid json\n{"timestamp":1,"action":"a","tool":"t"`);
+
+      const peeked = store.peekAllAuditLogs();
+      expect(peeked).toEqual([JSON.parse(good)]);
+
+      const warnCalls = (stderrSpy.mock.calls as unknown[][]).filter((args) =>
+        String(args[0]).includes('peekAllAuditLogs: dropping malformed mid-file line'),
+      );
+      expect(warnCalls).toHaveLength(1);
+    });
+
+    // Regression for the unbounded-CPU/payload finding: a long-lived daemon
+    // can accumulate far more `audit/*.jsonl` day-files (and rows) than any
+    // consumer ever renders or exports. `limit` must stop opening older
+    // files once enough rows are collected, not just truncate the result
+    // after reading everything.
+    //
+    // Proof that the older files are never *opened* (not just filtered out
+    // of the result afterwards): every one of the 8 oldest day-files is
+    // written with a mid-file malformed line, which — per the "drops a
+    // malformed mid-file line" test above — triggers a
+    // 'peekAllAuditLogs: dropping malformed mid-file line' warning if and
+    // only if that file is actually read and parsed. If the early stop
+    // works, those 8 files are never opened and no such warning fires for
+    // them.
+    it('with a limit, stops opening older day-files once enough rows are collected', () => {
+      const store = new LocalStore(tmpDir);
+      store.initialize();
+      const auditDir = resolve(tmpDir, 'audit');
+
+      const dayCount = 10;
+      const rowsPerNewDay = 3; // the 2 newest days: clean, 3 valid rows each
+      const baseDay = new Date('2025-01-01T12:00:00Z').getTime();
+      const dayFile = (d: number): string =>
+        resolve(
+          auditDir,
+          `${new Date(baseDay + d * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)}.jsonl`,
+        );
+
+      // 8 oldest days: each has a mid-file malformed line, which would warn
+      // if (and only if) the file is opened and parsed.
+      for (let d = 0; d < dayCount - 2; d++) {
+        const good = JSON.stringify(makeAudit({ detail: `day${d}-good` }));
+        writeFileSync(dayFile(d), `${good}\nnot valid json\n${good}\n`);
+      }
+      // 2 newest days: clean rows only.
+      for (let d = dayCount - 2; d < dayCount; d++) {
+        for (let r = 0; r < rowsPerNewDay; r++) {
+          store.appendAuditLog(
+            makeAudit({ timestamp: baseDay + d * 24 * 60 * 60 * 1000, detail: `day${d}-row${r}` }),
+          );
+        }
+      }
+
+      stderrSpy.mockClear();
+
+      // 2 newest days hold 6 rows combined, comfortably over this limit —
+      // so the loop should stop after those 2 files and never touch the 8
+      // older (malformed) ones.
+      const limit = 5;
+      const peeked = store.peekAllAuditLogs(limit);
+
+      expect(peeked.length).toBeGreaterThanOrEqual(limit);
+      const details = peeked.map((e) => e.detail);
+      for (const d of details) {
+        expect(d).toMatch(/^day[89]-row/);
+      }
+
+      const malformedWarnings = (stderrSpy.mock.calls as unknown[][]).filter((args) =>
+        String(args[0]).includes('peekAllAuditLogs: dropping malformed mid-file line'),
+      );
+      expect(malformedWarnings).toHaveLength(0);
+    });
+
+    it('without a limit, reads every day-file (existing unbounded behavior preserved)', () => {
+      const store = new LocalStore(tmpDir);
+      store.initialize();
+
+      const dayCount = 6;
+      const baseDay = new Date('2025-02-01T12:00:00Z').getTime();
+      for (let d = 0; d < dayCount; d++) {
+        store.appendAuditLog(makeAudit({ timestamp: baseDay + d * 24 * 60 * 60 * 1000 }));
+      }
+
+      const peeked = store.peekAllAuditLogs();
+      expect(peeked).toHaveLength(dayCount);
+    });
+  });
+
   // ---------------------------------------------------------------------------
   // Fault injection
   // ---------------------------------------------------------------------------
@@ -551,6 +690,37 @@ describe('LocalStore', () => {
       const all = drainAll.drainAllBuffers();
       expect(all.map((e) => e.tool)).toEqual(['real']);
     });
+
+    // Same DEAD_PID rationale as the gcOrphanBuffers() describe block below:
+    // 9_999_999 is above both Linux's and macOS's pid_max ceilings.
+    const DEAD_PID = 9_999_999;
+
+    it("skips a per-session buffer whose owner heartbeat is alive, so it does not race that --stdio process's own scoped drainBuffer()", () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const owned = new LocalStore(tmpDir, 'sess-owned');
+      owned.appendToBuffer(makeEvent({ tool: 'owned-event' }));
+      owned.writeHeartbeat(process.pid);
+      new LocalStore(tmpDir, 'sess-orphan').appendToBuffer(makeEvent({ tool: 'orphan-event' }));
+
+      const drainAll = new LocalStore(tmpDir);
+      const all = drainAll.drainAllBuffers();
+
+      // Only the orphaned session's event comes back — the live-owned
+      // session's buffer is left untouched for its own process to drain.
+      expect(all.map((e) => e.tool)).toEqual(['orphan-event']);
+      expect(existsSync(resolve(tmpDir, 'buffer-sess-owned.jsonl'))).toBe(true);
+      expect(owned.drainBuffer().map((e) => e.tool)).toEqual(['owned-event']);
+    });
+
+    it('still drains a per-session buffer whose heartbeat PID is dead', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      new LocalStore(tmpDir, 'sess-dead-owner').appendToBuffer(makeEvent({ tool: 'dead-owner' }));
+      writeFileSync(resolve(tmpDir, 'active-sess-dead-owner.pid'), String(DEAD_PID));
+
+      const drainAll = new LocalStore(tmpDir);
+      const all = drainAll.drainAllBuffers();
+      expect(all.map((e) => e.tool)).toEqual(['dead-owner']);
+    });
   });
 
   describe('migrateLegacyBuffer()', () => {
@@ -808,6 +978,34 @@ describe('LocalStore', () => {
       // Should not throw
       expect(() => store.removeHeartbeat()).not.toThrow();
     });
+
+    it('also writes a sidecar meta file with argv and cwd', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const store = new LocalStore(tmpDir, 'sess-hb-3');
+      store.writeHeartbeat(
+        12345,
+        ['/opt/preflight/dist/index.js', '--stdio'],
+        '/home/user/project',
+      );
+
+      const metaPath = resolve(tmpDir, 'active-sess-hb-3.meta.json');
+      expect(existsSync(metaPath)).toBe(true);
+      const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      expect(meta).toEqual({
+        argv: ['/opt/preflight/dist/index.js', '--stdio'],
+        cwd: '/home/user/project',
+      });
+    });
+
+    it('removeHeartbeat also removes the sidecar meta file', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const store = new LocalStore(tmpDir, 'sess-hb-4');
+      store.writeHeartbeat(67890, ['/opt/preflight/dist/index.js'], '/home/user/project');
+      expect(existsSync(resolve(tmpDir, 'active-sess-hb-4.meta.json'))).toBe(true);
+
+      store.removeHeartbeat();
+      expect(existsSync(resolve(tmpDir, 'active-sess-hb-4.meta.json'))).toBe(false);
+    });
   });
 
   describe('gcOrphanBuffers()', () => {
@@ -844,6 +1042,23 @@ describe('LocalStore', () => {
         /^buffer-sess-dead\.jsonl\.archived-\d+$/.test(n),
       );
       expect(archives).toHaveLength(1);
+    });
+
+    it('also removes the sidecar meta.json when archiving a dead-heartbeat buffer', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      makeBufferFile('buffer-sess-dead-meta.jsonl');
+      writeFileSync(resolve(tmpDir, 'active-sess-dead-meta.pid'), String(DEAD_PID));
+      writeFileSync(
+        resolve(tmpDir, 'active-sess-dead-meta.meta.json'),
+        JSON.stringify({ argv: ['/opt/preflight/dist/index.js'], cwd: '/home/user/project' }),
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcOrphanBuffers(new Set());
+
+      expect(result.archived).toBe(1);
+      expect(existsSync(resolve(tmpDir, 'active-sess-dead-meta.pid'))).toBe(false);
+      expect(existsSync(resolve(tmpDir, 'active-sess-dead-meta.meta.json'))).toBe(false);
     });
 
     it('preserves a buffer whose heartbeat PID is alive (this process)', () => {
@@ -969,6 +1184,199 @@ describe('LocalStore', () => {
     });
   });
 
+  describe('gcWatcherCursors()', () => {
+    const PARENT_SESSION = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
+    const AGENT_ID = 'a1234567890abcdef';
+    const OTHER_SESSION = 'b2c3d4e5-f6a7-8901-bcde-f12345678901';
+
+    function makeCursorFile(name: string, mtimeMs?: number): string {
+      const path = resolve(tmpDir, name);
+      writeFileSync(path, JSON.stringify({ bytePos: 0, partialLine: '' }));
+      if (mtimeMs !== undefined) {
+        const date = new Date(mtimeMs);
+        utimesSync(path, date, date);
+      }
+      return path;
+    }
+
+    it('preserves a subagent cursor whose parent session is live, regardless of mtime', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(
+        `.subagent-pos-${PARENT_SESSION}-${AGENT_ID}`,
+        Date.now() - 48 * 60 * 60 * 1000,
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set([PARENT_SESSION]), 24);
+
+      expect(result.subagentCursors).toBe(0);
+      expect(existsSync(path)).toBe(true);
+    });
+
+    it('preserves a dead-session subagent cursor with recent mtime', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(`.subagent-pos-${PARENT_SESSION}-${AGENT_ID}`);
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result.subagentCursors).toBe(0);
+      expect(existsSync(path)).toBe(true);
+    });
+
+    it('deletes a dead-session subagent cursor older than the discovery window', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(
+        `.subagent-pos-${PARENT_SESSION}-${AGENT_ID}`,
+        Date.now() - 48 * 60 * 60 * 1000,
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result.subagentCursors).toBe(1);
+      expect(existsSync(path)).toBe(false);
+    });
+
+    it('deletes a dead-session subagent cursor for a named-subagent transcript (Agent tool `name` spawn) older than the discovery window', () => {
+      // Named subagents (spawned via Agent({name: ...})) produce cursor files
+      // shaped `.subagent-pos-<parentSessionId>-a<name>-<16-hex>` — the agentId
+      // segment itself contains hyphens, unlike the plain `a<16-hex>` shape.
+      mkdirSync(tmpDir, { recursive: true });
+      const namedAgentId = 'aconfluence-istio-investigator-ca0143b626a86424';
+      const path = makeCursorFile(
+        `.subagent-pos-${PARENT_SESSION}-${namedAgentId}`,
+        Date.now() - 48 * 60 * 60 * 1000,
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result.subagentCursors).toBe(1);
+      expect(existsSync(path)).toBe(false);
+    });
+
+    it('preserves a live-session subagent cursor for a named-subagent transcript, regardless of mtime', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const namedAgentId = 'aconfluence-istio-investigator-ca0143b626a86424';
+      const path = makeCursorFile(
+        `.subagent-pos-${PARENT_SESSION}-${namedAgentId}`,
+        Date.now() - 48 * 60 * 60 * 1000,
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set([PARENT_SESSION]), 24);
+
+      expect(result.subagentCursors).toBe(0);
+      expect(existsSync(path)).toBe(true);
+    });
+
+    it('preserves a parent-transcript cursor whose session is live, regardless of mtime', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(
+        `.parent-transcript-pos-${PARENT_SESSION}`,
+        Date.now() - 48 * 60 * 60 * 1000,
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set([PARENT_SESSION]), 24);
+
+      expect(result.parentTranscriptCursors).toBe(0);
+      expect(existsSync(path)).toBe(true);
+    });
+
+    it('preserves a dead-session parent-transcript cursor with recent mtime', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(`.parent-transcript-pos-${PARENT_SESSION}`);
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result.parentTranscriptCursors).toBe(0);
+      expect(existsSync(path)).toBe(true);
+    });
+
+    it('deletes a dead-session parent-transcript cursor older than the discovery window', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(
+        `.parent-transcript-pos-${PARENT_SESSION}`,
+        Date.now() - 48 * 60 * 60 * 1000,
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result.parentTranscriptCursors).toBe(1);
+      expect(existsSync(path)).toBe(false);
+    });
+
+    it('preserves a transcript cursor while its companion buffer file exists', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      writeFileSync(resolve(tmpDir, `buffer-${OTHER_SESSION}.jsonl`), '');
+      const path = makeCursorFile(
+        `.transcript-pos-${OTHER_SESSION}`,
+        Date.now() - 48 * 60 * 60 * 1000,
+      );
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result.transcriptCursors).toBe(0);
+      expect(existsSync(path)).toBe(true);
+    });
+
+    it('deletes a dead-session transcript cursor once its buffer file is gone', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(`.transcript-pos-${OTHER_SESSION}`);
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result.transcriptCursors).toBe(1);
+      expect(existsSync(path)).toBe(false);
+    });
+
+    it('preserves a transcript cursor whose session is live even with no buffer file', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const path = makeCursorFile(`.transcript-pos-${OTHER_SESSION}`);
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set([OTHER_SESSION]), 24);
+
+      expect(result.transcriptCursors).toBe(0);
+      expect(existsSync(path)).toBe(true);
+    });
+
+    it('ignores malformed cursor filenames', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      writeFileSync(resolve(tmpDir, '.subagent-pos-not-a-valid-agent-id'), '{}');
+      writeFileSync(resolve(tmpDir, '.transcript-pos-'), '{}');
+      writeFileSync(resolve(tmpDir, '.parent-transcript-pos-'), '{}');
+
+      const store = new LocalStore(tmpDir);
+      const result = store.gcWatcherCursors(new Set(), 24);
+
+      expect(result).toEqual({
+        subagentCursors: 0,
+        transcriptCursors: 0,
+        parentTranscriptCursors: 0,
+      });
+      expect(existsSync(resolve(tmpDir, '.subagent-pos-not-a-valid-agent-id'))).toBe(true);
+      expect(existsSync(resolve(tmpDir, '.transcript-pos-'))).toBe(true);
+      expect(existsSync(resolve(tmpDir, '.parent-transcript-pos-'))).toBe(true);
+    });
+
+    it('returns zeros when storage path does not exist', () => {
+      const missing = resolve(tmpDir, 'nonexistent');
+      const store = new LocalStore(missing);
+      expect(store.gcWatcherCursors(new Set(), 24)).toEqual({
+        subagentCursors: 0,
+        transcriptCursors: 0,
+        parentTranscriptCursors: 0,
+      });
+    });
+  });
+
   describe('getActiveSessionIdsFromHeartbeats()', () => {
     it('returns sessionIds whose PID is alive and skips dead ones', () => {
       mkdirSync(tmpDir, { recursive: true });
@@ -984,6 +1392,54 @@ describe('LocalStore', () => {
       mkdirSync(tmpDir, { recursive: true });
       const store = new LocalStore(tmpDir);
       expect(store.getActiveSessionIdsFromHeartbeats().size).toBe(0);
+    });
+  });
+
+  describe('listActiveStdioInstances()', () => {
+    it('returns live instances with argv/cwd from the sidecar meta file', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const store = new LocalStore(tmpDir, 'sess-stdio-1');
+      store.writeHeartbeat(
+        process.pid,
+        ['/opt/preflight/dist/index.js', '--stdio'],
+        '/home/user/project',
+      );
+
+      const [inst] = new LocalStore(tmpDir).listActiveStdioInstances();
+      expect(inst.pid).toBe(process.pid);
+      expect(inst.sessionId).toBe('sess-stdio-1');
+      expect(inst.argv).toEqual(['/opt/preflight/dist/index.js', '--stdio']);
+      expect(inst.cwd).toBe('/home/user/project');
+      expect(inst.alive).toBe(true);
+      expect(typeof inst.startedAt).toBe('number');
+    });
+
+    it('marks a dead PID as not alive', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      const DEAD_PID = 999999;
+      writeFileSync(resolve(tmpDir, 'active-sess-stdio-dead.pid'), String(DEAD_PID));
+      const [inst] = new LocalStore(tmpDir).listActiveStdioInstances();
+      expect(inst.pid).toBe(DEAD_PID);
+      expect(inst.alive).toBe(false);
+    });
+
+    it('defaults argv to [] and cwd to null when the sidecar meta file is missing (pre-upgrade heartbeat)', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      writeFileSync(resolve(tmpDir, 'active-sess-stdio-nometa.pid'), String(process.pid));
+      const [inst] = new LocalStore(tmpDir).listActiveStdioInstances();
+      expect(inst.argv).toEqual([]);
+      expect(inst.cwd).toBeNull();
+    });
+
+    it('returns an empty array when no heartbeats exist', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      expect(new LocalStore(tmpDir).listActiveStdioInstances()).toEqual([]);
+    });
+
+    it('skips a heartbeat file with a malformed sessionId', () => {
+      mkdirSync(tmpDir, { recursive: true });
+      writeFileSync(resolve(tmpDir, 'active-bad session id!.pid'), String(process.pid));
+      expect(new LocalStore(tmpDir).listActiveStdioInstances()).toEqual([]);
     });
   });
 

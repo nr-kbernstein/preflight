@@ -1,15 +1,27 @@
 import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
 import { platform } from 'node:os';
-import { resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 
 import { createLogger } from '../shared/index.js';
+import { checkNodeVersion, MIN_SUPPORTED_NODE_MAJOR } from './node-version-check.js';
+import { isNewerVersion, fetchLatestNpmVersion } from './npm-version-check.js';
+import { VERSION } from '../version.js';
 
-import { validateConfigFile, DEFAULT_STORAGE_PATH } from '../config.js';
-import { getDashboardDaemonStatus, findExecutableNodeDir } from './schedule.js';
+import {
+  validateConfigFile,
+  loadMcpConfig,
+  DEFAULT_STORAGE_PATH,
+  resolveCompanionMode,
+} from '../config.js';
+import { getDashboardDaemonStatus, findExecutableNodeDir, getScheduleStatus } from './schedule.js';
+import { detectUpdateSupport, upgradeCommandFor } from './update-support.js';
+import { HOOK_EVENT_TYPES, type HookEventType } from '../hook-subcommands.js';
 import {
   detectSettingsPath,
   entryContainsNrObserve,
   entryHasAnyCommandHook,
+  HOOK_SUBCOMMAND_PATTERN,
+  NR_HOOK_RE,
 } from './install-helper.js';
 import { isWsl, resolveWindowsHome } from './platform.js';
 import { LocalStore } from '../storage/index.js';
@@ -31,6 +43,10 @@ type DiagnosticsContext = {
   // used verbatim as the skip detail so the message is accurate for each cause
   // (absent file, config errors, local mode, missing licenseKey).
   readonly nrSkipReason: string | null;
+  // Raw file.mode, for checkTelemetryMode's source reporting — see validateConfigFile.
+  readonly fileMode: string | undefined;
+  // Raw file.companionMode, for checkCompanionMode's source reporting — see validateConfigFile.
+  readonly fileCompanionMode: boolean | undefined;
 };
 
 function checkConfigValid(
@@ -96,7 +112,58 @@ function checkConfigValid(
 
   return {
     check,
-    context: { storagePath, nrSkipReason },
+    context: {
+      storagePath,
+      nrSkipReason,
+      fileMode: validation.mode,
+      fileCompanionMode: validation.companionMode,
+    },
+  };
+}
+
+// Reports the mode the running server would actually resolve — via the real
+// loader, not a re-derived approximation — plus which of env/file/default
+// produced it. Also the only place a licenseKey-without-explicit-mode config
+// (loadMcpConfig's fail-closed throw, see config.ts) surfaces to `doctor`
+// instead of crashing it with a stack trace.
+function checkTelemetryMode(configPath: string, fileMode: string | undefined): DiagnosticCheck {
+  const envMode = process.env.NR_AI_MODE;
+  const source =
+    envMode !== undefined && envMode !== ''
+      ? 'env NR_AI_MODE'
+      : fileMode !== undefined
+        ? 'config file'
+        : 'default (local)';
+  try {
+    const resolved = loadMcpConfig({ config: configPath });
+    return {
+      check: 'Telemetry mode',
+      status: 'ok',
+      detail: `Resolved to '${resolved.mode}' (source: ${source})`,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // loadMcpConfig can throw for reasons that have nothing to do with mode
+    // (invalid accountId, a literal "null" licenseKey, etc.) — those aren't
+    // caught by the "Config valid" check above (its Zod schema doesn't
+    // validate those runtime-only rules), so still surface them here rather
+    // than dropping them, but don't imply the mode itself is at fault.
+    const isModeError = message.includes('no explicit mode');
+    return {
+      check: 'Telemetry mode',
+      status: 'fail',
+      detail: isModeError ? message : `Could not resolve config to determine mode: ${message}`,
+      fix: 'Apply the remedy named in the message, then re-run doctor.',
+    };
+  }
+}
+
+function checkCompanionMode(fileValue: boolean | undefined): DiagnosticCheck {
+  const resolved = resolveCompanionMode(process.env, fileValue);
+  return {
+    check: 'Companion mode',
+    status: 'ok',
+    detail: `Resolved to ${resolved.value} (source: ${resolved.source})`,
   };
 }
 
@@ -190,11 +257,35 @@ function checkDaemon(): DiagnosticCheck[] {
   return [installedCheck, nodePathCheck];
 }
 
-/** The only two settings.json hook keys this diagnostic checks for. */
-interface ClaudeSettingsHooks {
-  readonly PreToolUse?: unknown;
-  readonly PostToolUse?: unknown;
+function checkUpdateSchedule(): DiagnosticCheck {
+  const name = 'Update schedule';
+  if (platform() !== 'darwin') {
+    return { check: name, status: 'skip', detail: 'Update scheduling is macOS-only.' };
+  }
+  if (!getScheduleStatus().installed) {
+    return { check: name, status: 'ok', detail: 'No update schedule installed.' };
+  }
+  const support = detectUpdateSupport();
+  if (support.supported) {
+    return { check: name, status: 'ok', detail: 'com.preflight.update.plist found' };
+  }
+  return {
+    check: name,
+    status: 'warn',
+    detail:
+      'com.preflight.update.plist is installed, but `preflight update` cannot run on this install (not a source clone), so the daily job fails every run.',
+    fix: `preflight schedule --disable, then upgrade with: ${upgradeCommandFor(support.blocker)}`,
+  };
 }
+
+/** The settings.json hook keys this diagnostic checks — the installer's own set. */
+type ClaudeSettingsHooks = Partial<Record<HookEventType, unknown>>;
+
+// Captures the binary path portion of an installed NR hook command, e.g.
+// `"/Users/x/.nvm/.../bin/preflight-collector" pre-tool` -> group 1 =
+// `/Users/x/.nvm/.../bin/preflight-collector`. Handles both quoted and
+// unquoted forms (see generateHookEntries() in install-helper.ts).
+const HOOK_COMMAND_PATH_RE = new RegExp(`^"?(.+?)"?\\s+(?:${HOOK_SUBCOMMAND_PATTERN})$`);
 
 function checkHooksWired(settingsPaths: string[], platform: string | undefined): DiagnosticCheck {
   if (platform !== undefined && platform !== 'claude-code') {
@@ -216,10 +307,8 @@ function checkHooksWired(settingsPaths: string[], platform: string | undefined):
   }
 
   const anyPathExists = settingsPaths.some(existsSync);
-  let hooksPre = false;
-  let hooksPost = false;
-  let hooksPreAny = false;
-  let hooksPostAny = false;
+  const nrWired = new Set<HookEventType>();
+  const anyWired = new Set<HookEventType>();
   const parseErrorPaths: string[] = [];
   let anyParsed = false;
 
@@ -229,13 +318,11 @@ function checkHooksWired(settingsPaths: string[], platform: string | undefined):
       const settings = JSON.parse(readFileSync(sp, 'utf-8')) as Record<string, unknown>;
       anyParsed = true;
       const hooks = settings.hooks as ClaudeSettingsHooks | undefined;
-      if (Array.isArray(hooks?.PreToolUse)) {
-        hooksPre ||= hooks.PreToolUse.some(entryContainsNrObserve);
-        hooksPreAny ||= hooks.PreToolUse.some(entryHasAnyCommandHook);
-      }
-      if (Array.isArray(hooks?.PostToolUse)) {
-        hooksPost ||= hooks.PostToolUse.some(entryContainsNrObserve);
-        hooksPostAny ||= hooks.PostToolUse.some(entryHasAnyCommandHook);
+      for (const hookType of HOOK_EVENT_TYPES) {
+        const entries = hooks?.[hookType];
+        if (!Array.isArray(entries)) continue;
+        if (entries.some(entryContainsNrObserve)) nrWired.add(hookType);
+        if (entries.some(entryHasAnyCommandHook)) anyWired.add(hookType);
       }
     } catch (err) {
       logger.debug('settings file could not be parsed — treating as not wired', { err, path: sp });
@@ -252,13 +339,13 @@ function checkHooksWired(settingsPaths: string[], platform: string | undefined):
     };
   }
 
-  if (hooksPre && hooksPost) {
+  if (HOOK_EVENT_TYPES.every((hookType) => nrWired.has(hookType))) {
     const malformedNote =
       parseErrorPaths.length > 0 ? `; ${parseErrorPaths.join(' and ')} could not be parsed` : '';
     return {
       check: 'Hooks wired',
       status: parseErrorPaths.length > 0 ? 'warn' : 'ok',
-      detail: `PreToolUse and PostToolUse hooks found${malformedNote}`,
+      detail: `${HOOK_EVENT_TYPES.join(', ')} hooks found${malformedNote}`,
       ...(parseErrorPaths.length > 0 && {
         fix: 'Fix or delete the malformed file(s), then run: preflight install',
       }),
@@ -276,16 +363,9 @@ function checkHooksWired(settingsPaths: string[], platform: string | undefined):
   }
 
   // Determine which event types are missing the official NR collector hook.
-  const missingNrEvents = (
-    [!hooksPre && 'PreToolUse', !hooksPost && 'PostToolUse'] as (string | false)[]
-  ).filter((x): x is string => x !== false);
-
-  const customEvents = missingNrEvents.filter((ev) =>
-    ev === 'PreToolUse' ? hooksPreAny : hooksPostAny,
-  );
-  const trulyMissingEvents = missingNrEvents.filter((ev) =>
-    ev === 'PreToolUse' ? !hooksPreAny : !hooksPostAny,
-  );
+  const missingNrEvents = HOOK_EVENT_TYPES.filter((hookType) => !nrWired.has(hookType));
+  const customEvents = missingNrEvents.filter((hookType) => anyWired.has(hookType));
+  const trulyMissingEvents = missingNrEvents.filter((hookType) => !anyWired.has(hookType));
 
   const searched = settingsPaths.filter(existsSync).join(' or ');
   const malformedNote =
@@ -297,7 +377,7 @@ function checkHooksWired(settingsPaths: string[], platform: string | undefined):
       check: 'Hooks wired',
       status: 'warn',
       detail: `${customEvents.join(' and ')} ${customEvents.length > 1 ? 'have' : 'has'} a custom hook command in ${searched} — verify it calls preflight-collector${malformedNote}`,
-      fix: 'Run preflight install to use the official hook, or confirm your script calls preflight-collector <event>-tool',
+      fix: 'Run preflight install to use the official hooks, or confirm your script forwards each hook event to preflight-collector',
     };
   }
 
@@ -311,6 +391,112 @@ function checkHooksWired(settingsPaths: string[], platform: string | undefined):
     status: 'fail',
     detail: `${trulyMissingEvents.join(' and ')} not found in ${searched}${customNote}${malformedNote}`,
     fix: 'preflight install',
+  };
+}
+
+/**
+ * Returns the raw installed hook command string (e.g.
+ * `"/abs/path/preflight-collector" pre-tool`) from the first settings file
+ * that has one, or null if no NR hook is installed anywhere. Mirrors the
+ * parsing checkHooksWired() already does, but returns the command text
+ * itself instead of a boolean — checkHooksWired() only needs booleans.
+ */
+function extractInstalledHookCommand(settingsPaths: string[]): string | null {
+  for (const sp of settingsPaths) {
+    if (!existsSync(sp)) continue;
+    let settings: Record<string, unknown>;
+    try {
+      settings = JSON.parse(readFileSync(sp, 'utf-8')) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const hooks = settings.hooks as ClaudeSettingsHooks | undefined;
+    for (const hookType of HOOK_EVENT_TYPES) {
+      const entries = hooks?.[hookType];
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (typeof entry !== 'object' || entry === null) continue;
+        const commandHooks = (entry as Record<string, unknown>).hooks;
+        if (!Array.isArray(commandHooks)) continue;
+        for (const h of commandHooks) {
+          if (typeof h !== 'object' || h === null) continue;
+          const command = (h as Record<string, unknown>).command;
+          if (typeof command === 'string' && NR_HOOK_RE.test(command)) {
+            return command;
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function checkHookNodePath(settingsPaths: string[], platform: string | undefined): DiagnosticCheck {
+  if (platform !== undefined && platform !== 'claude-code') {
+    return {
+      check: 'Hook node path',
+      status: 'skip',
+      detail: `This check only validates Claude Code's settings.json — not applicable to "${platform}"`,
+    };
+  }
+
+  const command = extractInstalledHookCommand(settingsPaths);
+  if (command === null) {
+    return {
+      check: 'Hook node path',
+      status: 'skip',
+      detail: 'No installed preflight hook found — see the "Hooks wired" check above.',
+    };
+  }
+
+  const match = HOOK_COMMAND_PATH_RE.exec(command);
+  const hookPath = match?.[1] ?? null;
+  if (hookPath === null || !isAbsolute(hookPath)) {
+    return {
+      check: 'Hook node path',
+      status: 'skip',
+      detail:
+        'Installed hook uses a bare command name (not an absolute path) — cannot check for a colocated node binary.',
+    };
+  }
+
+  const hookDir = dirname(hookPath);
+  const { dir: nodeDir, hasNonExecutable } = findExecutableNodeDir([hookDir]);
+
+  if (nodeDir === null && hasNonExecutable) {
+    return {
+      check: 'Hook node path',
+      status: 'fail',
+      detail: `node binary found next to the installed hook (${hookDir}) but is not executable`,
+      fix: 'Check node permissions (chmod +x <node>), or reinstall: preflight setup',
+    };
+  } else if (nodeDir === null) {
+    return {
+      check: 'Hook node path',
+      status: 'fail',
+      detail: `No executable node binary found next to the installed hook (${hookDir}) — the hook may fail to start.`,
+      fix: 'preflight setup (re-run install to refresh the hook path)',
+    };
+  }
+
+  const currentNodeDir = dirname(process.execPath);
+  if (resolve(nodeDir) !== resolve(currentNodeDir)) {
+    return {
+      check: 'Hook node path',
+      status: 'warn',
+      detail:
+        `Hook's colocated node binary (${nodeDir}) differs from the Node currently running doctor ` +
+        `(${currentNodeDir}) — the nvm default may have changed since install. This is a proxy check ` +
+        "based on where nvm/Homebrew colocate binaries, not a guarantee of what Claude Code's own hook " +
+        'subprocess resolves at runtime.',
+      fix: 'preflight setup (re-run install to refresh the hook path)',
+    };
+  }
+
+  return {
+    check: 'Hook node path',
+    status: 'ok',
+    detail: `node binary found next to the installed hook (${nodeDir}), matching the current Node install`,
   };
 }
 
@@ -436,6 +622,44 @@ function checkLocalInstances(storagePath: string): DiagnosticCheck {
   }
 }
 
+function checkNodeVersionDiagnostic(): DiagnosticCheck {
+  const error = checkNodeVersion();
+  if (error !== null) {
+    return {
+      check: 'Node version',
+      status: 'fail',
+      detail: `Running Node.js ${process.version}, but preflight requires v${MIN_SUPPORTED_NODE_MAJOR}+.`,
+      fix: `Install/select Node v${MIN_SUPPORTED_NODE_MAJOR}+ (e.g. via nvm), then re-run preflight setup.`,
+    };
+  }
+  return {
+    check: 'Node version',
+    status: 'ok',
+    detail: `Running Node.js ${process.version} (requires v${MIN_SUPPORTED_NODE_MAJOR}+)`,
+  };
+}
+
+async function checkPreflightVersion(): Promise<DiagnosticCheck> {
+  const latest = await fetchLatestNpmVersion();
+  if (latest === null) {
+    return {
+      check: 'Preflight version',
+      status: 'skip',
+      detail:
+        'Could not reach the npm registry to check for updates (offline, or npm unreachable).',
+    };
+  }
+  if (isNewerVersion(latest, VERSION)) {
+    return {
+      check: 'Preflight version',
+      status: 'warn',
+      detail: `Update available: v${VERSION} installed, v${latest} on npm.`,
+      fix: 'npm install -g @newrelic/preflight@latest',
+    };
+  }
+  return { check: 'Preflight version', status: 'ok', detail: `v${VERSION} is the latest version.` };
+}
+
 export async function runDiagnostics(opts?: {
   configPath?: string;
   storagePath?: string;
@@ -443,6 +667,8 @@ export async function runDiagnostics(opts?: {
 }): Promise<DiagnosticCheck[]> {
   const configPath = opts?.configPath ?? resolve(DEFAULT_STORAGE_PATH, 'config.json');
   const { check: configCheck, context } = checkConfigValid(configPath, opts?.storagePath);
+  const modeCheck = checkTelemetryMode(configPath, context.fileMode);
+  const companionModeCheck = checkCompanionMode(context.fileCompanionMode);
 
   const settingsPaths: string[] = [detectSettingsPath('user')];
   if (isWsl()) {
@@ -452,10 +678,16 @@ export async function runDiagnostics(opts?: {
 
   return [
     configCheck,
+    modeCheck,
+    companionModeCheck,
+    checkNodeVersionDiagnostic(),
     ...checkDaemon(),
+    checkUpdateSchedule(),
     checkHooksWired(settingsPaths, opts?.platform),
+    checkHookNodePath(settingsPaths, opts?.platform),
     checkStorageWritable(context.storagePath),
     checkLocalInstances(context.storagePath),
+    await checkPreflightVersion(),
     await checkNrReachable(context.nrSkipReason),
   ];
 }

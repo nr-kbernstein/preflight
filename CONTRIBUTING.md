@@ -1,3 +1,8 @@
+---
+title: Contributing
+description: Environment setup, architecture, code conventions, testing, and how to verify changes end-to-end.
+---
+
 # Contributing to NR AI Coding Observability: Preflight
 
 This guide covers everything you need to get productive in this repo: environment setup, project architecture, code conventions, testing, and how to verify your changes end-to-end.
@@ -19,6 +24,9 @@ The MCP server uses a common transport layer (`src/shared/`) for event buffering
 ### Prerequisites
 
 - Node.js v22 or later (v24 recommended; use `nvm install` to get the version from `.nvmrc`)
+- npm 11.11 or later (Node 24 ships it; on Node 22, `npm install -g npm@latest`). Older npm strips the `libc` fields from `package-lock.json`, so `npm install` rewrites 90 unrelated lines. `npm` warns at install time when yours is too old.
+- [`shellcheck`](https://www.shellcheck.net/) (`brew install shellcheck`), for the pre-commit hook's lint of tracked scripts under `.claude/skills/`
+- [`jq`](https://jqlang.org/), which `npm test` runs to check the release workflow's version filters (recent macOS and GitHub's Ubuntu runners include it; otherwise `brew install jq` or `apt install jq`)
 - A New Relic account with a license key and account ID (for cloud-path testing)
 
 ### First-time setup
@@ -26,10 +34,12 @@ The MCP server uses a common transport layer (`src/shared/`) for event buffering
 ```bash
 nvm install        # Install the right Node version (v24, from .nvmrc)
 nvm use            # Activate it
-npm install        # Install dependencies
-npm run build      # Build TypeScript and chmod +x the CLI binaries
+npm ci             # Install dependencies from the lockfile
+npm run build      # Build the server and the dashboard bundle, chmod +x the CLI binaries
 npm link           # Register preflight on PATH (required for Claude Code hooks)
-npm test           # Verify everything works
+npm test           # Jest suite — server, CLI, metrics
+npm run test:web   # Vitest suite — dashboard UI
+preflight setup    # Interactive wizard that inits NR keys, Claude Code hooks, dashboards
 ```
 
 To pull the latest changes and rebuild later:
@@ -40,26 +50,33 @@ preflight update
 
 ### Commands
 
-| Command                             | What it does                                                                                |
-| ----------------------------------- | ------------------------------------------------------------------------------------------- |
-| `npm run build`                     | Build TypeScript (`tsc --build`) and chmod the CLI binaries                                 |
-| `npm run build:clean`               | Remove build output                                                                         |
-| `npm test`                          | Run the full Jest suite (`maxWorkers: 1`)                                                   |
-| `npm run lint`                      | ESLint over `src/`                                                                          |
-| `npm run format`                    | Prettier write                                                                              |
-| `npm run format:check`              | Prettier check (no writes)                                                                  |
-| `npm run deploy:dashboard`          | Deploy the default NR dashboard                                                             |
-| `npm run deploy:dashboard:all`      | Deploy every pre-built dashboard                                                            |
-| `npm run deploy:dashboard:update`   | Sync every pre-built dashboard in place (preserves GUID/URL)                                |
-| `npm run deploy:dashboard:teardown` | Delete every pre-built dashboard (matches by name; missing = skipped)                       |
-| `npm run deploy:alerts`             | Deploy the alert policy + conditions to NR                                                  |
-| `npm run deploy:alerts:update`      | Sync conditions on the existing alert policy in place                                       |
-| `npm run deploy:alerts:teardown`    | Delete the alert policy and all its conditions                                              |
-| `npm run backfill:sessions`         | Backfill local session JSON files from NR event history                                     |
-| `npm run dev`                       | Start local dashboard server (`--local`); assumes `dist/` already built                     |
-| `npm run dev:all`                   | Build then start local dashboard (`npm run build && npm run dev`)                           |
-| `npm run dev:full`                  | Build backend, then start backend + Vite dev server together (open `http://localhost:5173`) |
-| `npm run start:local`               | Alias for `npm run dev`                                                                     |
+| Command                             | What it does                                                                                 |
+| ----------------------------------- | -------------------------------------------------------------------------------------------- |
+| `npm run build`                     | Build the server (`tsc --build`), chmod the CLI binaries, then typecheck and build `src/web` |
+| `npm run build:clean`               | Remove build output                                                                          |
+| `npm test`                          | Run the full Jest suite (`maxWorkers: 1`) — everything except `src/web`                      |
+| `npm run test:web`                  | Run the Vitest suite — the `src/web` dashboard UI                                            |
+| `npm run test:e2e`                  | Run the Playwright suite in `e2e/` (rebuilds first via `pretest:e2e`)                        |
+| `npm run test:e2e:update`           | Rewrite the Playwright screenshot baselines for the OS you are on                            |
+| `npm run test:e2e:update:linux`     | Rewrite the `-linux` baselines in the Playwright image CI uses (needs Docker)                |
+| `npm run test:integration`          | Run `src/multi-instance.integration.test.ts`                                                 |
+| `npx tsc -p tsconfig.web.json`      | Typecheck `src/web`, tests included (`npm run build` checks source only)                     |
+| `npx tsc -p tsconfig.tools.json`    | Typecheck `scripts/`, `e2e/` and the root `*.config.ts` files, which no other config reaches |
+| `npm run lint`                      | ESLint over `src/`, `scripts/`, `e2e/` and the root `*.config.ts` files                      |
+| `npm run format`                    | Prettier write                                                                               |
+| `npm run format:check`              | Prettier check (no writes)                                                                   |
+| `npm run deploy:dashboard`          | Deploy the default NR dashboard                                                              |
+| `npm run deploy:dashboard:all`      | Deploy every pre-built dashboard                                                             |
+| `npm run deploy:dashboard:update`   | Sync every pre-built dashboard in place (preserves GUID/URL)                                 |
+| `npm run deploy:dashboard:teardown` | Delete every pre-built dashboard (matches by name; missing = skipped)                        |
+| `npm run deploy:alerts`             | Deploy the alert policy + conditions to NR                                                   |
+| `npm run deploy:alerts:update`      | Sync conditions on the existing alert policy in place                                        |
+| `npm run deploy:alerts:teardown`    | Delete the alert policy and all its conditions                                               |
+| `npm run backfill:sessions`         | Backfill local session JSON files from NR event history                                      |
+| `npm run dev`                       | Start local dashboard server (`--local`); assumes `dist/` already built                      |
+| `npm run dev:all`                   | Build then start local dashboard (`npm run build && npm run dev`)                            |
+| `npm run dev:full`                  | Build backend, then start backend + Vite dev server together (open `http://localhost:5173`)  |
+| `npm run start:local`               | Alias for `npm run dev`                                                                      |
 
 To run a single test file:
 
@@ -72,6 +89,17 @@ To build directly without the chmod step:
 
 ```bash
 npx tsc -b .
+```
+
+### Git worktrees
+
+A new worktree starts with no `node_modules/` and no `.husky/_` — both are generated rather than
+tracked, so neither comes across with the checkout. Install in the worktree before working in it:
+
+```bash
+git worktree add ../preflight-my-feature -b fix/my-feature
+cd ../preflight-my-feature
+npm ci             # Installs deps and regenerates .husky/_ via the prepare script
 ```
 
 ### Working with shared code
@@ -96,7 +124,7 @@ preflight/
     security/      # Audit trail + SSRF helpers
     tracing/       # OTel span lifecycle
     transport/     # NR ingest manager + log ingest
-    platforms/     # 9 platform adapters — 8 named (Claude Code, Cursor, Windsurf, Copilot, Zed, Continue.dev, Amazon Q, Amazon Kiro) + 1 generic MCP fallback
+    platforms/     # one adapter per supported platform (see docs/ADAPTERS.md) + generic MCP fallback
     digest/        # Slack digest formatter and sender
     install/       # preflight install / setup CLI
     alerts/        # Alert TS types (JSON files live in alerts/ at repo root)
@@ -216,6 +244,54 @@ Logger writes to **stderr** as JSON. Never write to stdout — it's reserved for
 
 Tests live next to the code they test (`foo.test.ts` alongside `foo.ts`).
 
+### The three suites
+
+`npm test` is not the whole story — there are three runners, split by what they can execute:
+
+| Suite   | Command            | Covers                                                         | Runner                    |
+| ------- | ------------------ | -------------------------------------------------------------- | ------------------------- |
+| Server  | `npm test`         | `src/**/*.test.ts` outside `src/web`, plus `test/**/*.test.ts` | Jest, `node` env          |
+| Web     | `npm run test:web` | `src/web/**/*.test.{ts,tsx}`                                   | Vitest, `jsdom` env       |
+| Browser | `npm run test:e2e` | `e2e/*.spec.ts`                                                | Playwright, real Chromium |
+
+Two files sit outside all three: `jest.config.ts` also ignores `src/shared/index.test.ts`, which
+asserts an invariant that does not hold for vendored source, and
+`src/multi-instance.integration.test.ts`, which spawns real processes and runs on demand via
+`npm run test:integration`. Both carry a comment saying why.
+
+`npm run test:e2e` installs its browser if needed, rebuilds, then starts two dashboards itself —
+one over an empty store, one over a seeded one — each against its own temp directory, which
+also stands in for `HOME`. So it needs no running server, and it reads none of your credentials,
+your real `~/.newrelic-preflight`, or your Claude Code and Copilot transcripts. See
+[TEST_PATTERNS.md](./docs/TEST_PATTERNS.md#browser-tests-playwright) for adding a test.
+
+`.claude/skills/verify-preflight/` is the only project skill tracked in git. It launches an isolated
+Preflight from your checkout and drives it through the collector, the dashboard, and the stdio MCP
+tools (`.claude/skills/verify-preflight/SKILL.md`). Any other skill in `.claude/skills/`, including
+symlinks to skills kept elsewhere, stays ignored. To track a new project skill, add a
+`!.claude/skills/<name>/` line to `.gitignore`. Keep personal skills untracked through
+`.git/info/exclude`. Tracked skill Markdown is covered by `npm run format:check`, and tracked shell
+scripts by `npm run lint:shell` (shellcheck).
+
+Screenshot assertions compare against per-platform baselines in `e2e/*-snapshots/`. Two are
+committed for each screenshot: `-darwin`, recorded on a Mac, and `-linux`, recorded in the
+`mcr.microsoft.com/playwright` image whose tag matches `@playwright/test` in `package.json` —
+the image CI's `e2e` job runs in, so CI checks the Linux one. When a deliberate UI change makes
+them stale, re-record both and commit the result:
+
+- **macOS:** `npm run test:e2e:update`.
+- **Linux:** `npm run test:e2e:update:linux`, from any OS with Docker running. It records in the
+  pinned image as `linux/amd64`, so on Apple Silicon it runs emulated and takes a few minutes.
+  Your checkout has to be under a directory Docker shares with its VM (your home directory,
+  by default).
+
+A Linux desktop run compares against the committed `-linux` baseline and may fail on font
+differences alone; the container is the reference. There is no Windows baseline: a first run
+on Windows writes one and fails, and later runs compare against it. Keep it uncommitted, since
+nothing in CI checks it. Adding a new screenshot means committing its `-darwin` and `-linux`
+files together. CI's `e2e` job fails on a missing `-linux` one; it runs Linux only, so nothing
+catches a missing or stale `-darwin` one but the next macOS run.
+
 ### Writing tests
 
 ```typescript
@@ -245,7 +321,16 @@ See [TEST_PATTERNS.md](./docs/TEST_PATTERNS.md) for the full testing guide.
 
 - [ ] `npm run build` succeeds
 - [ ] `npm test` passes
+- [ ] `npm run test:web` passes (if you touched `src/web`)
+- [ ] `npm run test:e2e` passes (if you changed the dashboard UI; CI runs it too, against the `-linux` baselines — see [The three suites](#the-three-suites) for re-recording them)
+- [ ] `npx tsc -p tsconfig.web.json` passes (if you touched `src/web`; `npm run build` checks source only)
+- [ ] `npx tsc -p tsconfig.tools.json` passes (if you touched `scripts/`, `e2e/` or a root `*.config.ts`)
 - [ ] `npm run lint` passes
+- [ ] `npm run format:check` passes (the `pre-commit` hook runs this too)
+- [ ] `npm run lint:shell` passes (if you touched a script under `.claude/skills/`; the `pre-commit` hook runs this too)
+- [ ] `npm run check:test-ownership` passes (if you added, moved or renamed a test file, or touched `jest.config.ts`, `vitest.config.ts` or a `test:*` script)
+- [ ] `package-lock.json` is unchanged by `npm install --package-lock-only` unless you changed dependencies
+- [ ] You added a changeset if the PR changes anything that ships, and left the version, `CHANGELOG.md`, and other PRs' pending changesets alone (see [Changesets](#changesets); CI's `changeset` job checks all three)
 - [ ] You've reviewed your own diff
 
 ---
@@ -257,7 +342,7 @@ See [TEST_PATTERNS.md](./docs/TEST_PATTERNS.md) for the full testing guide.
 1. Fork the repo on GitHub
 2. Clone your fork: `git clone https://github.com/<your-username>/preflight`
 3. Create a branch: `git checkout -b fix/my-fix`
-4. Make your changes, run `npm test` and `npm run lint`
+4. Make your changes, then run the checks in [Before opening a PR](#before-opening-a-pr)
 5. Push to your fork and open a PR against `main`
 
 ### Commit messages
@@ -277,6 +362,125 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
 ### Branches
 
 Use descriptive branch names: `yourname/short-description` or `fix/issue-description`.
+
+### Changesets
+
+A PR never bumps Preflight's version or edits `CHANGELOG.md`; only the release PR does (see
+[Releasing](#releasing)). Instead, the PR adds a changeset: a Markdown file in
+[`.changeset/`](./.changeset/) that names the semver bump the change needs and holds its
+CHANGELOG entry.
+
+```md
+---
+'@newrelic/preflight': minor
+---
+
+**Scripts and fleet tooling could read `preflight doctor` results only by parsing its
+human-readable output.** `preflight doctor --json` prints the checks as a JSON array on stdout,
+with the same exit codes as the human-readable mode.
+```
+
+Create one with `npx changeset`, which asks for the bump and the summary, or in one line with
+`npx changeset --patch @newrelic/preflight -m "..."` (or `--minor`, `--major`). You can also
+write the file by hand. If you do, give it a name that says what it's about, such as
+`.changeset/doctor-json-output.md`. Commit it along with the change it describes. A PR
+that makes several changes worth their own entries can add several changesets.
+
+Changesets don't conflict the way version bumps did. Every PR used to bump the version in five
+files and add its entry at the top of the CHANGELOG, so each merge put every other open PR in
+conflict. Each changeset is its own file, and the release PR is the only thing that bumps the
+version.
+
+**Which PRs need one.** CI's `changeset` job fails when a PR changes a file that ships and adds
+no changeset. The files that ship are listed under `changedFilePatterns` in
+`.changeset/config.json`: everything in `src/` except tests, the plugin and Kiro power, the data
+directories, `package.json`, `package-lock.json`, `server.json`, and `smithery.yaml`, plus the
+build config that shapes `dist/` (`tsconfig.json`, the two `tsconfig.web*.json` files,
+`vite.config.ts`, and `postcss.config.js`). The lockfile counts because the dashboard bundle in
+`dist/web` is built from the versions it pins.
+A PR that touches only docs, tests, CI, or scripts needs no changeset. If a PR changes a shipped
+file in a way users won't notice, such as bumping a devDependency that only the tests or the
+build use, add an empty changeset with `npx changeset --empty`. That satisfies the check
+without adding a CHANGELOG entry. The dashboard's own libraries (React, TanStack Query, and the
+rest of what Vite bundles) are devDependencies too, but bumping one changes what users get, so
+give it a `patch` changeset.
+
+Release only refuses to run past a pending changeset that bumps the version (see
+[Releasing](#releasing)). An empty changeset that merges after the release PR ships in that
+release without being mentioned, which is why it's only for changes users won't notice.
+
+**Picking the bump.** The release takes the highest bump among its pending changesets.
+
+- `patch`: fixes, and changes users won't notice.
+- `minor`: anything new a user can use, such as a config field, a CLI command or flag, an MCP
+  tool, an event type or attribute, or a dashboard view.
+- `major`: anything that breaks a working setup, such as removing or renaming a config field,
+  CLI flag, MCP tool, or event attribute that dashboards and alerts query, or raising the
+  minimum Node.js version.
+
+**Writing the entry.** Write it the way the existing CHANGELOG entries read: for someone who
+uses Preflight, about what changed for them and why, not how the code changed. A fix says what
+was wrong and what happens now. When an entry runs long, lead with one bolded sentence. The
+summary goes into the CHANGELOG exactly as written, and Prettier checks `.changeset/` files
+like any others, so run `npm run format` before committing.
+
+**Changing a changeset that's already on `main`.** Edit its text in place, raise its bump, or
+rename the file without changing it. CI fails a PR that deletes a pending changeset, empties
+it, or lowers its bump, since any of those quietly drops a change from the next release. A
+maintainer can merge over the check for a PR that reverts the change a changeset describes,
+or when a reviewer agrees a bump should be lower. CI also fails a PR whose own changeset it
+can't read, so write each bump as `'@newrelic/preflight': patch` (or `minor`, or `major`). If
+an unreadable one reaches `main` anyway, every PR fails and Release refuses to run until a PR
+fixes or removes it.
+
+### Releasing
+
+1. While `main` has changesets that need a release,
+   [`release-pr.yml`](./.github/workflows/release-pr.yml) keeps a **Chore: Release x.y.z** PR
+   open. It runs `npm run version-packages`, which bumps `package.json`, adds the CHANGELOG
+   entry, and deletes the changesets it used. Then `scripts/release-files.ts` copies the new
+   version into `package-lock.json`, `server.json`, and both plugin manifests, and dates the
+   entry. Each push to `main` rebuilds the PR, so to change an entry, edit its changeset on
+   `main` instead of pushing to the PR's branch. The entry's date is the day the PR was last
+   rebuilt. If that's stale, start the Release PR workflow on `main` from the Actions tab (Run
+   workflow) before merging. Don't use Re-run on an older run: a re-run builds from that
+   run's commit, so the PR would lose any changeset that landed since.
+2. Review the release PR, then close and reopen it right before you merge, and wait for CI.
+   GitHub doesn't let a PR opened by the built-in `GITHUB_TOKEN` start workflows, so CI
+   doesn't run on it by itself. A reopen runs CI on the PR merged into the current `main`, so
+   it also tests whatever landed after the PR was built, such as a new test that reads the
+   version files. Then merge it. Every push to `main` gives the PR a new head commit, which
+   drops its checks and its approval. When that happens, reopen it again and approve only once
+   CI passes: `main` requires the approval but not CI, so the approval is the only gate. Before
+   merging, also check the Actions tab: no Release PR run should be queued or in progress, and
+   the latest one shouldn't have failed, since until a run pushes, the PR still shows the old
+   commit's green checks. If a push lands
+   while the PR is closed, the workflow opens a new release PR instead; leave the old one
+   closed, and close and reopen the new one before merging it.
+3. Right after the release PR merges, run the Release workflow
+   ([`release.yml`](./.github/workflows/release.yml)) on `main` from the Actions tab. Run from
+   any other branch, it skips its job and publishes nothing. It checks that every version file
+   agrees (`npm run check:release-files`), tags `vX.Y.Z`, creates the
+   GitHub release, and publishes to npm, the Homebrew tap, and the MCP Registry.
+
+Release tags and publishes `main` as it stands when it runs. A changeset that merges after the
+release PR goes into the next release's CHANGELOG entry, so if Release ran after it, x.y.z
+would ship that change without mentioning it. Release refuses to run while `main` has such a
+changeset. When that happens, merge the next release PR, which release-pr.yml opens as soon as
+the changeset lands, and run Release then. That release also ships everything in x.y.z, which
+keeps its CHANGELOG entry but never reaches npm under its own number.
+
+If Release fails after tagging, for example at the npm publish, use **Re-run failed jobs** on
+that run, which uses the commit it started from. If only the Homebrew tap step failed, the run
+still finishes green (that step is allowed to fail, and shows a warning), so use **Re-run all
+jobs** instead; the steps already done skip themselves. Don't start a new run: by then `main`
+may have moved past the tagged commit, and Release refuses to run when the existing tag points
+at a different commit than the one it checked out, so it can't publish that commit under the
+tag's version. The GitHub release's notes are the version's CHANGELOG entry.
+
+If the Release PR workflow can't run, run `npm run version-packages` on a branch named
+`changeset-release/main` off `main`, commit the result, and open the PR yourself. CI's
+`changeset` job skips only that branch, since a release PR bumps the version.
 
 ---
 
@@ -300,7 +504,7 @@ The MCP server registers an adapter per AI coding platform and auto-detects the 
 
 Platform capabilities vary: some platforms expose a real hook mechanism that captures every built-in tool call, others only support MCP as a client (so Preflight can only see calls routed to its own MCP tools, not the platform's built-in file/shell tools).
 
-See **[docs/ADAPTERS.md](./docs/ADAPTERS.md)** for the full per-platform reference — integration mechanism, detection env vars, tool-name mapping, known gaps, and setup steps.
+See **[docs/ADAPTERS.md](https://newrelic-experimental.github.io/preflight/adapters/)** for the full per-platform reference — integration mechanism, detection env vars, tool-name mapping, known gaps, and setup steps.
 
 ---
 
@@ -389,7 +593,7 @@ After making changes, run through these checkpoints to confirm end-to-end behavi
 git clone https://github.com/newrelic-experimental/preflight
 cd preflight
 nvm use
-npm install
+npm ci
 npm run build
 npm link
 ```

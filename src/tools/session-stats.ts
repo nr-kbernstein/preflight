@@ -16,6 +16,7 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import { createLogger } from '../shared/index.js';
+import { redactSensitive } from '../config.js';
 import { VERSION } from '../version.js';
 
 const logger = createLogger('session-stats');
@@ -49,11 +50,18 @@ import type { InstructionDriftTracker } from '../metrics/instruction-drift-track
 import type { ToolSelectionScorer } from '../metrics/tool-selection-scorer.js';
 import type { QualityProxyTracker } from '../metrics/quality-proxy-tracker.js';
 import type { ApiFailureTracker } from '../metrics/api-failure-tracker.js';
+import type { SessionResumeTracker } from '../metrics/session-resume-tracker.js';
 import type { TurnCostAttributor } from '../metrics/turn-cost-attributor.js';
 import type { TurnTracker } from '../metrics/turn-tracker.js';
+import type { GitActivityRecord } from '../metrics/git-activity-recorder.js';
 import type { GitEfficiencyTracker } from '../metrics/git-efficiency-tracker.js';
+import { resolveScopeParam, resolveWindowParam } from '../metrics/git-window-params.js';
+import type { ScopeRef } from '../metrics/git-workspace-report.js';
+import type { GitWorkspaceReportWithWindow } from '../metrics/git-workspace-reporter.js';
 import { registerAnalyticsTools } from './analytics-tools.js';
 import { registerExtendedAnalyticsTools } from './extended-analytics-tools.js';
+import { registerGenericMcpTools } from './generic-mcp-tools.js';
+import type { GenericMcpAdapter } from '../platforms/generic-mcp-adapter.js';
 import {
   requireTracker,
   requireAvailable,
@@ -80,7 +88,7 @@ const SESSION_STATS_TOOL = {
 const HEALTH_TOOL = {
   name: 'nr_observe_health',
   description:
-    'Check server health: version, uptime, session ID, and connection timestamp. Use when the MCP connection feels stale or tools are behaving unexpectedly.',
+    'Check server health: version, uptime, session ID, and connection timestamp. Also reports whether telemetry event sends are succeeding. Use when the MCP connection feels stale or tools are behaving unexpectedly.',
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -118,7 +126,7 @@ const SESSION_TIMELINE_TOOL = {
 const COST_PER_TOOL_TOOL = {
   name: 'nr_observe_get_cost_per_tool',
   description:
-    'Cost attribution per tool type — approximate, based on turn-level token correlation. Shows which tools cost the most and average cost per call.',
+    'Cost attribution per tool type — approximate, based on turn-level token correlation. Shows which tools cost the most and average cost per call. Also breaks Skill calls down per skill in costBySkill (calls, estimated cost and tokens, total duration).',
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -140,7 +148,7 @@ const TURN_ANALYSIS_TOOL = {
 const INSTALL_HOOKS_TOOL = {
   name: 'nr_observe_install_hooks',
   description:
-    'Install PreToolUse and PostToolUse monitoring hooks into ~/.claude/settings.json. ' +
+    'Install PreToolUse, PostToolUse, PermissionRequest, and PermissionDenied monitoring hooks into ~/.claude/settings.json. ' +
     'Call when nr_observe_health reports hooks_installed: false. ' +
     'Requires a Claude Code restart to activate monitoring.',
   inputSchema: { type: 'object' as const, properties: {} },
@@ -167,7 +175,13 @@ export function handleGetSessionStats(sessionTracker: SessionTracker, sessionTra
   const stats = {
     session_trace_id: sessionTraceId ?? null,
     session_id: metrics.sessionId,
-    session_name: metrics.sessionName ?? null,
+    // The name can be an ai-title or a user-given title (not just a directory
+    // basename), so redact before it leaves the process.
+    session_name: metrics.sessionName ? redactSensitive(metrics.sessionName) : null,
+    session_name_source: metrics.sessionNameSource ?? null,
+    // Intent is SENSITIVE content; non-null only when recordContent was on at
+    // capture. Redact again (idempotent) before it leaves the process.
+    session_intent: metrics.sessionIntent ? redactSensitive(metrics.sessionIntent) : null,
     session_duration_ms: metrics.sessionDurationMs,
     tool_calls: metrics.toolCallCount,
     tool_calls_by_type: metrics.toolCallCountByTool,
@@ -209,6 +223,11 @@ export function handleHealth(options: {
   developer?: string;
   sessionId?: string;
   hooksInstalledFn?: () => boolean;
+  eventSendHealth?: {
+    consecutiveFailures: number;
+    lastFailureAt: number | null;
+    lastSuccessAt: number | null;
+  };
 }): { content: [{ type: 'text'; text: string }] } {
   const nowMs = Date.now();
   const startMs = options.sessionStartMs ?? nowMs;
@@ -228,6 +247,11 @@ export function handleHealth(options: {
   if (hooksInstalled !== undefined) {
     payload.hooks_installed = hooksInstalled;
     payload.setup_required = !hooksInstalled;
+  }
+
+  if (options.eventSendHealth !== undefined) {
+    payload.event_send_status = options.eventSendHealth.consecutiveFailures > 0 ? 'failing' : 'ok';
+    payload.consecutive_event_send_failures = options.eventSendHealth.consecutiveFailures;
   }
 
   return {
@@ -305,6 +329,7 @@ export interface ConfigSummary {
   readonly storagePath: string;
   readonly dashboardUrl: string;
   readonly configFilePath: string;
+  readonly companionMode: boolean;
 }
 
 export function handleGetConfig(configSummary: ConfigSummary): {
@@ -330,7 +355,18 @@ const GIT_EFFICIENCY_TOOL = {
     'Get Git workflow efficiency metrics: merge conflicts, aborted operations, force pushes, stale branch detection, and actionable suggestions to reduce Git friction.',
   inputSchema: {
     type: 'object' as const,
-    properties: {},
+    properties: {
+      window: {
+        type: 'string',
+        description:
+          "Time window: 'today' (default), 'yesterday', 'week', or a number of days back.",
+      },
+      scope: {
+        type: 'string',
+        description:
+          "Scope: 'all' (default), 'repo:<id>', or 'worktree:<id>' (ids come from a prior response's rows).",
+      },
+    },
   },
   annotations: { readOnlyHint: true },
 };
@@ -343,6 +379,31 @@ export function handleGetGitEfficiency(tracker: GitEfficiencyTracker): {
       {
         type: 'text' as const,
         text: JSON.stringify(tracker.getMetrics(), null, 2),
+      },
+    ],
+  };
+}
+
+export function handleGetGitWorkspaceReport(
+  reporter: {
+    report(input: {
+      scope: ScopeRef;
+      since: number;
+      until: number;
+      historical?: readonly GitActivityRecord[];
+    }): GitWorkspaceReportWithWindow;
+  },
+  args: { window?: unknown; scope?: unknown } | undefined,
+): { content: [{ type: 'text'; text: string }] } {
+  const { since, until } = resolveWindowParam(
+    typeof args?.window === 'string' ? args.window : null,
+  );
+  const scope = resolveScopeParam(typeof args?.scope === 'string' ? args.scope : null);
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(reporter.report({ scope, since, until }), null, 2),
       },
     ],
   };
@@ -381,9 +442,27 @@ export interface ToolRegistrationOptions {
   toolCallBuffer?: { getRecords(): readonly import('../storage/types.js').ToolCallRecord[] };
   qualityProxyTracker?: QualityProxyTracker;
   apiFailureTracker?: ApiFailureTracker;
+  sessionResumeTracker?: SessionResumeTracker;
   turnCostAttributor?: TurnCostAttributor;
   turnTracker?: TurnTracker;
   gitEfficiencyTracker?: GitEfficiencyTracker;
+  gitWorkspaceReporter?: {
+    report(input: {
+      scope: ScopeRef;
+      since: number;
+      until: number;
+      historical?: readonly GitActivityRecord[];
+    }): GitWorkspaceReportWithWindow;
+  };
+  genericMcpAdapter?: GenericMcpAdapter;
+  nrIngestManager?: {
+    ingestToolCall(record: import('../storage/types.js').ToolCallRecord): void;
+    getEventSendHealth?(): {
+      consecutiveFailures: number;
+      lastFailureAt: number | null;
+      lastSuccessAt: number | null;
+    };
+  };
   sessionTraceId?: string;
   sessionStartMs?: number;
   accountId?: string;
@@ -414,6 +493,7 @@ function registerCoreTools(deps: ToolRegistrationOptions): RegisteredToolSet {
           developer: deps.developer,
           sessionId: deps.sessionTracker?.getMetrics().sessionId,
           hooksInstalledFn: deps.hooksInstalledFn,
+          eventSendHealth: deps.nrIngestManager?.getEventSendHealth?.(),
         }),
     },
     {
@@ -470,11 +550,14 @@ function registerCoreTools(deps: ToolRegistrationOptions): RegisteredToolSet {
     },
     {
       definition: GIT_EFFICIENCY_TOOL,
-      available: !!deps.gitEfficiencyTracker,
-      handle: () => {
-        const check = requireTracker(deps.gitEfficiencyTracker, 'GitEfficiencyTracker');
-        if (!check.ok) return check.result;
-        return handleGetGitEfficiency(check.value);
+      available: !!deps.gitWorkspaceReporter,
+      handle: (args) => {
+        const missing = requireAvailable(
+          !!deps.gitWorkspaceReporter,
+          'GitWorkspaceReporter not available',
+        );
+        if (missing) return missing;
+        return handleGetGitWorkspaceReport(deps.gitWorkspaceReporter!, args);
       },
     },
     {
@@ -572,6 +655,7 @@ export function registerTools(server: Server, options: ToolRegistrationOptions):
     registerCrossSessionTools(options),
     registerAnalyticsTools(options),
     registerExtendedAnalyticsTools(options),
+    registerGenericMcpTools(options),
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));

@@ -222,6 +222,35 @@ describe('parseToolSpecificFields', () => {
     });
   });
 
+  describe('PowerShell parser', () => {
+    // PowerShell is a real, first-party Claude Code tool on native Windows —
+    // auto-enabled without Git Bash, opt-in via CLAUDE_CODE_USE_POWERSHELL_TOOL
+    // elsewhere (code.claude.com/docs/en/tools-reference, /setup, /env-vars).
+    // It carries the same command/description/timeout/run_in_background input
+    // shape as Bash, so it should get the same parsing.
+    it('extracts command and description, same as Bash', () => {
+      const input = { command: 'Get-Process', description: 'List processes' };
+      const fields = parseToolSpecificFields('PowerShell', input, undefined);
+
+      expect(fields.command).toBe('Get-Process');
+      expect(fields.commandDescription).toBe('List processes');
+    });
+
+    it('extracts timeout and run_in_background', () => {
+      const input = { command: 'npm start', timeout: 30000, run_in_background: true };
+      const fields = parseToolSpecificFields('PowerShell', input, undefined);
+
+      expect(fields.commandTimeout).toBe(30000);
+      expect(fields.runInBackground).toBe(true);
+    });
+
+    it('attaches bashCategory / bashLeading from the same classifier as Bash', () => {
+      const fields = parseToolSpecificFields('PowerShell', { command: 'git status' }, undefined);
+      expect(fields.bashCategory).toBe('git');
+      expect(fields.bashLeading).toBe('git');
+    });
+  });
+
   describe('Grep parser', () => {
     it('extracts pattern, grepPath, and outputMode', () => {
       const input = { pattern: 'TODO', path: '/src', output_mode: 'content' };
@@ -313,6 +342,47 @@ describe('parseToolSpecificFields', () => {
     });
   });
 
+  describe('Skill parser', () => {
+    it('maps skill → skillName and argsLength → skillArgsLength', () => {
+      const input = { skill: 'code-review', argsLength: 42 };
+      const fields = parseToolSpecificFields('Skill', input, undefined);
+
+      expect(fields.skillName).toBe('code-review');
+      expect(fields.skillArgsLength).toBe(42);
+    });
+
+    it('computes argsLength from raw args string when argsLength is absent', () => {
+      const input = { skill: 'pstack:how', args: 'How does this work?' };
+      const fields = parseToolSpecificFields('Skill', input, undefined);
+
+      expect(fields.skillName).toBe('pstack:how');
+      expect(fields.skillArgsLength).toBe('How does this work?'.length);
+    });
+
+    it('does not include args text in output, only length', () => {
+      const input = { skill: 'design', args: 'Create a button component' };
+      const fields = parseToolSpecificFields('Skill', input, undefined);
+
+      expect(fields.skillArgsLength).toBe('Create a button component'.length);
+      expect(Object.values(fields).includes('Create a button component')).toBe(false);
+    });
+
+    it('returns empty when skill is not a string', () => {
+      const input = { skill: 123, args: 'test' };
+      const fields = parseToolSpecificFields('Skill', input, undefined);
+
+      expect(fields.skillName).toBeUndefined();
+    });
+
+    it('handles lowercase "skill" tool name via capitalize fallback', () => {
+      const input = { skill: 'foo', args: 'bar' };
+      const fields = parseToolSpecificFields('skill', input, undefined);
+
+      expect(fields.skillName).toBe('foo');
+      expect(fields.skillArgsLength).toBe(3);
+    });
+  });
+
   describe('Bash output parser', () => {
     it('extracts exitCode from tool response', () => {
       const input = { command: 'npm test' };
@@ -321,6 +391,20 @@ describe('parseToolSpecificFields', () => {
 
       expect(fields.exitCode).toBe(0);
       expect(fields.command).toBe('npm test');
+    });
+
+    it('carries the created PR number through, and drops a non-numeric one', () => {
+      const cmd = { command: 'gh pr create --fill' };
+      expect(parseToolSpecificFields('Bash', cmd, { createdPrNumber: '42' }).createdPrNumber).toBe(
+        '42',
+      );
+      expect(
+        parseToolSpecificFields('Bash', cmd, { createdPrNumber: '4x' }).createdPrNumber,
+      ).toBeUndefined();
+      expect(
+        parseToolSpecificFields('mcp__github__create_pull_request', {}, { createdPrNumber: '57' })
+          .createdPrNumber,
+      ).toBe('57');
     });
 
     it('extracts non-zero exitCode', () => {
@@ -426,6 +510,19 @@ describe('parseToolSpecificFields', () => {
     it('returns empty fields when output is null', () => {
       const fields = parseToolSpecificFields('Agent', { prompt: 'x' }, null);
       expect(fields.agentCompleted).toBeUndefined();
+    });
+
+    it('captures the spawned agentId from the extractOutputMeta-shaped output', () => {
+      const fields = parseToolSpecificFields(
+        'Agent',
+        { prompt: 'Do work' },
+        {
+          spawnedAgentId: 'a4d2c8f1e0b3a297',
+          agentCompleted: true,
+        },
+      );
+
+      expect(fields.spawnedAgentId).toBe('a4d2c8f1e0b3a297');
     });
   });
 

@@ -26,11 +26,17 @@ import { VERSION } from '../version.js';
 import type { ToolCallRecord, SubagentTokenEvent } from '../storage/types.js';
 import type { ProxyToolCallRecord, ProxyRequestRecord } from '../proxy/types.js';
 import type { AiCodingTask } from '../metrics/task-detector.js';
+import type { OutcomeType } from '../metrics/cost-per-outcome.js';
+import { CostPerOutcomeAnalyzer } from '../metrics/cost-per-outcome.js';
 import type { WorkflowRunMetrics } from '../metrics/workflow-run-tracker.js';
 import type { AntiPattern } from '../metrics/anti-patterns.js';
+import type { ThrashingAlert } from '../metrics/retry-detector.js';
 import type { SessionTracker } from '../metrics/session-tracker.js';
 import type { CostTracker } from '../metrics/cost-tracker.js';
+import type { GitEfficiencyTracker } from '../metrics/git-efficiency-tracker.js';
 import type { EfficiencyScorer } from '../metrics/efficiency-score.js';
+import type { ApiFailureTracker } from '../metrics/api-failure-tracker.js';
+import { classifyProvider } from '../metrics/model-provider.js';
 import type { FeedbackCollector } from '../tools/workflow-tools.js';
 import type { BudgetThresholdEvent } from '../metrics/budget-tracker.js';
 import type { ContextTurnSnapshot, ToolContextContribution } from '../metrics/context-tracker.js';
@@ -41,9 +47,13 @@ import {
   securityAlertToNrEvent,
 } from '../security/index.js';
 import type { AuditRecord } from '../security/index.js';
-import type { TurnCostAttributor } from '../metrics/turn-cost-attributor.js';
+import type { TurnCostAttributor, ClosedTurn } from '../metrics/turn-cost-attributor.js';
 import type { LocalStore } from '../storage/index.js';
 import { LogIngestManager } from './log-ingest.js';
+import { TierRouter } from './tier-router.js';
+import { DEFAULT_TIER_NAME, WILDCARD_EVENT_TYPE } from './tier-types.js';
+import type { ResolvedTier } from './tier-types.js';
+import { TierLocalWriter } from '../storage/tier-local-writer.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -101,9 +111,14 @@ export interface NrIngestOptions {
   efficiencyScorer?: EfficiencyScorer;
   /** Feedback collector for emitting ai.feedback.count metrics. */
   feedbackCollector?: FeedbackCollector;
+  /** API failure tracker for emitting ai.api.* metrics. */
+  apiFailureTracker?: ApiFailureTracker;
+  /** Git efficiency tracker for emitting ai.git.* metrics. */
+  gitEfficiencyTracker?: GitEfficiencyTracker;
   teamId?: string | null;
   projectId?: string | null;
   orgId?: string | null;
+  repoUrl?: string | null;
   /** OTLP/HTTP endpoint URL. When set, telemetry is also exported via OTLP. */
   otlpEndpoint?: string | null;
   /** Additional HTTP headers for the OTLP exporter. */
@@ -121,6 +136,27 @@ export interface NrIngestOptions {
    * reporting `duration_ms≈604800000` with file-activity counts stuck at 0).
    */
   trackSessionGauges?: boolean;
+  /**
+   * When true, `emitSessionGauges()` suppresses the `ai.cost.*` gauge family
+   * and cost-bearing Claude-Code-sourced events are tagged
+   * `cost_authority: 'external'` instead of dropped. Set this when the same
+   * org also enables Claude Code's built-in OTel export, so a blended
+   * "org AI spend" dashboard doesn't double the true cost (the two exports
+   * share `session_id` === OTel's `session.id`). Default false.
+   */
+  companionMode?: boolean;
+  /**
+   * Multi-tier telemetry routing. Threaded from `config.tiers`.
+   * Absent or empty → one implicit `default` tier is synthesized from
+   * `licenseKey` + `transportOptions.accountId`, reproducing the existing
+   * single-scheduler behavior exactly.
+   *
+   * The FIRST nr-type tier in array order is the **primary tier**: it carries
+   * the aggregated Metric API stream, the NR Logs API audit entries, the OTLP
+   * bridge/transport, and the `getEventSendHealth()` counters. At least one
+   * nr-type tier is required.
+   */
+  tiers?: readonly ResolvedTier[];
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +178,8 @@ const STANDARD_KEYS = new Set([
   'outputSizeBytes',
   'inputHash',
   'platform',
+  'agentId',
+  'agentType',
 ]);
 
 /**
@@ -165,7 +203,23 @@ const REDACT_FIELD_KEYS = new Set([
   'grepPath',
   'globPath',
   'agentTeamName',
+  'skillName',
 ]);
+
+export function attachTeamAttribution(
+  event: NrEventData,
+  attrs: {
+    teamId?: string | null;
+    projectId?: string | null;
+    orgId?: string | null;
+    repoUrl?: string | null;
+  },
+): void {
+  if (attrs.teamId) event.team_id = attrs.teamId;
+  if (attrs.projectId) event.project_id = attrs.projectId;
+  if (attrs.orgId) event.org_id = attrs.orgId;
+  if (attrs.repoUrl) event.repo_url = attrs.repoUrl;
+}
 
 /**
  * Convert a ToolCallRecord into a flat NR event object.
@@ -182,10 +236,12 @@ export function toolCallToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
   },
 ): NrEventData {
   const event: NrEventData = {
     eventType: 'AiToolCall',
+    event_version: 1,
     timestamp: record.timestamp,
     tool: record.toolName,
     tool_use_id: record.toolUseId,
@@ -194,9 +250,7 @@ export function toolCallToNrEvent(
     app_name: attrs.appName,
   };
 
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
 
   if (attrs.sessionTraceId != null) event.session_id = attrs.sessionTraceId;
   if (record.durationMs != null) event.duration_ms = record.durationMs;
@@ -208,6 +262,8 @@ export function toolCallToNrEvent(
   if (record.inputSizeBytes != null) event.input_size_bytes = record.inputSizeBytes;
   if (record.outputSizeBytes != null) event.output_size_bytes = record.outputSizeBytes;
   if (record.inputHash != null) event.input_hash = record.inputHash;
+  if (typeof record.agentId === 'string') event.agent_id = record.agentId;
+  if (typeof record.agentType === 'string') event.agent_type = record.agentType;
 
   // Platform attribution — defaults to 'claude-code' for backward compatibility
   event.platform = typeof record.platform === 'string' ? record.platform : 'claude-code';
@@ -250,10 +306,12 @@ export function proxyToolCallToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
   },
 ): NrEventData {
   const event: NrEventData = {
     eventType: 'AiMcpToolCall',
+    event_version: 1,
     timestamp: record.timestamp,
     server: record.serverName,
     tool: record.toolName,
@@ -264,9 +322,7 @@ export function proxyToolCallToNrEvent(
     app_name: attrs.appName,
   };
 
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
 
   // Prefer the record's own per-connection sessionId (the real per-client
   // identity — see ProxyManager.resolveSessionId) over the process-wide
@@ -293,10 +349,12 @@ export function proxyRequestToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
   },
 ): NrEventData {
   const event: NrEventData = {
     eventType: 'AiProxyRequest',
+    event_version: 1,
     timestamp: record.timestamp,
     server: record.serverName,
     method: record.method,
@@ -307,9 +365,7 @@ export function proxyRequestToNrEvent(
     app_name: attrs.appName,
   };
 
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
 
   if (record.proxyOverheadMs != null) event.proxy_overhead_ms = record.proxyOverheadMs;
   if (record.responseSizeBytes != null) event.response_size_bytes = record.responseSizeBytes;
@@ -332,6 +388,13 @@ export function codingTaskToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
+    /** See `NrIngestOptions.companionMode`. */
+    companionMode?: boolean;
+    /** Outcome classification from `CostPerOutcomeAnalyzer.classifyOutcome()`. */
+    outcomeType?: OutcomeType;
+    /** Model active when the task completed, from `CostTracker.getMetrics().model`. */
+    model?: string | null;
   },
 ): NrEventData {
   const firstRecord = task.toolCalls[0];
@@ -339,6 +402,7 @@ export function codingTaskToNrEvent(
 
   const event: NrEventData = {
     eventType: 'AiCodingTask',
+    event_version: 1,
     timestamp: task.endTime,
     task_id: task.taskId,
     developer: attrs.developer,
@@ -366,14 +430,20 @@ export function codingTaskToNrEvent(
     sub_agents_spawned: task.subAgentsSpawned,
   };
 
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
+  if (attrs.outcomeType) event.outcome_type = attrs.outcomeType;
+  if (attrs.model) event.model = attrs.model;
 
   // sessionTraceId is the resolved Claude Code session_id; the
   // firstRecord?.sessionId fallback was only meaningful when the MCP fabricated
   // its own UUID and lost cross-reference with the tool-call records.
   if (attrs.sessionTraceId != null) event.session_id = attrs.sessionTraceId;
+
+  // Only claude-code-platform cost has an OTel twin to reconcile against —
+  // other platforms' cost fields have no double-count to flag.
+  if (attrs.companionMode && platform === 'claude-code') {
+    event.cost_authority = 'external';
+  }
 
   return event;
 }
@@ -403,7 +473,13 @@ export interface ScriptWorkflowRunMetrics {
   readonly status: string;
   readonly default_model: string;
   readonly started_at: number;
-  readonly duration_ms: number;
+  /**
+   * `null` when the on-disk rollup has no numeric `durationMs` yet (e.g. a
+   * run still in progress or killed before it wrote one) — distinct from a
+   * confirmed 0ms run. See `WorkflowRunRow.duration_ms`'s docstring
+   * (`workflow-store.ts`) for the same distinction on the read side.
+   */
+  readonly duration_ms: number | null;
   readonly agent_count: number;
   /** Re-derived from sum of subagent JSONL usage; falls back to rollup totalTokens. */
   readonly total_tokens: number;
@@ -425,6 +501,11 @@ export interface ScriptWorkflowRunMetrics {
 export interface SubagentTurnMetrics {
   readonly workflow_run_id: string | null;
   readonly agent_id: string;
+  /**
+   * Best-effort subagent type — see `TokenRecordContext.agentType` in
+   * cost-tracker.ts. Absent when no type has been seen yet for this agent.
+   */
+  readonly agent_type?: string;
   readonly parent_session_id: string;
   readonly message_id: string;
   readonly turn_uuid: string;
@@ -464,6 +545,9 @@ export function subagentTurnToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
+    /** See `NrIngestOptions.companionMode`. */
+    companionMode?: boolean;
   },
 ): NrEventData {
   const event: NrEventData = {
@@ -490,9 +574,11 @@ export function subagentTurnToNrEvent(
   if (metrics.usd !== null) event.usd = metrics.usd;
   if (metrics.stop_reason !== null) event.stop_reason = metrics.stop_reason;
   if (metrics.schema_fingerprint) event.schema_fingerprint = metrics.schema_fingerprint;
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  if (metrics.agent_type) event.agent_type = metrics.agent_type;
+  attachTeamAttribution(event, attrs);
+  // Subagent turns are always derived from a Claude Code transcript — no
+  // platform check needed, unlike codingTaskToNrEvent.
+  if (attrs.companionMode) event.cost_authority = 'external';
   return event;
 }
 
@@ -510,6 +596,9 @@ export function subagentTokenEventToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
+    /** See `NrIngestOptions.companionMode`. */
+    companionMode?: boolean;
   },
 ): NrEventData {
   const ev: NrEventData = {
@@ -529,9 +618,10 @@ export function subagentTokenEventToNrEvent(
     app_name: attrs.appName,
   };
   if (event.workflowRunId != null) ev.workflow_run_id = event.workflowRunId;
-  if (attrs.teamId) ev.team_id = attrs.teamId;
-  if (attrs.projectId) ev.project_id = attrs.projectId;
-  if (attrs.orgId) ev.org_id = attrs.orgId;
+  attachTeamAttribution(ev, attrs);
+  // Subagent token events are always derived from a Claude Code transcript —
+  // no platform check needed, unlike codingTaskToNrEvent.
+  if (attrs.companionMode) ev.cost_authority = 'external';
   return ev;
 }
 
@@ -543,12 +633,18 @@ export function scriptWorkflowRunToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
+    /** See `NrIngestOptions.companionMode`. */
+    companionMode?: boolean;
   },
 ): NrEventData {
   const event: NrEventData = {
     eventType: 'AiWorkflowRun',
     event_version: 1,
-    timestamp: metrics.started_at + metrics.duration_ms,
+    // duration_ms can be null (unfinished/killed run); fall back to 0 for
+    // this derived timestamp only — the event's own duration_ms field below
+    // still omits the value entirely rather than reporting a false 0.
+    timestamp: metrics.started_at + (metrics.duration_ms ?? 0),
     run_source: 'script',
     workflow_run_id: metrics.workflow_run_id,
     // Declarative metadata: NOT redacted. meta.name is author-declared
@@ -558,7 +654,6 @@ export function scriptWorkflowRunToNrEvent(
     status: metrics.status,
     default_model: metrics.default_model,
     started_at: metrics.started_at,
-    duration_ms: metrics.duration_ms,
     agent_count: metrics.agent_count,
     total_tokens: metrics.total_tokens,
     observed_phases: metrics.observed_phases,
@@ -568,15 +663,17 @@ export function scriptWorkflowRunToNrEvent(
     developer: attrs.developer,
     app_name: attrs.appName,
   };
+  if (metrics.duration_ms !== null) event.duration_ms = metrics.duration_ms;
   if (metrics.task_id !== null) event.task_id = metrics.task_id;
   if (metrics.declared_phases !== null) event.declared_phases = metrics.declared_phases;
   if (metrics.total_usd !== null) event.total_usd = metrics.total_usd;
   if (metrics.token_reconciliation_delta !== null) {
     event.token_reconciliation_delta = metrics.token_reconciliation_delta;
   }
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
+  // Script-driven workflow runs are always derived from a Claude Code
+  // transcript — no platform check needed, unlike codingTaskToNrEvent.
+  if (attrs.companionMode) event.cost_authority = 'external';
   return event;
 }
 
@@ -588,6 +685,7 @@ export function observabilityHealthToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
   },
 ): NrEventData {
   const event: NrEventData = {
@@ -614,9 +712,7 @@ export function observabilityHealthToNrEvent(
   if (typeof metrics.cost_self_check_delta_pct === 'number') {
     event.cost_self_check_delta_pct = metrics.cost_self_check_delta_pct;
   }
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
   return event;
 }
 
@@ -636,6 +732,9 @@ export function workflowRunToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
+    /** See `NrIngestOptions.companionMode`. */
+    companionMode?: boolean;
   },
 ): NrEventData {
   const event: NrEventData = {
@@ -671,15 +770,17 @@ export function workflowRunToNrEvent(
     event.exit_error = redactSensitive(metrics.exit_error);
   }
 
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
 
   // Prefer the resolved Claude Code session ID when threaded through the
   // manager (matches codingTaskToNrEvent); otherwise fall back to
   // the session ID baked into the tracker output.
   const resolvedSessionId = attrs.sessionTraceId ?? metrics.session_id;
   if (resolvedSessionId) event.session_id = resolvedSessionId;
+
+  // Agent-tool workflow runs are always derived from a Claude Code
+  // transcript — no platform check needed, unlike codingTaskToNrEvent.
+  if (attrs.companionMode) event.cost_authority = 'external';
 
   return event;
 }
@@ -700,12 +801,14 @@ export function antiPatternToNrEvent(
     teamId?: string | null;
     projectId?: string | null;
     orgId?: string | null;
+    repoUrl?: string | null;
     /** Detection wall-clock time in ms. Defaults to now if not provided. */
     detectedAt?: number;
   },
 ): NrEventData {
   const event: NrEventData = {
     eventType: 'AiAntiPattern',
+    event_version: 1,
     timestamp: attrs.detectedAt ?? Date.now(),
     // Field name is intentionally 'type' (not 'patternType') — used by all NRQL queries and dashboards. Do not rename.
     type: pattern.type,
@@ -716,9 +819,7 @@ export function antiPatternToNrEvent(
     suggestion: pattern.suggestion,
   };
 
-  if (attrs.teamId) event.team_id = attrs.teamId;
-  if (attrs.projectId) event.project_id = attrs.projectId;
-  if (attrs.orgId) event.org_id = attrs.orgId;
+  attachTeamAttribution(event, attrs);
 
   if (attrs.sessionId != null) event.session_id = attrs.sessionId;
   // pattern.file is sourced from raw call.filePath in detectThrashing, and
@@ -734,6 +835,116 @@ export function antiPatternToNrEvent(
   if (pattern.agentCount != null) event.agent_count = pattern.agentCount;
 
   return event;
+}
+
+/**
+ * Convert a ThrashingAlert into a flat NR event object.
+ *
+ * session_id comes from `attrs.sessionId` (the ingesting process's resolved
+ * sessionTraceId) — the same single-source-of-truth convention every other
+ * ingest*() method uses (see ingestAntiPattern, ingestToolCall). This is
+ * deliberately NOT `alert.sessionId`: that field exists for in-process
+ * attribution (the --local dashboard's per-session breakdown, which drains
+ * every session's buffer into one RetryDetector) and is a different concern
+ * from "which process is reporting this event to NR".
+ */
+export function retryAlertToNrEvent(
+  alert: ThrashingAlert,
+  attrs: {
+    developer: string;
+    appName: string;
+    sessionId?: string;
+    platform?: string;
+    teamId?: string | null;
+    projectId?: string | null;
+    orgId?: string | null;
+    repoUrl?: string | null;
+  },
+): NrEventData {
+  const event: NrEventData = {
+    eventType: 'AiRetryAlert',
+    timestamp: alert.timestamp,
+    tool_name: alert.toolName,
+    occurrences: alert.occurrences,
+    window_size: alert.windowSize,
+    similarity: alert.similarity,
+    tokens_wasted: alert.tokensWastedEstimate,
+    developer: attrs.developer,
+    app_name: attrs.appName,
+    platform: attrs.platform ?? 'claude-code',
+  };
+
+  attachTeamAttribution(event, attrs);
+  if (attrs.sessionId != null) event.session_id = attrs.sessionId;
+
+  return event;
+}
+
+/**
+ * One `AiTurnCost` row per tool call in a closed turn, each carrying the
+ * turn's cost and tokens split evenly. `tool_use_id` cross-references the
+ * call's `AiToolCall` row.
+ */
+export function turnCostToNrEvents(
+  turn: ClosedTurn,
+  attrs: {
+    developer: string;
+    appName: string;
+    sessionTraceId?: string;
+    teamId?: string | null;
+    projectId?: string | null;
+    orgId?: string | null;
+    companionMode?: boolean;
+  },
+): NrEventData[] {
+  const events: NrEventData[] = [];
+  const platform = turn.platform ?? 'claude-code';
+
+  for (const call of turn.calls) {
+    const event: NrEventData = {
+      eventType: 'AiTurnCost',
+      event_version: 1,
+      timestamp: turn.attribution.endTime,
+      turn_id: turn.id,
+      tool_use_id: call.toolUseId,
+      tool: call.toolName,
+      cost_usd: turn.attribution.costPerToolCall,
+      input_tokens: turn.attribution.inputTokens / turn.calls.length,
+      output_tokens: turn.attribution.outputTokens / turn.calls.length,
+      cache_read_tokens: turn.attribution.cacheReadTokens / turn.calls.length,
+      cache_creation_tokens: turn.attribution.cacheCreationTokens / turn.calls.length,
+      turn_cost_usd: turn.attribution.estimatedCostUsd,
+      turn_tool_call_count: turn.calls.length,
+      model: turn.attribution.model,
+      developer: attrs.developer,
+      app_name: attrs.appName,
+      platform,
+    };
+
+    if (call.skillName !== null) {
+      event.skillName = redactSensitive(call.skillName);
+    }
+
+    if (attrs.teamId) event.team_id = attrs.teamId;
+    if (attrs.projectId) event.project_id = attrs.projectId;
+    if (attrs.orgId) event.org_id = attrs.orgId;
+
+    // The turn's own session wins over this process's trace id for the same
+    // reason ingestToolCall() prefers the record's: a --local daemon's trace
+    // id is synthetic.
+    const sessionId = turn.attribution.sessionId ?? attrs.sessionTraceId;
+    if (sessionId != null) event.session_id = sessionId;
+
+    // Only an explicit claude-code stamp has an OTel twin to defer to; an
+    // unstamped turn keeps the display default above but is not tagged.
+    if (attrs.companionMode && turn.platform === 'claude-code') {
+      event.cost_authority = 'external';
+    }
+
+    events.push(event);
+  }
+
+  return events;
 }
 
 // ---------------------------------------------------------------------------
@@ -787,13 +998,23 @@ class DeveloperAttributedMetricAggregator extends MetricAggregator {
 // ---------------------------------------------------------------------------
 
 export class NrIngestManager {
-  private readonly scheduler: HarvestScheduler;
+  private readonly schedulers: Map<string, HarvestScheduler>;
+  private readonly localWriters: Map<string, TierLocalWriter>;
+  private readonly router: TierRouter;
+  /** First nr-type tier — carries metrics, logs, OTLP, and send-health. */
+  private readonly primaryScheduler: HarvestScheduler;
+  private readonly primaryTierName: string;
   private readonly logIngest: LogIngestManager;
   private readonly sessionTracker: SessionTracker;
   private readonly proxyMetrics: ProxyMetricsTracker;
   private readonly costTracker?: CostTracker;
+  // classifyOutcome() reads only the task it's given, so one shared instance
+  // with default options serves every ingest.
+  private readonly outcomeAnalyzer = new CostPerOutcomeAnalyzer();
   private readonly efficiencyScorer?: EfficiencyScorer;
   private readonly feedbackCollector?: FeedbackCollector;
+  private readonly apiFailureTracker?: ApiFailureTracker;
+  private readonly gitEfficiencyTracker?: GitEfficiencyTracker;
   readonly auditTrail: AuditTrailManager;
   private readonly developer: string;
   private readonly appName: string;
@@ -801,13 +1022,18 @@ export class NrIngestManager {
   private readonly teamId: string | null | undefined;
   private readonly projectId: string | null | undefined;
   private readonly orgId: string | null | undefined;
+  private readonly repoUrl: string | null | undefined;
   private readonly metricHarvestIntervalMs: number;
   private readonly turnCostAttributor?: TurnCostAttributor;
   private readonly otlpTransport: OtlpTransport | null;
   private readonly otlpEventBridge: OtlpEventBridge | null;
   private readonly trackSessionGauges: boolean;
+  private readonly companionMode: boolean;
   private sessionGaugeIntervalId: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private consecutiveEventSendFailures = 0;
+  private lastEventSendFailureAt: number | null = null;
+  private lastEventSendSuccessAt: number | null = null;
 
   constructor(options: NrIngestOptions) {
     this.developer = options.developer;
@@ -816,11 +1042,14 @@ export class NrIngestManager {
     this.teamId = options.teamId;
     this.projectId = options.projectId;
     this.orgId = options.orgId;
+    this.repoUrl = options.repoUrl;
     this.sessionTracker = options.sessionTracker;
     this.proxyMetrics = new ProxyMetricsTracker();
     this.costTracker = options.costTracker;
     this.efficiencyScorer = options.efficiencyScorer;
     this.feedbackCollector = options.feedbackCollector;
+    this.apiFailureTracker = options.apiFailureTracker;
+    this.gitEfficiencyTracker = options.gitEfficiencyTracker;
     this.turnCostAttributor = options.turnCostAttributor;
     this.auditTrail =
       options.auditTrail ??
@@ -831,6 +1060,7 @@ export class NrIngestManager {
       });
     this.metricHarvestIntervalMs = options.metricHarvestIntervalMs ?? 60_000;
     this.trackSessionGauges = options.trackSessionGauges ?? true;
+    this.companionMode = options.companionMode ?? false;
 
     let otlpTransport: OtlpTransport | null = null;
     let otlpEventBridge: OtlpEventBridge | null = null;
@@ -858,17 +1088,34 @@ export class NrIngestManager {
     // Wrap send functions so non-retryable 4xx failures (400, 403, etc.) are not
     // re-queued by HarvestScheduler. Returning success=true suppresses the requeue
     // without masking the original error — we log a warning before returning.
+    //
+    // One wrapper per tier so the tier name appears in the drop log. Only the
+    // primary tier moves the `getEventSendHealth()` counters: those describe
+    // "is this process's own telemetry landing", and a secondary team-account
+    // tier being unreachable must not make the primary look unhealthy.
     const rawSendEventsFn = options.sendEventsFn ?? sendEvents;
-    const classifyingEventsFn: SendEventsFn = async (events, licenseKey, opts) => {
-      const result = await rawSendEventsFn(events, licenseKey, opts);
-      if (!result.success && result.statusCode !== null && isNonRetryable4xx(result.statusCode)) {
-        logger.warn('Dropping non-retryable event batch', {
-          statusCode: result.statusCode,
-          batchSize: events.length,
-        });
-        return { ...result, success: true };
-      }
-      return result;
+    const makeClassifyingEventsFn = (tierName: string, isPrimary: boolean): SendEventsFn => {
+      return async (events, licenseKey, opts) => {
+        const result = await rawSendEventsFn(events, licenseKey, opts);
+        if (isPrimary) {
+          if (result.success) {
+            this.consecutiveEventSendFailures = 0;
+            this.lastEventSendSuccessAt = Date.now();
+          } else {
+            this.consecutiveEventSendFailures += 1;
+            this.lastEventSendFailureAt = Date.now();
+          }
+        }
+        if (!result.success && result.statusCode !== null && isNonRetryable4xx(result.statusCode)) {
+          logger.warn('Dropping non-retryable event batch', {
+            tier: tierName,
+            statusCode: result.statusCode,
+            batchSize: events.length,
+          });
+          return { ...result, success: true };
+        }
+        return result;
+      };
     };
 
     const rawSendMetricsFn = options.sendMetricsFn ?? sendMetrics;
@@ -890,27 +1137,168 @@ export class NrIngestManager {
       clientVersion: VERSION,
     };
 
-    this.scheduler = new HarvestScheduler({
-      licenseKey: options.licenseKey,
-      transportOptions,
-      eventHarvestIntervalMs: options.eventHarvestIntervalMs,
-      metricHarvestIntervalMs: options.metricHarvestIntervalMs,
-      sendEventsFn: classifyingEventsFn,
-      sendMetricsFn: classifyingMetricsFn,
-      otlpEventBridge: otlpEventBridge ?? undefined,
-      otlpTransport: otlpTransport ?? undefined,
-      transport: options.transport,
-      allowProcessExit: true,
-    });
+    // Absent/empty tiers → one implicit tier reproducing the existing
+    // single-scheduler behavior exactly (same licenseKey, same
+    // transportOptions, same OTLP objects, same transport mode).
+    const tiers: readonly ResolvedTier[] =
+      options.tiers !== undefined && options.tiers.length > 0
+        ? options.tiers
+        : [
+            {
+              name: DEFAULT_TIER_NAME,
+              destination: {
+                type: 'nr',
+                licenseKey: options.licenseKey,
+                accountId: options.transportOptions.accountId,
+              },
+              eventTypes: [WILDCARD_EVENT_TYPE],
+            },
+          ];
+
+    this.router = new TierRouter(tiers);
+    this.schedulers = new Map();
+    this.localWriters = new Map();
+
+    let primaryScheduler: HarvestScheduler | null = null;
+    let primaryTierName: string | null = null;
+    let primaryLicenseKey: string | null = null;
+    let primaryTransportOptions: TransportOptions | null = null;
+    const seenTierNames = new Set<string>();
+
+    for (const tier of tiers) {
+      // validateTiers() already rejects duplicate names at config load; this
+      // guard covers direct programmatic construction (several existing
+      // tests build a `tiers` array by hand, bypassing validateTiers()). Without
+      // it, `this.schedulers.set(tier.name, scheduler)` /
+      // `this.localWriters.set(tier.name, ...)` would silently let the second
+      // tier's scheduler/writer overwrite the first's, so events meant for two
+      // destinations would silently double up on whichever survives instead
+      // of reaching both — with no error.
+      if (seenTierNames.has(tier.name)) {
+        throw new Error(
+          `NrIngestManager received duplicate tier name "${tier.name}" — tier names must be unique.`,
+        );
+      }
+      seenTierNames.add(tier.name);
+
+      if (tier.destination.type === 'local') {
+        this.localWriters.set(
+          tier.name,
+          new TierLocalWriter({ tierName: tier.name, path: tier.destination.path }),
+        );
+        continue;
+      }
+
+      const isPrimary: boolean = primaryScheduler === null;
+      const tierTransportOptions: TransportOptions = {
+        ...transportOptions,
+        accountId: tier.destination.accountId,
+      };
+      const scheduler: HarvestScheduler = new HarvestScheduler({
+        licenseKey: tier.destination.licenseKey,
+        transportOptions: tierTransportOptions,
+        eventHarvestIntervalMs: options.eventHarvestIntervalMs,
+        metricHarvestIntervalMs: options.metricHarvestIntervalMs,
+        sendEventsFn: makeClassifyingEventsFn(tier.name, isPrimary),
+        sendMetricsFn: classifyingMetricsFn,
+        // Per-tier OTLP is an explicit non-goal — OTLP stays bound to the
+        // primary tier, so secondary tiers are NR-events-only.
+        otlpEventBridge: isPrimary ? (otlpEventBridge ?? undefined) : undefined,
+        otlpTransport: isPrimary ? (otlpTransport ?? undefined) : undefined,
+        transport: isPrimary ? options.transport : 'nr-events-api',
+        allowProcessExit: true,
+      });
+      this.schedulers.set(tier.name, scheduler);
+
+      if (isPrimary) {
+        primaryScheduler = scheduler;
+        primaryTierName = tier.name;
+        primaryLicenseKey = tier.destination.licenseKey;
+        primaryTransportOptions = tierTransportOptions;
+      }
+    }
+
+    if (
+      primaryScheduler === null ||
+      primaryTierName === null ||
+      primaryLicenseKey === null ||
+      primaryTransportOptions === null
+    ) {
+      // validateTiers() already enforces this at config load; this guard covers
+      // direct programmatic construction.
+      throw new Error(
+        'NrIngestManager requires at least one nr-type tier — the aggregated Metric API stream ' +
+          'and NR Logs API audit entries are delivered through the primary tier.',
+      );
+    }
+    this.primaryScheduler = primaryScheduler;
+    this.primaryTierName = primaryTierName;
 
     this.logIngest = new LogIngestManager({
-      licenseKey: options.licenseKey,
-      transportOptions,
+      licenseKey: primaryLicenseKey,
+      transportOptions: primaryTransportOptions,
       developer: options.developer,
       appName: options.appName,
       logHarvestIntervalMs: options.logHarvestIntervalMs,
       sendLogsFn: options.sendLogsFn,
     });
+  }
+
+  getEventSendHealth(): {
+    consecutiveFailures: number;
+    lastFailureAt: number | null;
+    lastSuccessAt: number | null;
+  } {
+    return {
+      consecutiveFailures: this.consecutiveEventSendFailures,
+      lastFailureAt: this.lastEventSendFailureAt,
+      lastSuccessAt: this.lastEventSendSuccessAt,
+    };
+  }
+
+  /**
+   * All configured tier names — NOT in overall declaration order. All
+   * nr-type tier names come first (in their own declaration order relative
+   * to each other), followed by all local-type tier names (likewise in
+   * their own relative declaration order). A local tier declared before an
+   * nr tier in config still appears after every nr tier here, because this
+   * reads `this.schedulers.keys()` (nr tiers) then `this.localWriters.keys()`
+   * (local tiers) — two separate maps keyed by destination type.
+   */
+  getTierNames(): readonly string[] {
+    return [...this.schedulers.keys(), ...this.localWriters.keys()];
+  }
+
+  /** The tier carrying metrics, logs, OTLP, and send-health. */
+  getPrimaryTierName(): string {
+    return this.primaryTierName;
+  }
+
+  /**
+   * Fan one NR event out to every tier whose `eventTypes` matches, in tier
+   * declaration order. The single choke point through which all ~15
+   * `ingestX()` methods emit events.
+   *
+   * The same event object is shared by reference across tiers — field-level
+   * redaction/projection per tier is an explicit non-goal (routing is
+   * event-type-level only). Neither `HarvestScheduler.addEvent()` nor
+   * `TierLocalWriter.addEvent()` mutates it.
+   *
+   * An event whose type matches no tier is dropped silently: a narrow tier
+   * list is a deliberate operator choice, and logging per dropped event would
+   * flood stderr at tool-call volume.
+   */
+  private routeEvent(event: NrEventData): void {
+    const rawEventType = event.eventType;
+    const eventType = typeof rawEventType === 'string' ? rawEventType : '';
+    for (const tierName of this.router.resolveEventType(eventType)) {
+      const scheduler = this.schedulers.get(tierName);
+      if (scheduler !== undefined) {
+        scheduler.addEvent(event);
+        continue;
+      }
+      this.localWriters.get(tierName)?.addEvent(event);
+    }
   }
 
   ingestProxyRequest(record: ProxyRequestRecord): void {
@@ -920,13 +1308,17 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
     });
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
 
     const server = record.serverName;
-    this.scheduler.recordMetric('ai.mcp.proxy_request_count', 1, { server, method: record.method });
+    this.primaryScheduler.recordMetric('ai.mcp.proxy_request_count', 1, {
+      server,
+      method: record.method,
+    });
     if (record.durationMs != null) {
-      this.scheduler.recordMetric('ai.mcp.proxy_request_duration_ms', record.durationMs, {
+      this.primaryScheduler.recordMetric('ai.mcp.proxy_request_duration_ms', record.durationMs, {
         server,
       });
     }
@@ -936,49 +1328,56 @@ export class NrIngestManager {
   }
 
   ingestToolCall(record: ToolCallRecord, auditRecord?: AuditRecord): void {
-    // Buffer event for NR Events API
+    // Buffer event for NR Events API. Prefer the record's own sessionId over
+    // this process's sessionTraceId: a scoped engine's own records always
+    // carry a sessionId matching its sessionTraceId anyway, but a record
+    // drained on behalf of an unowned session (e.g. --local's unscoped
+    // drainAllSessions, or a proxy client's own connection) carries its
+    // true, more specific sessionId — without this, every such record was
+    // silently re-attributed to this process's own session_id, making the
+    // real session's activity unqueryable under its own id.
     const event = toolCallToNrEvent(record, {
       developer: this.developer,
       appName: this.appName,
-      sessionTraceId: this.sessionTraceId,
+      sessionTraceId: record.sessionId ?? this.sessionTraceId,
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
     });
 
     // Cost attribution is available via the nr_observe_get_cost_per_tool MCP tool only.
     // Enriching NR events here would always produce null because the token event
     // (which finalizes turn cost) arrives asynchronously after ingestToolCall is called.
 
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
 
-    // Record per-call metrics for NR Metric API. Proxy calls carry their own
-    // per-connection sessionId (see ProxyManager.resolveSessionId) — prefer
-    // it over the process-wide sessionTraceId so metrics from concurrent
-    // proxy clients don't all collapse onto one fake session. Non-proxy
-    // records keep using sessionTraceId unchanged.
+    // Record per-call metrics for NR Metric API. Prefer the record's own
+    // sessionId (see the comment on the AiToolCall event above) — this also
+    // covers proxy calls' own per-connection sessionId (see
+    // ProxyManager.resolveSessionId), so metrics from concurrent proxy
+    // clients don't all collapse onto one fake session.
     const tool = record.toolName;
-    const sessionId = isProxyToolCall(record)
-      ? (record.sessionId ?? this.sessionTraceId)
-      : this.sessionTraceId;
+    const sessionId = record.sessionId ?? this.sessionTraceId;
     const teamDims: Record<string, string> = {};
     if (this.teamId) teamDims.team_id = this.teamId;
     if (this.projectId) teamDims.project_id = this.projectId;
     if (this.orgId) teamDims.org_id = this.orgId;
+    if (this.repoUrl) teamDims.repo_url = this.repoUrl;
 
-    this.scheduler.recordMetric(
+    this.primaryScheduler.recordMetric(
       'ai.tool.call_count',
       1,
       sessionId != null ? { tool, session_id: sessionId, ...teamDims } : { tool, ...teamDims },
     );
     if (record.durationMs != null) {
-      this.scheduler.recordMetric(
+      this.primaryScheduler.recordMetric(
         'ai.tool.duration_ms',
         record.durationMs,
         sessionId != null ? { tool, session_id: sessionId, ...teamDims } : { tool, ...teamDims },
       );
     }
-    this.scheduler.recordMetric(
+    this.primaryScheduler.recordMetric(
       'ai.tool.success',
       record.success ? 1 : 0,
       sessionId != null ? { tool, session_id: sessionId, ...teamDims } : { tool, ...teamDims },
@@ -993,8 +1392,9 @@ export class NrIngestManager {
         teamId: this.teamId,
         projectId: this.projectId,
         orgId: this.orgId,
+        repoUrl: this.repoUrl,
       });
-      this.scheduler.addEvent(proxyEvent);
+      this.routeEvent(proxyEvent);
       this.proxyMetrics.recordProxyCall(record);
     }
 
@@ -1006,19 +1406,21 @@ export class NrIngestManager {
       (isProxyToolCall(record)
         ? this.auditTrail.recordProxyCall(record)
         : this.auditTrail.recordToolCall(record));
-    this.scheduler.addEvent(
+    this.routeEvent(
       auditRecordToNrEvent(finalAuditRecord, {
         teamId: this.teamId,
         projectId: this.projectId,
         orgId: this.orgId,
+        repoUrl: this.repoUrl,
       }),
     );
     if (finalAuditRecord.securityAlert) {
-      this.scheduler.addEvent(
+      this.routeEvent(
         securityAlertToNrEvent(finalAuditRecord, {
           teamId: this.teamId,
           projectId: this.projectId,
           orgId: this.orgId,
+          repoUrl: this.repoUrl,
         }),
       );
     }
@@ -1034,8 +1436,12 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
+      companionMode: this.companionMode,
+      outcomeType: this.outcomeAnalyzer.classifyOutcome(task),
+      model: this.costTracker?.getMetrics().model ?? null,
     });
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
   }
 
   /**
@@ -1053,8 +1459,10 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
+      companionMode: this.companionMode,
     });
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
   }
 
   /**
@@ -1070,8 +1478,10 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
+      companionMode: this.companionMode,
     });
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
   }
 
   /**
@@ -1086,8 +1496,10 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
+      companionMode: this.companionMode,
     });
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
   }
 
   /**
@@ -1102,8 +1514,10 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
+      companionMode: this.companionMode,
     });
-    this.scheduler.addEvent(ev);
+    this.routeEvent(ev);
   }
 
   /** Buffer an `AiObservabilityHealth` event from the watcher pipeline. */
@@ -1114,8 +1528,9 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
     });
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
   }
 
   ingestAntiPattern(
@@ -1131,9 +1546,39 @@ export class NrIngestManager {
       teamId: this.teamId,
       projectId: this.projectId,
       orgId: this.orgId,
+      repoUrl: this.repoUrl,
       detectedAt: context.detectedAt,
     });
-    this.scheduler.addEvent(event);
+    this.routeEvent(event);
+  }
+
+  ingestRetryAlert(alert: ThrashingAlert, context: { platform?: string } = {}): void {
+    const event = retryAlertToNrEvent(alert, {
+      developer: this.developer,
+      appName: this.appName,
+      sessionId: this.sessionTraceId,
+      platform: context.platform,
+      teamId: this.teamId,
+      projectId: this.projectId,
+      orgId: this.orgId,
+      repoUrl: this.repoUrl,
+    });
+    this.routeEvent(event);
+  }
+
+  ingestTurnCost(turn: ClosedTurn): void {
+    const events = turnCostToNrEvents(turn, {
+      developer: this.developer,
+      appName: this.appName,
+      sessionTraceId: this.sessionTraceId,
+      teamId: this.teamId,
+      projectId: this.projectId,
+      orgId: this.orgId,
+      companionMode: this.companionMode,
+    });
+    for (const event of events) {
+      this.routeEvent(event);
+    }
   }
 
   ingestContextSnapshot(
@@ -1142,6 +1587,7 @@ export class NrIngestManager {
   ): void {
     const nrEvent: NrEventData = {
       eventType: 'AiContextSnapshot',
+      event_version: 1,
       timestamp: snapshot.timestamp,
       developer: this.developer,
       appName: this.appName,
@@ -1164,13 +1610,15 @@ export class NrIngestManager {
     if (this.teamId) nrEvent.team_id = this.teamId;
     if (this.projectId) nrEvent.project_id = this.projectId;
     if (this.orgId) nrEvent.org_id = this.orgId;
+    if (this.repoUrl) nrEvent.repo_url = this.repoUrl;
     if (this.sessionTraceId != null) nrEvent.session_id = this.sessionTraceId;
-    this.scheduler.addEvent(nrEvent);
+    this.routeEvent(nrEvent);
   }
 
   ingestBudgetWarning(event: BudgetThresholdEvent): void {
     const nrEvent: NrEventData = {
       eventType: 'AiBudgetWarning',
+      event_version: 1,
       timestamp: event.timestamp,
       developer: this.developer,
       appName: this.appName,
@@ -1183,14 +1631,15 @@ export class NrIngestManager {
     if (this.teamId) nrEvent.team_id = this.teamId;
     if (this.projectId) nrEvent.project_id = this.projectId;
     if (this.orgId) nrEvent.org_id = this.orgId;
+    if (this.repoUrl) nrEvent.repo_url = this.repoUrl;
     if (this.sessionTraceId != null) nrEvent.session_id = this.sessionTraceId;
-    this.scheduler.addEvent(nrEvent);
+    this.routeEvent(nrEvent);
   }
 
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.scheduler.start();
+    for (const scheduler of this.schedulers.values()) scheduler.start();
     this.logIngest.start();
 
     // Emit session-level gauges on the metric harvest cadence
@@ -1214,7 +1663,10 @@ export class NrIngestManager {
 
     this.running = false;
 
-    const cleanupPromises = [this.scheduler.stop(), this.logIngest.stop()];
+    const cleanupPromises: Promise<void>[] = [
+      ...[...this.schedulers.values()].map((scheduler) => scheduler.stop()),
+      this.logIngest.stop(),
+    ];
     if (this.otlpTransport) {
       cleanupPromises.push(this.otlpTransport.shutdown());
     }
@@ -1237,9 +1689,10 @@ export class NrIngestManager {
     if (this.teamId) teamAttrs.team_id = this.teamId;
     if (this.projectId) teamAttrs.project_id = this.projectId;
     if (this.orgId) teamAttrs.org_id = this.orgId;
+    if (this.repoUrl) teamAttrs.repo_url = this.repoUrl;
 
     const record = (name: string, value: number, attrs: Record<string, string | number> = {}) => {
-      this.scheduler.recordMetric(
+      this.primaryScheduler.recordMetric(
         name,
         value,
         sessionId != null ? { session_id: sessionId, ...attrs } : attrs,
@@ -1255,50 +1708,74 @@ export class NrIngestManager {
 
     // Emit cost and efficiency metrics with developer dimension so Team View
     // FACET developer queries return per-developer breakdowns.
-    if (this.costTracker || this.efficiencyScorer || this.feedbackCollector) {
+    if (
+      this.costTracker ||
+      this.efficiencyScorer ||
+      this.feedbackCollector ||
+      this.apiFailureTracker ||
+      this.gitEfficiencyTracker
+    ) {
       const developer = this.developer;
-      const scheduler = this.scheduler;
+      const scheduler = this.primaryScheduler;
       const devAggregator = new DeveloperAttributedMetricAggregator((name, value, attrs) => {
+        const providerAttrs: Record<string, string> = {};
+        const model = attrs.model;
+        if (typeof model === 'string') {
+          const provider = classifyProvider(model);
+          if (provider) providerAttrs.provider = provider;
+        }
         scheduler.recordMetric(
           name,
           value,
           sessionId != null
-            ? { developer, session_id: sessionId, ...teamAttrs, ...attrs }
-            : { developer, ...teamAttrs, ...attrs },
+            ? { developer, session_id: sessionId, ...teamAttrs, ...providerAttrs, ...attrs }
+            : { developer, ...teamAttrs, ...providerAttrs, ...attrs },
         );
       });
-      this.costTracker?.emitMetrics(devAggregator);
+      // Gauges carry no platform attribute, so suppression is the only way to
+      // stop the blended-dashboard double-count against Claude Code's own
+      // OTel export — cost-bearing events are tagged instead (see below).
+      if (!this.companionMode) this.costTracker?.emitMetrics(devAggregator);
       this.efficiencyScorer?.emitMetrics(devAggregator);
       this.feedbackCollector?.emitMetrics(devAggregator);
+      this.apiFailureTracker?.emitMetrics(devAggregator);
+      this.gitEfficiencyTracker?.emitMetrics(devAggregator);
     }
 
     // Emit aggregated proxy metrics
     const proxyMetrics = this.proxyMetrics.getMetrics();
     for (const [server, stats] of Object.entries(proxyMetrics.perServer)) {
-      this.scheduler.recordMetric('ai.mcp.server_call_count', stats.callCount, {
+      this.primaryScheduler.recordMetric('ai.mcp.server_call_count', stats.callCount, {
         server,
         ...teamAttrs,
       });
       if (stats.latencyMs.count > 0) {
         const avg = stats.latencyMs.sum / stats.latencyMs.count;
-        this.scheduler.recordMetric('ai.mcp.server_latency_ms', avg, { server, ...teamAttrs });
+        this.primaryScheduler.recordMetric('ai.mcp.server_latency_ms', avg, {
+          server,
+          ...teamAttrs,
+        });
       }
       if (stats.errorRate > 0) {
-        this.scheduler.recordMetric('ai.mcp.server_error_rate', stats.errorRate, {
+        this.primaryScheduler.recordMetric('ai.mcp.server_error_rate', stats.errorRate, {
           server,
           ...teamAttrs,
         });
       }
     }
     if (proxyMetrics.avgProxyOverheadMs > 0) {
-      this.scheduler.recordMetric('ai.mcp.proxy_overhead_ms', proxyMetrics.avgProxyOverheadMs, {
-        ...teamAttrs,
-      });
+      this.primaryScheduler.recordMetric(
+        'ai.mcp.proxy_overhead_ms',
+        proxyMetrics.avgProxyOverheadMs,
+        {
+          ...teamAttrs,
+        },
+      );
     }
     // Cap at 100 (tool, server) combinations to stay within NR Metric API cardinality limits.
     const MAX_TOOL_POPULARITY_ENTRIES = 100;
     for (const entry of proxyMetrics.toolPopularity.slice(0, MAX_TOOL_POPULARITY_ENTRIES)) {
-      this.scheduler.recordMetric('ai.mcp.tool_popularity', entry.count, {
+      this.primaryScheduler.recordMetric('ai.mcp.tool_popularity', entry.count, {
         tool: entry.tool,
         server: entry.server,
         ...teamAttrs,

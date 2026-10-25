@@ -7,9 +7,13 @@ coverage/
 !.env.example
 .superpowers/
 docs/superpowers/
-.claude/
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/verify-preflight/
 test-results/
 playwright-report/
+.playwright-mcp/
 
 # Terraform
 terraform/.terraform/
@@ -20,3 +24,7 @@ terraform/*.tfvars
 terraform/override.tf
 terraform/override.tf.json
 scripts/migrate-to-public.sh
+
+# Scratch files written by scripts/check-claude-code-changelog.ts
+changelog-cursor.txt
+changelog-report.md

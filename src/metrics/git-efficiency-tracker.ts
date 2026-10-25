@@ -1,4 +1,16 @@
-import type { ToolCallRecord, ReplayTimelineEntry } from '../storage/types.js';
+import type { MetricAggregator } from '../shared/index.js';
+import type { ReplayTimelineEntry, ToolCallRecord } from '../storage/types.js';
+import { stripHeredocBodies } from './local-session-aggregator.js';
+import {
+  classifyGitSegments,
+  isAmendCommit,
+  isCountedCommit,
+  isCountedPush,
+  processGhCommand,
+  splitShellSegments,
+  type GitEvent,
+} from './git-event-classifier.js';
+import { RepoNameResolver } from './local-session-aggregator.js';
 
 /**
  * Parse `git symbolic-ref --short refs/remotes/<remoteName>/HEAD`'s stdout
@@ -16,108 +28,59 @@ export function parseDefaultBranchFromSymbolicRef(output: string, remoteName: st
   return 'main';
 }
 
-// ---------------------------------------------------------------------------
-// Git command classification patterns
-// ---------------------------------------------------------------------------
-
-const GIT_COMMAND_RE = /\bgit\s+/;
-
-const MERGE_CONFLICT_INDICATORS = [
-  /CONFLICT\s*\(/i,
-  /Automatic merge failed/i,
-  /fix conflicts and then commit/i,
-  /Merge conflict in/i,
-  /both modified:/i,
-];
-
-const REBASE_CONFLICT_RE = /\brebase\b.*(?:conflict|could not apply|patch does not apply)/i;
-
-const MERGE_ABORT_RE = /\bgit\s+merge\s+--abort\b/;
-const REBASE_ABORT_RE = /\bgit\s+rebase\s+--abort\b/;
-const CHERRY_PICK_ABORT_RE = /\bgit\s+cherry-pick\s+--abort\b/;
-
-const GIT_PULL_RE = /\bgit\s+pull\b/;
-const GIT_FETCH_RE = /\bgit\s+fetch\b/;
-const GIT_PUSH_RE = /\bgit\s+push\b/;
-// `(?!-)` excludes `--force-with-lease` — without it, a lease-protected force
-// push would also match this plain "unsafe force push" pattern, since
-// "--force-with-lease" starts with the literal text "--force".
-const GIT_PUSH_FORCE_RE = /\bgit\s+push\s+.*--force(?!-)|\bgit\s+push\s+-f\b/;
-const GIT_PUSH_FORCE_LEASE_RE = /--force-with-lease\b/;
-const GIT_MERGE_RE = /\bgit\s+merge\b/;
-const GIT_REBASE_RE = /\bgit\s+rebase\b/;
-const GIT_STASH_RE = /\bgit\s+stash\b/;
-const GIT_RESET_HARD_RE = /\bgit\s+reset\s+--hard\b/;
-const GIT_CHECKOUT_DASH_RE = /\bgit\s+checkout\s+--\s/;
-const GIT_RESTORE_RE = /\bgit\s+restore\b/;
-const GIT_BRANCH_RE = /\bgit\s+(?:branch|checkout\s+-b|switch\s+-c)\b/;
-const GIT_STATUS_RE = /\bgit\s+status\b/;
-const GIT_DIFF_RE = /\bgit\s+diff\b/;
-const GIT_LOG_RE = /\bgit\s+log\b/;
-const GIT_COMMIT_RE = /\bgit\s+commit\b/;
-const GIT_WORKTREE_RE = /\bgit\s+worktree\b/;
+// Regex patterns needed by processEvent (others moved to git-event-classifier.ts)
 const GIT_CHECKOUT_OURS_RE = /\bgit\s+checkout\s+--ours\b/;
 const GIT_CHECKOUT_THEIRS_RE = /\bgit\s+checkout\s+--theirs\b/;
 const GIT_CHERRY_PICK_RE = /\bgit\s+cherry-pick\b/;
-
-// GitHub CLI patterns
-const GH_PR_CREATE_RE = /\bgh\s+pr\s+create\b/;
-const GH_PR_MERGE_RE = /\bgh\s+pr\s+merge\b/;
-const GH_PR_VIEW_RE = /\bgh\s+pr\s+view\b/;
-const GH_PR_EDIT_RE = /\bgh\s+pr\s+edit\b/;
-const GH_PR_READY_RE = /\bgh\s+pr\s+ready\b/;
-const GH_PR_CHECKS_RE = /\bgh\s+pr\s+checks\b/;
-const GH_COMMAND_RE = /\bgh\s+/;
-
-// Extract PR number from gh commands
-const GH_PR_NUMBER_RE = /\bgh\s+pr\s+\w+\s+(\d+)/;
-
-const REJECT_INDICATORS = [
-  /\[rejected\]/i,
-  /non-fast-forward/i,
-  /failed to push/i,
-  /Updates were rejected/i,
-];
+const CHERRY_PICK_ABORT_RE = /\bgit\s+cherry-pick\s+--abort\b/;
+const GIT_WORKTREE_ADD_REMOVE_RE = /\bgit\s+worktree\s+(?:add|remove)\b/;
+const GIT_PULL_RE = /\bgit\s+pull\b/;
 
 // Conflict file path extraction: "CONFLICT (content): Merge conflict in <path>"
 const CONFLICT_FILE_RE = /Merge conflict in (.+)/g;
 
+/**
+ * GitHub MCP server tool names confirmed via live-account NRQL evidence
+ * to reach Preflight as first-class AiToolCall events with these exact
+ * `tool` values,
+ * but never counted by the PR metric because recordToolCall() only inspects
+ * `record.command` — which MCP tool calls never carry. Deliberately limited
+ * to the two names the issue's own evidence covers; other GitHub-MCP PR
+ * tools (merge_pull_request, etc.) are unconfirmed and out of scope pending
+ * their own evidence.
+ */
+const MCP_PR_TOOL_ACTION: Record<string, PrEvent['action']> = {
+  create_pull_request: 'create',
+  update_pull_request: 'edit',
+};
+
+// hydrateGitLog()'s dedup window, used only against a hook-observed commit
+// event (one with no hash in its command text): `git log`'s %ct has 1-second
+// resolution and a hook-observed commit event's timestamp is recorded when
+// the tool call completes, so the two timestamps for the same commit are
+// close but never exactly equal — and the hook event's command text is the
+// raw pre-execution shell string, which never contains the resulting hash,
+// so dedup against it can't key on a hash match. Treat any existing
+// hook-observed commit event within this window as the same commit.
+//
+// A hydrated commit ALWAYS carries a real hash from `git log`, so comparing
+// it against another hydrated event uses exact hash equality (via
+// HYDRATED_COMMIT_HASH_RE below) instead of this proximity window — two
+// genuinely distinct commits landing within the window (e.g. rapid
+// sequential commits in the same `git log` batch) must not collapse into
+// one just because their timestamps are close.
+const COMMIT_DEDUP_WINDOW_MS = 5_000;
+
+// Matches the synthetic command text hydrateGitLog() gives its own events
+// (see below), letting isDuplicate() tell a hydrated event apart from a
+// hook-observed one and recover its hash.
+const HYDRATED_COMMIT_HASH_RE = /^git commit \((.+)\)$/;
+
 // ---------------------------------------------------------------------------
-// Types
+// Types (GitEvent and GitEventType are re-exported from git-event-classifier)
 // ---------------------------------------------------------------------------
 
-export interface GitEvent {
-  readonly timestamp: number;
-  readonly type: GitEventType;
-  readonly command?: string;
-  readonly success: boolean;
-  readonly durationMs: number | null;
-}
-
-export type GitEventType =
-  | 'merge_conflict'
-  | 'rebase_conflict'
-  | 'merge_abort'
-  | 'rebase_abort'
-  | 'cherry_pick_abort'
-  | 'force_push'
-  | 'force_push_lease'
-  | 'reset_hard'
-  | 'discard_changes'
-  | 'pull'
-  | 'fetch'
-  | 'push'
-  | 'push_rejected'
-  | 'merge'
-  | 'rebase'
-  | 'stash'
-  | 'branch'
-  | 'commit'
-  | 'status'
-  | 'diff'
-  | 'log'
-  | 'worktree'
-  | 'other_git';
+export type { GitEvent, GitEventType } from './git-event-classifier.js';
 
 export interface MergeConflictRecord {
   readonly timestamp: number;
@@ -125,6 +88,21 @@ export interface MergeConflictRecord {
   readonly resolutionTimeMs: number | null;
   readonly command: string;
   readonly files: readonly string[];
+}
+
+// A conflict that's been detected but not yet aborted or resolved via commit.
+// Kept as a queue (not a single scalar) so a second conflict arriving while
+// one is already open is queued rather than silently overwriting the first.
+// The used*/ flags accumulate as ours/theirs/cherry-pick commands run while
+// this conflict is the oldest pending one, and are only credited to the
+// strategy counters once this conflict actually resolves.
+interface PendingConflict {
+  timestamp: number;
+  command: string;
+  files: string[];
+  usedOurs: boolean;
+  usedTheirs: boolean;
+  usedCherryPick: boolean;
 }
 
 export interface GitEfficiencyMetrics {
@@ -204,9 +182,34 @@ export interface GitSuggestion {
 export interface BestPractice {
   readonly id: string;
   readonly label: string;
-  readonly status: 'pass' | 'fail' | 'warn' | 'unknown';
+  /**
+   * `'n/a'` is distinct from `'unknown'`: `'unknown'` means there isn't
+   * enough signal yet to evaluate the check (genuinely insufficient data);
+   * `'n/a'` means the check is fully evaluated and the practice simply
+   * doesn't apply this session (e.g. no parallel work happened, so worktree
+   * usage was never needed) — a known, non-violating outcome that shouldn't
+   * be conflated with "we don't know" or count against the pass ratio.
+   */
+  readonly status: 'pass' | 'fail' | 'warn' | 'unknown' | 'n/a';
   readonly detail: string;
 }
+
+// Render order for suggestions/best-practices — most severe first — rather
+// than fixed source-code push order, which could put a critical item below
+// a milder one.
+const SUGGESTION_SEVERITY_RANK: Record<GitSuggestion['severity'], number> = {
+  critical: 0,
+  warning: 1,
+  info: 2,
+};
+
+const BEST_PRACTICE_STATUS_RANK: Record<BestPractice['status'], number> = {
+  fail: 0,
+  warn: 1,
+  pass: 2,
+  unknown: 3,
+  'n/a': 4,
+};
 
 export interface RiskIndicators {
   readonly syncedBeforeEditing: boolean | null;
@@ -231,9 +234,7 @@ export interface RiskIndicators {
 export class GitEfficiencyTracker {
   private events: GitEvent[] = [];
   private conflictRecords: MergeConflictRecord[] = [];
-  private pendingConflictTimestamp: number | null = null;
-  private pendingConflictCommand: string = '';
-  private pendingConflictFiles: string[] = [];
+  private pendingConflicts: PendingConflict[] = [];
   private lastSyncTimestamp: number | null = null;
   private pullsSinceLastConflict = 0;
   private consecutiveFailedPushes = 0;
@@ -249,9 +250,33 @@ export class GitEfficiencyTracker {
   private editedFiles = new Set<string>();
   private hasUsedWorktree = false;
   private hasUsedForceWithLease = false;
+  // Tracks whether ANY bare (non-lease) force-push occurred this session,
+  // independent of whether --force-with-lease was ever also used. This is
+  // the single shared signal both the force_with_lease best-practice check
+  // and the force_push suggestion's severity gate on, so the two checks
+  // agree on what counts as "was this session's force-push usage safe."
+  private hasUsedBareForcePush = false;
+  // Count of bare (non-lease) force-pushes specifically — kept separate from
+  // stats.forcePushes (which sums bare AND lease-protected pushes) so
+  // severity scales with how much *unsafe* force-pushing happened, not with
+  // total force-push volume. A safe --force-with-lease push must never be
+  // able to escalate severity that a bare push alone already set.
+  private bareForcePushCount = 0;
+  // Snapshot of whether any bare force-push landed while repoContext.branch
+  // matched repoContext.defaultBranch — a bare push to the shared default
+  // branch can clobber other collaborators' work, unlike an identical push
+  // to a personal feature branch only one person is using, so the two must
+  // not scale to the same severity.
+  private hasForcePushedToDefaultBranch = false;
   private totalToolCalls = 0;
   private sessionStartTimestamp: number | null = null;
   private commitTimestamps: number[] = [];
+  // Latest commit timestamp covered by a `hydrateGitLog()` call. A live
+  // `git commit` event with a timestamp at or before this is one `git log`
+  // already saw at hydration time — recordToolCall() must skip it rather
+  // than double-count a commit that's about to arrive (or already has)
+  // through the normal hook-observed path too. See recordToolCall().
+  private hydratedThroughMs = 0;
   private worktreeCommands = 0;
   private oursCount = 0;
   private theirsCount = 0;
@@ -264,6 +289,7 @@ export class GitEfficiencyTracker {
   private quickConflictResolutions = 0;
   private prEvents: PrEvent[] = [];
   private firstCommitTimestamp: number | null = null;
+  private readonly repoResolver = new RepoNameResolver();
   private repoContext: RepoContext = {
     repoName: null,
     branch: null,
@@ -293,20 +319,45 @@ export class GitEfficiencyTracker {
       this.lastBuildOrTestTimestamp = record.timestamp;
     }
 
-    const command = record.command as string | undefined;
-    if (!command) return;
-
-    // Track GitHub CLI PR commands (skip if `git commit` is the *command*, not
-    // text that happens to appear inside a gh argument like --title).
-    if (GH_COMMAND_RE.test(command) && !command.trimStart().startsWith('git ')) {
-      this.processGhCommand(command, record.timestamp);
+    // MCP tool calls (e.g. the GitHub MCP server's create_pull_request /
+    // update_pull_request) carry no `command` field, so they'd otherwise be
+    // silently dropped by the guard below. See MCP_PR_TOOL_ACTION's doc
+    // comment. No confirmed PR-number field exists for these — prNumber is
+    // null, unlike the gh-CLI path below which extracts it from command text.
+    const mcpPrAction = MCP_PR_TOOL_ACTION[record.toolName];
+    if (mcpPrAction) {
+      this.prEvents.push({ timestamp: record.timestamp, action: mcpPrAction, prNumber: null });
     }
 
-    if (!GIT_COMMAND_RE.test(command)) return;
+    const rawCommand = record.command as string | undefined;
+    if (!rawCommand) return;
+    // Classify on the command *minus* any inline script bodies: a heredoc that
+    // merely mentions git words is not a git operation.
+    const command = stripHeredocBodies(rawCommand);
 
-    const event = this.classifyGitCommand(command, record);
-    this.events.push(event);
-    this.processEvent(event, command, record);
+    // Track GitHub CLI PR commands. Split on shell separators first so a
+    // `gh` invocation chained after a `git` command (e.g. `git push && gh pr
+    // create --fill`) is still detected. `processGhCommand`'s own anchoring
+    // is what skips "gh" text inside a git argument, e.g. `git commit -m "gh
+    // pr create note"` — that segment doesn't START with `gh pr ...`.
+    for (const segment of splitShellSegments(command)) {
+      const prEvent = processGhCommand(segment.trim(), record.timestamp);
+      if (!prEvent) continue;
+      // A failed `gh pr create` made no PR — see git-activity-recorder.ts's
+      // matching gate for the full rationale.
+      if (prEvent.action === 'create' && record.success === false) continue;
+      this.prEvents.push(prEvent);
+    }
+
+    const resolveRepo = (dir: string | null): string | null => this.repoResolver.resolve(dir);
+    for (const { segment, event } of classifyGitSegments(command, record, resolveRepo)) {
+      // A hook-observed commit whose timestamp `hydrateGitLog()` already saw
+      // is the same commit; a live event's `command` is the raw shell string,
+      // not `git commit (<hash>)`, so the hash-based dedup can't catch it.
+      if (event.type === 'commit' && event.timestamp <= this.hydratedThroughMs) continue;
+      this.events.push(event);
+      this.processEvent(event, segment, record);
+    }
   }
 
   hydrateBranchDivergence(ahead: number, behind: number): void {
@@ -318,25 +369,6 @@ export class GitEfficiencyTracker {
     this.repoContext = ctx;
   }
 
-  private processGhCommand(command: string, timestamp: number): void {
-    const numberMatch = GH_PR_NUMBER_RE.exec(command);
-    const prNumber = numberMatch ? numberMatch[1] : null;
-
-    if (GH_PR_CREATE_RE.test(command)) {
-      this.prEvents.push({ timestamp, action: 'create', prNumber });
-    } else if (GH_PR_MERGE_RE.test(command)) {
-      this.prEvents.push({ timestamp, action: 'merge', prNumber });
-    } else if (GH_PR_CHECKS_RE.test(command)) {
-      this.prEvents.push({ timestamp, action: 'checks', prNumber });
-    } else if (GH_PR_READY_RE.test(command)) {
-      this.prEvents.push({ timestamp, action: 'ready', prNumber });
-    } else if (GH_PR_EDIT_RE.test(command)) {
-      this.prEvents.push({ timestamp, action: 'edit', prNumber });
-    } else if (GH_PR_VIEW_RE.test(command)) {
-      this.prEvents.push({ timestamp, action: 'view', prNumber });
-    }
-  }
-
   private computePrMetrics(): PullRequestMetrics {
     const created = this.prEvents.filter((e) => e.action === 'create').length;
     const merged = this.prEvents.filter((e) => e.action === 'merge').length;
@@ -345,14 +377,28 @@ export class GitEfficiencyTracker {
       (e) => e.action === 'edit' || e.action === 'ready',
     ).length;
 
-    // Time from first commit to first PR creation
-    let avgTimeToCreateMs: number | null = null;
-    if (created > 0 && this.firstCommitTimestamp !== null) {
-      const firstCreate = this.prEvents.find((e) => e.action === 'create');
-      if (firstCreate) {
-        avgTimeToCreateMs = Math.max(0, firstCreate.timestamp - this.firstCommitTimestamp);
+    // Time from each PR's most recent preceding commit to its `gh pr
+    // create`, averaged across every PR opened this session — not a single
+    // delta anchored to whichever commit happened to be the very first one
+    // this tracker ever saw, which would go stale after the first PR and
+    // ignore every PR opened later in the same session.
+    const sortedCommitTimestamps = [...this.commitTimestamps].sort((a, b) => a - b);
+    const timesToCreate: number[] = [];
+    for (const prEvent of this.prEvents) {
+      if (prEvent.action !== 'create') continue;
+      let precedingCommitTimestamp: number | null = null;
+      for (const commitTimestamp of sortedCommitTimestamps) {
+        if (commitTimestamp > prEvent.timestamp) break;
+        precedingCommitTimestamp = commitTimestamp;
+      }
+      if (precedingCommitTimestamp !== null) {
+        timesToCreate.push(Math.max(0, prEvent.timestamp - precedingCommitTimestamp));
       }
     }
+    const avgTimeToCreateMs =
+      timesToCreate.length > 0
+        ? timesToCreate.reduce((a, b) => a + b, 0) / timesToCreate.length
+        : null;
 
     return {
       created,
@@ -364,7 +410,15 @@ export class GitEfficiencyTracker {
     };
   }
 
-  hydrateGitLog(commits: readonly { timestamp: number; hash: string }[]): void {
+  hydrateGitLog(
+    commits: readonly {
+      timestamp: number;
+      hash: string;
+      repo?: string | null;
+      subject?: string | null;
+      url?: string | null;
+    }[],
+  ): void {
     for (const commit of commits) {
       if (!commit.hash) continue;
       const event: GitEvent = {
@@ -373,21 +427,74 @@ export class GitEfficiencyTracker {
         command: `git commit (${commit.hash})`,
         success: true,
         durationMs: null,
+        repo: commit.repo ?? null,
+        subject: commit.subject ?? null,
+        url: commit.url ?? null,
       };
-      // Only add if we don't already have this commit tracked
-      const isDuplicate = this.events.some(
-        (e) => e.type === 'commit' && e.command?.includes(commit.hash),
-      );
+      // Only add if we don't already have this commit tracked. Against an
+      // existing hydrated event (one carrying its own real hash), match by
+      // exact hash equality — precise, and avoids collapsing two genuinely
+      // distinct commits that just happen to land within the proximity
+      // window. Against an existing hook-observed event, fall back to
+      // timestamp proximity: a prior session's hook-observed `commit` event,
+      // replayed via replayTimeline() before this method ever runs, has no
+      // hash in its command text at all, so a hash match would never catch
+      // it and every restart would double-count that commit. Only a counted
+      // commit can stand for this one. A commit the `;` rule marked failed
+      // may still have landed, and git log is what shows it did, as
+      // `reconcileHydratedCommits` reads it for the weekly panel. An amend
+      // can't either: nothing here shows which commit it rewrote, and when
+      // that one was never counted (yesterday's, or one made outside the
+      // hooks) git log is the only place it shows up. The cost is that an
+      // amend with `--reset-author`, which moves the author time git log
+      // reports to the amend's, counts its commit again on the next git log
+      // refresh (every 5 minutes, or a restart). A plain `--amend` keeps the
+      // original's author time, so it still matches on the refreshes that read
+      // `%at`; the day-boundary one reads committer time, which an amend moves.
+      const isDuplicate = this.events.some((e) => {
+        if (!isCountedCommit(e)) return false;
+        const existingHash = e.command ? HYDRATED_COMMIT_HASH_RE.exec(e.command)?.[1] : undefined;
+        if (existingHash !== undefined) {
+          return existingHash === commit.hash;
+        }
+        return Math.abs(e.timestamp - commit.timestamp) < COMMIT_DEDUP_WINDOW_MS;
+      });
       if (!isDuplicate) {
         this.events.push(event);
         this.commitTimestamps.push(commit.timestamp);
         // Don't increment commitsSinceLastSync for historical commits — this counter
         // tracks real-time session activity, not replayed history.
       }
+      // Advance the watermark even for a commit that was already tracked —
+      // either way, `git log` has now vouched for everything up to here, so
+      // recordToolCall() must not add it again when the hook-observed event
+      // for it (still queued in the same drain batch) gets processed.
+      if (commit.timestamp > this.hydratedThroughMs) {
+        this.hydratedThroughMs = commit.timestamp;
+      }
     }
   }
 
-  replayTimeline(entries: readonly ReplayTimelineEntry[]): void {
+  /**
+   * @param repoName The replayed session's own repo (from `SessionSummary.repoName`).
+   *   When both this and the tracker's own `repoContext.repoName` (set via
+   *   `hydrateRepoContext()`) are known and they don't match, the whole
+   *   timeline is skipped — otherwise a session worked on in a
+   *   different repo earlier today would have its commits/conflicts/force-
+   *   pushes counted against whichever repo this process's header currently
+   *   names. When either side is unknown (null/undefined — e.g. no git
+   *   remote configured, or `repoContext` not hydrated yet), the timeline is
+   *   replayed unfiltered rather than risk dropping legitimate same-repo
+   *   history.
+   */
+  replayTimeline(entries: readonly ReplayTimelineEntry[], repoName?: string | null): void {
+    if (
+      repoName != null &&
+      this.repoContext.repoName != null &&
+      repoName !== this.repoContext.repoName
+    ) {
+      return;
+    }
     for (const entry of entries) {
       const syntheticRecord: ToolCallRecord = {
         id: `replay-${entry.timestamp}`,
@@ -421,15 +528,33 @@ export class GitEfficiencyTracker {
     const resetHards = this.events.filter((e) => e.type === 'reset_hard').length;
     const discardedChanges = this.events.filter((e) => e.type === 'discard_changes').length;
     const pullCount = this.events.filter((e) => e.type === 'pull').length;
-    const pushCount = this.events.filter(
-      (e) => e.type === 'push' || e.type === 'force_push' || e.type === 'force_push_lease',
-    ).length;
-    const commitCount = this.events.filter((e) => e.type === 'commit').length;
+    const pushCount = this.events.filter(isCountedPush).length;
+    const commitCount = this.events.filter(isCountedCommit).length;
     const branchOperations = this.events.filter((e) => e.type === 'branch').length;
 
-    const resolved = this.conflictRecords.filter((c) => c.resolution === 'resolved');
+    // A conflict that's currently open (mid-merge, not yet aborted or
+    // resolved) is counted in the mergeConflicts/rebaseConflicts KPI above,
+    // but this.conflictRecords only gains an entry once it's aborted or
+    // resolved — so it would otherwise never enter the resolution-rate
+    // denominator, letting a session with one resolved and one still-open
+    // conflict show a "perfect" 100% rate. Synthesizing (not persisting) a
+    // 'pending' record per still-queued conflict keeps the denominator
+    // honest without ever double-counting once that conflict does resolve —
+    // at that point it leaves the queue and gets a real entry instead.
+    const allConflictRecords: MergeConflictRecord[] = [
+      ...this.conflictRecords,
+      ...this.pendingConflicts.map((p) => ({
+        timestamp: p.timestamp,
+        resolution: 'pending' as const,
+        resolutionTimeMs: null,
+        command: p.command,
+        files: p.files,
+      })),
+    ];
+
+    const resolved = allConflictRecords.filter((c) => c.resolution === 'resolved');
     const conflictResolutionRate =
-      this.conflictRecords.length > 0 ? resolved.length / this.conflictRecords.length : null;
+      allConflictRecords.length > 0 ? resolved.length / allConflictRecords.length : null;
 
     const resolutionTimes = resolved
       .filter((c) => c.resolutionTimeMs !== null)
@@ -496,10 +621,25 @@ export class GitEfficiencyTracker {
       conflictResolutionRate,
       avgConflictResolutionMs,
       staleBranchPulls,
-      gitCommandTimeline: this.events.slice(-50),
-      conflictHistory: this.conflictRecords,
-      suggestions,
-      bestPractices,
+      // this.events/this.conflictRecords are append-only in processing
+      // order, not timestamp order — parallel tool calls within a session,
+      // or multi-session buffer draining, can push an earlier-timestamped
+      // event after a later one. Sort by timestamp ascending (oldest-first)
+      // before exposing, so gitCommandTimeline's consumer
+      // (GitEfficiency.tsx's `[...timeline].reverse().slice(0, 30)`) picks
+      // the true newest 30, not whichever 30 happened to be pushed last.
+      gitCommandTimeline: [...this.events].sort((a, b) => a.timestamp - b.timestamp).slice(-50),
+      conflictHistory: [...allConflictRecords].sort((a, b) => a.timestamp - b.timestamp),
+      // Both arrays render in whatever order the checks above happen to
+      // .push() in — fixed source-code order, not severity order — so a
+      // critical-severity item could render below a milder one. Sort by
+      // severity (most severe first) before exposing.
+      suggestions: [...suggestions].sort(
+        (a, b) => SUGGESTION_SEVERITY_RANK[a.severity] - SUGGESTION_SEVERITY_RANK[b.severity],
+      ),
+      bestPractices: [...bestPractices].sort(
+        (a, b) => BEST_PRACTICE_STATUS_RANK[a.status] - BEST_PRACTICE_STATUS_RANK[b.status],
+      ),
       preventionScore,
       efficiencyScore,
       riskIndicators,
@@ -510,12 +650,23 @@ export class GitEfficiencyTracker {
     };
   }
 
+  // Each count below blends hook-observed events with events hydrated from
+  // `git log`/PR-CLI history at session start — the two paths are already
+  // deduped upstream (see hydrateGitLog()'s isDuplicate check), so there is
+  // no separate hook-observed-vs-hydrated split to emit here.
+  emitMetrics(aggregator: MetricAggregator): void {
+    const metrics = this.getMetrics();
+    aggregator.record('ai.git.commit_count', metrics.commitCount);
+    aggregator.record('ai.git.push_count', metrics.pushCount);
+    aggregator.record('ai.git.force_push_count', metrics.forcePushes);
+    aggregator.record('ai.git.pr_created', metrics.prMetrics.created);
+    aggregator.record('ai.git.pr_merged', metrics.prMetrics.merged);
+  }
+
   reset(_sessionId: string): void {
     this.events = [];
     this.conflictRecords = [];
-    this.pendingConflictTimestamp = null;
-    this.pendingConflictCommand = '';
-    this.pendingConflictFiles = [];
+    this.pendingConflicts = [];
     this.lastSyncTimestamp = null;
     this.pullsSinceLastConflict = 0;
     this.consecutiveFailedPushes = 0;
@@ -531,9 +682,13 @@ export class GitEfficiencyTracker {
     this.editedFiles.clear();
     this.hasUsedWorktree = false;
     this.hasUsedForceWithLease = false;
+    this.hasUsedBareForcePush = false;
+    this.bareForcePushCount = 0;
+    this.hasForcePushedToDefaultBranch = false;
     this.totalToolCalls = 0;
     this.sessionStartTimestamp = null;
     this.commitTimestamps = [];
+    this.hydratedThroughMs = 0;
     this.worktreeCommands = 0;
     this.oursCount = 0;
     this.theirsCount = 0;
@@ -545,7 +700,6 @@ export class GitEfficiencyTracker {
     this.commitsBehindMain = null;
     this.quickConflictResolutions = 0;
     this.prEvents = [];
-    this.firstCommitTimestamp = null;
     this.repoContext = { repoName: null, branch: null, remoteName: null, defaultBranch: null };
   }
 
@@ -553,61 +707,26 @@ export class GitEfficiencyTracker {
   // Internals
   // -------------------------------------------------------------------------
 
-  // Order matters: several patterns overlap (e.g. a force-push-with-lease
-  // command also matches the plain push/force-push patterns), so more
-  // specific checks must run before the more general ones they'd otherwise
-  // be shadowed by.
-  private classifyGitCommand(command: string, record: ToolCallRecord): GitEvent {
-    const base = {
-      timestamp: record.timestamp,
-      command,
-      success: record.success,
-      durationMs: record.durationMs,
-    };
-
-    const output = (record.error as string) ?? '';
-    const hasConflict = MERGE_CONFLICT_INDICATORS.some((re) => re.test(output));
-    const hasRebaseConflict = REBASE_CONFLICT_RE.test(output);
-    const hasRejection = REJECT_INDICATORS.some((re) => re.test(output));
-
-    if (hasConflict && !hasRebaseConflict) return { ...base, type: 'merge_conflict' };
-    if (hasRebaseConflict) return { ...base, type: 'rebase_conflict' };
-    if (MERGE_ABORT_RE.test(command)) return { ...base, type: 'merge_abort' };
-    if (REBASE_ABORT_RE.test(command)) return { ...base, type: 'rebase_abort' };
-    if (CHERRY_PICK_ABORT_RE.test(command)) return { ...base, type: 'cherry_pick_abort' };
-    if (GIT_PUSH_FORCE_LEASE_RE.test(command)) return { ...base, type: 'force_push_lease' };
-    if (GIT_PUSH_FORCE_RE.test(command)) return { ...base, type: 'force_push' };
-    if (GIT_RESET_HARD_RE.test(command)) return { ...base, type: 'reset_hard' };
-    if (GIT_CHECKOUT_DASH_RE.test(command) || GIT_RESTORE_RE.test(command))
-      return { ...base, type: 'discard_changes' };
-    if (GIT_WORKTREE_RE.test(command)) return { ...base, type: 'worktree' };
-    if (GIT_PULL_RE.test(command)) return { ...base, type: 'pull' };
-    if (GIT_FETCH_RE.test(command)) return { ...base, type: 'fetch' };
-    if (GIT_PUSH_RE.test(command) && hasRejection) return { ...base, type: 'push_rejected' };
-    if (GIT_PUSH_RE.test(command)) return { ...base, type: 'push' };
-    if (GIT_REBASE_RE.test(command)) return { ...base, type: 'rebase' };
-    if (GIT_MERGE_RE.test(command)) return { ...base, type: 'merge' };
-    if (GIT_STASH_RE.test(command)) return { ...base, type: 'stash' };
-    if (GIT_BRANCH_RE.test(command)) return { ...base, type: 'branch' };
-    if (GIT_COMMIT_RE.test(command)) return { ...base, type: 'commit' };
-    if (GIT_STATUS_RE.test(command)) return { ...base, type: 'status' };
-    if (GIT_DIFF_RE.test(command)) return { ...base, type: 'diff' };
-    if (GIT_LOG_RE.test(command)) return { ...base, type: 'log' };
-
-    return { ...base, type: 'other_git' };
-  }
-
   private processEvent(event: GitEvent, command: string, record: ToolCallRecord): void {
-    // Track conflict resolution strategies regardless of event type
-    if (GIT_CHECKOUT_OURS_RE.test(command)) this.oursCount++;
-    if (GIT_CHECKOUT_THEIRS_RE.test(command)) this.theirsCount++;
-    if (GIT_CHERRY_PICK_RE.test(command)) this.cherryPickCount++;
+    // Attribute ours/theirs/cherry-pick resolution strategy to the oldest
+    // still-open conflict, not to every matching command — a multi-file
+    // conflict resolved with one `--ours` per file must count once toward
+    // that conflict, not once per file, and a strategy command run with no
+    // conflict pending isn't resolving anything. `--abort` also matches the
+    // bare cherry-pick pattern, so it's excluded explicitly — aborting isn't
+    // a resolution strategy.
+    const oldestPending = this.pendingConflicts[0];
+    if (oldestPending) {
+      if (GIT_CHECKOUT_OURS_RE.test(command)) oldestPending.usedOurs = true;
+      if (GIT_CHECKOUT_THEIRS_RE.test(command)) oldestPending.usedTheirs = true;
+      if (GIT_CHERRY_PICK_RE.test(command) && !CHERRY_PICK_ABORT_RE.test(command)) {
+        oldestPending.usedCherryPick = true;
+      }
+    }
 
     switch (event.type) {
       case 'merge_conflict':
       case 'rebase_conflict': {
-        this.pendingConflictTimestamp = event.timestamp;
-        this.pendingConflictCommand = command;
         const output = (record.error as string) ?? '';
         const files: string[] = [];
         let match: RegExpExecArray | null;
@@ -616,60 +735,72 @@ export class GitEfficiencyTracker {
           files.push(match[1].trim());
           this.conflictedFiles.add(match[1].trim());
         }
-        this.pendingConflictFiles = files;
+        this.pendingConflicts.push({
+          timestamp: event.timestamp,
+          command,
+          files,
+          usedOurs: false,
+          usedTheirs: false,
+          usedCherryPick: false,
+        });
         this.pullsSinceLastConflict = 0;
         break;
       }
 
       case 'merge_abort':
       case 'rebase_abort':
-      case 'cherry_pick_abort':
-        if (this.pendingConflictTimestamp !== null) {
+      case 'cherry_pick_abort': {
+        const pending = this.pendingConflicts.shift();
+        if (pending) {
           this.conflictRecords.push({
-            timestamp: this.pendingConflictTimestamp,
+            timestamp: pending.timestamp,
             resolution: 'aborted',
-            resolutionTimeMs: event.timestamp - this.pendingConflictTimestamp,
-            command: this.pendingConflictCommand,
-            files: this.pendingConflictFiles,
+            resolutionTimeMs: event.timestamp - pending.timestamp,
+            command: pending.command,
+            files: pending.files,
           });
-          this.pendingConflictTimestamp = null;
-          this.pendingConflictCommand = '';
-          this.pendingConflictFiles = [];
         }
         break;
+      }
 
       case 'commit': {
-        // git commit --amend fixes a prior commit, not a merge conflict.
-        // Clear the pending conflict on amend so the *next* normal commit
-        // doesn't see a stale pendingConflictTimestamp (potentially hours old).
-        if (command.includes('--amend')) {
-          this.pendingConflictTimestamp = null;
-          this.pendingConflictCommand = '';
-          this.pendingConflictFiles = [];
-        }
-        if (this.pendingConflictTimestamp !== null && !command.includes('--amend')) {
-          const resolutionMs = event.timestamp - this.pendingConflictTimestamp;
-          this.conflictRecords.push({
-            timestamp: this.pendingConflictTimestamp,
-            resolution: 'resolved',
-            resolutionTimeMs: resolutionMs,
-            command: this.pendingConflictCommand,
-            files: this.pendingConflictFiles,
-          });
-          // Under 30s resolution with multiple conflicted files is suspiciously fast
-          if (resolutionMs < 30_000 && this.pendingConflictFiles.length > 1) {
-            this.quickConflictResolutions++;
-          }
-          this.pendingConflictTimestamp = null;
-          this.pendingConflictCommand = '';
-          this.pendingConflictFiles = [];
-        }
-        this.commitTimestamps.push(event.timestamp);
-        if (this.firstCommitTimestamp === null) {
-          this.firstCommitTimestamp = event.timestamp;
-        }
-        this.commitsSinceLastSync++;
         this.statusChecksSinceLastAction = 0;
+        // A failed commit (e.g. a pre-commit hook rejection, or unmerged
+        // files) added no history and resolved nothing, so it leaves pending
+        // conflicts queued and stays out of the commit cadence below.
+        if (!event.success) break;
+        // git commit --amend fixes a prior commit, not a merge conflict.
+        // Drop the oldest pending conflict on amend (without recording a
+        // resolution) so a later, unrelated commit doesn't retroactively
+        // "resolve" it.
+        if (isAmendCommit(command)) {
+          this.pendingConflicts.shift();
+        } else {
+          const pending = this.pendingConflicts.shift();
+          if (pending) {
+            const resolutionMs = event.timestamp - pending.timestamp;
+            this.conflictRecords.push({
+              timestamp: pending.timestamp,
+              resolution: 'resolved',
+              resolutionTimeMs: resolutionMs,
+              command: pending.command,
+              files: pending.files,
+            });
+            if (pending.usedOurs) this.oursCount++;
+            if (pending.usedTheirs) this.theirsCount++;
+            if (pending.usedCherryPick) this.cherryPickCount++;
+            // Under 30s resolution with multiple conflicted files is suspiciously fast
+            if (resolutionMs < 30_000 && pending.files.length > 1) {
+              this.quickConflictResolutions++;
+            }
+          }
+        }
+        // Same rule as the commit count: an amend rewrites a commit rather
+        // than adding one, so it isn't another commit in the cadence.
+        if (isCountedCommit(event)) {
+          this.commitTimestamps.push(event.timestamp);
+          this.commitsSinceLastSync++;
+        }
         break;
       }
 
@@ -689,6 +820,10 @@ export class GitEfficiencyTracker {
         break;
 
       case 'push': {
+        this.statusChecksSinceLastAction = 0;
+        // A failed push changed nothing on the remote, so it leaves the
+        // last-push state below as it was. The commit arm gates the same way.
+        if (!event.success) break;
         // buildBeforePush is only meaningful if the build/test happened AFTER the
         // most recent commit — a stale test from session start with many commits
         // in between doesn't protect the pushed code.
@@ -701,7 +836,6 @@ export class GitEfficiencyTracker {
           this.lastBuildOrTestTimestamp !== null &&
           (lastCommitTs === null || this.lastBuildOrTestTimestamp > lastCommitTs);
         this.consecutiveFailedPushes = 0;
-        this.statusChecksSinceLastAction = 0;
         break;
       }
 
@@ -713,12 +847,25 @@ export class GitEfficiencyTracker {
         break;
 
       case 'force_push':
+        this.hasUsedBareForcePush = true;
+        this.bareForcePushCount++;
+        if (
+          this.repoContext.branch !== null &&
+          this.repoContext.defaultBranch !== null &&
+          this.repoContext.branch === this.repoContext.defaultBranch
+        ) {
+          this.hasForcePushedToDefaultBranch = true;
+        }
         if (
           this.lastPushRejectedTimestamp !== null &&
           event.timestamp - this.lastPushRejectedTimestamp < 300_000
         ) {
           this.forceAfterReject++;
         }
+        this.statusChecksSinceLastAction = 0;
+        // The force-push checks above judge the command run, so a failed one
+        // still counts there; only a push that succeeded moves the state below.
+        if (!event.success) break;
         this.lastPushTimestamp = event.timestamp;
         {
           const lastCt =
@@ -730,11 +877,12 @@ export class GitEfficiencyTracker {
             (lastCt === null || this.lastBuildOrTestTimestamp > lastCt);
         }
         this.consecutiveFailedPushes = 0;
-        this.statusChecksSinceLastAction = 0;
         break;
 
       case 'force_push_lease':
         this.hasUsedForceWithLease = true;
+        this.statusChecksSinceLastAction = 0;
+        if (!event.success) break;
         this.lastPushTimestamp = event.timestamp;
         {
           const lastCt =
@@ -746,12 +894,17 @@ export class GitEfficiencyTracker {
             (lastCt === null || this.lastBuildOrTestTimestamp > lastCt);
         }
         this.consecutiveFailedPushes = 0;
-        this.statusChecksSinceLastAction = 0;
         break;
 
       case 'worktree':
-        this.hasUsedWorktree = true;
-        this.worktreeCommands++;
+        // Both the "worktree ops" count and the usesWorktrees/use_worktrees
+        // signal are meant to reflect real worktree usage, not read-only
+        // inspection — `list`/`prune`/`lock`/etc. shouldn't count as evidence
+        // that worktrees were used to isolate parallel work.
+        if (GIT_WORKTREE_ADD_REMOVE_RE.test(command)) {
+          this.worktreeCommands++;
+          this.hasUsedWorktree = true;
+        }
         break;
 
       case 'status':
@@ -764,18 +917,22 @@ export class GitEfficiencyTracker {
     }
   }
 
-  // A pull immediately followed by a conflict means the branch had already
-  // diverged enough that even the act of syncing produced a conflict — a
-  // stronger signal of a stale branch than a conflict from, say, a later
-  // merge or rebase attempted well after the pull.
+  // A pull that diverged enough to conflict is the strongest signal of a
+  // stale branch — checked directly off the conflicting event's own command
+  // (a `git pull` whose own output contains a conflict indicator classifies
+  // as merge_conflict/rebase_conflict, never as 'pull', so this can't rely
+  // on the event's `type`). A pull immediately followed by a *separate*
+  // command that then conflicts is a weaker but still real signal, kept as a
+  // fallback for events that don't match the direct case.
   private countStaleBranchPulls(): number {
     let staleCount = 0;
-    for (let i = 0; i < this.events.length - 1; i++) {
-      if (this.events[i].type === 'pull') {
-        const next = this.events[i + 1];
-        if (next.type === 'merge_conflict' || next.type === 'rebase_conflict') {
-          staleCount++;
-        }
+    for (let i = 0; i < this.events.length; i++) {
+      const event = this.events[i];
+      if (event.type !== 'merge_conflict' && event.type !== 'rebase_conflict') continue;
+      if (GIT_PULL_RE.test(event.command ?? '')) {
+        staleCount++;
+      } else if (i > 0 && this.events[i - 1].type === 'pull') {
+        staleCount++;
       }
     }
     return staleCount;
@@ -937,16 +1094,36 @@ export class GitEfficiencyTracker {
         detail:
           'Conflicts detected without worktree usage. When running multiple AI sessions in parallel (or switching between tasks), use `git worktree add` to give each task its own working directory. This completely eliminates cross-session conflicts.',
       });
-    } else {
+    } else if (stats.commitCount < 3) {
+      // Mirrors frequent_sync's "not enough commits yet" gate above — too
+      // little activity to tell whether this session even involves the kind
+      // of parallel/multi-task work worktrees would protect against.
       practices.push({
         id: 'use_worktrees',
         label: 'Use worktrees for parallel work',
         status: 'unknown',
-        detail: 'No worktree usage detected. Consider worktrees if you run parallel sessions.',
+        detail: 'Not enough activity yet to tell whether this session needs worktrees.',
+      });
+    } else {
+      // Fully known, not a violation: no conflicts occurred and no worktree
+      // was used. Distinct from the 'unknown' branch above — this session
+      // had enough activity to judge, and simply didn't need worktree
+      // isolation, which is a fine outcome, not "we don't know."
+      practices.push({
+        id: 'use_worktrees',
+        label: 'Use worktrees for parallel work',
+        status: 'n/a',
+        detail:
+          "No conflicts and no worktree usage detected this session — parallel-session isolation wasn't needed here.",
       });
     }
 
-    // 5. Use --force-with-lease instead of --force
+    // 5. Use --force-with-lease instead of --force. Gated on
+    // hasUsedBareForcePush rather than forcePushes/usesForceWithLease alone —
+    // those two count safe and unsafe force-pushes together, so checking
+    // usesForceWithLease alone would let one safe `--force-with-lease` mask a
+    // dangerous bare `--force` in the same session with a fully-passing
+    // status.
     if (stats.forcePushes === 0) {
       practices.push({
         id: 'force_with_lease',
@@ -954,15 +1131,15 @@ export class GitEfficiencyTracker {
         status: 'unknown',
         detail: 'No force pushes yet.',
       });
-    } else if (risk.usesForceWithLease) {
+    } else if (this.hasUsedBareForcePush && risk.usesForceWithLease) {
       practices.push({
         id: 'force_with_lease',
         label: 'Use --force-with-lease',
-        status: 'pass',
+        status: 'warn',
         detail:
-          "Good — using --force-with-lease which refuses to overwrite remote commits you haven't seen.",
+          'Mixed usage this session — some force pushes used --force-with-lease, but at least one bare --force (unsafe) push also occurred. Always use --force-with-lease; it refuses to push if someone else has pushed to the branch since your last fetch.',
       });
-    } else {
+    } else if (this.hasUsedBareForcePush) {
       practices.push({
         id: 'force_with_lease',
         label: 'Use --force-with-lease',
@@ -970,26 +1147,17 @@ export class GitEfficiencyTracker {
         detail:
           'Using bare --force instead of --force-with-lease. The --force-with-lease flag is a safety net: it refuses to push if someone else has pushed to the branch since your last fetch. Always prefer it.',
       });
-    }
-
-    // 6. Don't force-push after a rejection without investigating
-    if (risk.forceAfterReject > 0) {
+    } else {
       practices.push({
-        id: 'no_force_after_reject',
-        label: "Don't force-push after rejection",
-        status: 'fail',
-        detail: `Push was rejected ${risk.pushRejections} time(s) and then force-pushed ${risk.forceAfterReject} time(s). When a push is rejected, pull + rebase first to incorporate upstream changes. Force pushing after a rejection overwrites others' work.`,
-      });
-    } else if (risk.pushRejections > 0) {
-      practices.push({
-        id: 'no_force_after_reject',
-        label: "Don't force-push after rejection",
+        id: 'force_with_lease',
+        label: 'Use --force-with-lease',
         status: 'pass',
-        detail: 'Push was rejected but correctly handled without force pushing.',
+        detail:
+          "Good — using --force-with-lease which refuses to overwrite remote commits you haven't seen.",
       });
     }
 
-    // 7. Keep PRs small (proxy: many commits without pushing)
+    // 6. Keep PRs small (proxy: many commits without pushing)
     if (risk.commitsSinceLastSync > 15) {
       practices.push({
         id: 'small_increments',
@@ -1006,7 +1174,7 @@ export class GitEfficiencyTracker {
       });
     }
 
-    // 8. Avoid editing hot files
+    // 7. Avoid editing hot files
     if (risk.hotFiles.length > 0) {
       practices.push({
         id: 'avoid_hot_files',
@@ -1016,7 +1184,7 @@ export class GitEfficiencyTracker {
       });
     }
 
-    // 9. Build/test before pushing
+    // 8. Build/test before pushing
     if (this.buildBeforePush === null && this.lastPushTimestamp === null) {
       practices.push({
         id: 'verify_before_push',
@@ -1046,7 +1214,10 @@ export class GitEfficiencyTracker {
   }
 
   private computePreventionScore(practices: BestPractice[]): number | null {
-    const scorable = practices.filter((p) => p.status !== 'unknown');
+    // 'n/a' (fully known, not applicable) is excluded the same way 'unknown'
+    // (genuinely insufficient data) is — neither should count for or against
+    // the score. See BestPractice['status']'s docstring for the distinction.
+    const scorable = practices.filter((p) => p.status !== 'unknown' && p.status !== 'n/a');
     if (scorable.length < 2) return null;
 
     let points = 0;
@@ -1075,25 +1246,14 @@ export class GitEfficiencyTracker {
     const suggestions: GitSuggestion[] = [];
 
     // --- Proactive prevention suggestions (fire BEFORE conflicts happen) ---
-
-    if (stats.riskIndicators.syncedBeforeEditing === false) {
-      suggestions.push({
-        severity: 'warning',
-        category: 'no_initial_sync',
-        message:
-          'Started editing without syncing first. Run `git fetch && git rebase origin/main` (or your target branch) at the start of every session. This single habit prevents the majority of AI-assisted coding conflicts.',
-        evidence: 'First file edit occurred before any git pull/fetch',
-      });
-    }
-
-    if (stats.riskIndicators.commitsSinceLastSync > 8) {
-      suggestions.push({
-        severity: 'warning',
-        category: 'drift_risk',
-        message: `${stats.riskIndicators.commitsSinceLastSync} commits without syncing. You're accumulating drift that will compound into painful conflicts. Run \`git fetch && git rebase origin/main\` now — smaller, frequent rebases are far easier than one large one later.`,
-        evidence: `${stats.riskIndicators.commitsSinceLastSync} commits since last pull/fetch/rebase`,
-      });
-    }
+    //
+    // syncedBeforeEditing, commitsSinceLastSync (drift), and hotFiles are
+    // ongoing-state conditions already surfaced as their own Best Practice
+    // checks (sync_before_edit, frequent_sync, avoid_hot_files) — duplicating
+    // them here as one-off suggestions rendered the same fact twice, with a
+    // conflicting severity in the hot-files case. Best Practices is their
+    // canonical home; only force-after-reject (a one-time, reactive event
+    // with actionable remediation) is kept as a suggestion.
 
     if (stats.riskIndicators.forceAfterReject > 0) {
       suggestions.push({
@@ -1102,15 +1262,6 @@ export class GitEfficiencyTracker {
         message:
           'Push was rejected and then force-pushed — this overwrites upstream changes. The correct response to a rejected push is: `git fetch`, then `git rebase origin/<branch>`, resolve any conflicts, then push normally. Force push is a last resort, not a first response.',
         evidence: `${stats.riskIndicators.forceAfterReject} force push(es) within 5 min of a rejection`,
-      });
-    }
-
-    if (stats.riskIndicators.hotFiles.length > 0) {
-      suggestions.push({
-        severity: 'info',
-        category: 'hot_files',
-        message: `You're editing files that previously conflicted (${stats.riskIndicators.hotFiles.slice(0, 3).join(', ')}). These likely have active upstream work. Consider: (1) rebasing immediately to get latest state, (2) coordinating with whoever else is touching these files, or (3) deferring changes until upstream settles.`,
-        evidence: `${stats.riskIndicators.hotFiles.length} previously-conflicted file(s) re-edited`,
       });
     }
 
@@ -1144,21 +1295,40 @@ export class GitEfficiencyTracker {
       });
     }
 
-    if (stats.forcePushes >= 2) {
+    // Severity is gated on hasUsedBareForcePush/bareForcePushCount — the same
+    // shared signal the force_with_lease best-practice check uses — rather
+    // than the raw forcePushes count, which sums bare AND lease-protected
+    // pushes together. Gating (and scaling) on the bare-only count keeps this
+    // suggestion's ranking consistent with the best-practice check: adding a
+    // safe --force-with-lease push on top of an existing bare push must never
+    // raise severity, since only the bare push is actually risky.
+    //
+    // A bare push to the shared default branch is escalated to 'critical'
+    // outright, regardless of count — it can clobber other collaborators'
+    // work, unlike an identical push to a personal feature branch (which
+    // still scales by count, as above).
+    if (this.hasUsedBareForcePush) {
       suggestions.push({
-        severity: 'critical',
+        severity: this.hasForcePushedToDefaultBranch
+          ? 'critical'
+          : this.bareForcePushCount >= 2
+            ? 'critical'
+            : 'warning',
         category: 'force_push',
-        message:
-          'Multiple force pushes this session. Always use --force-with-lease as a safety net. If you need to rewrite history, coordinate with collaborators first and ensure your local refs are up to date with `git fetch` before force pushing.',
-        evidence: `${stats.forcePushes} force pushes this session`,
+        message: this.hasForcePushedToDefaultBranch
+          ? `Bare --force push used on the shared default branch (${this.repoContext.defaultBranch ?? 'default branch'}) — this can overwrite history other collaborators are building on. Always use --force-with-lease, and avoid force-pushing the default branch entirely if possible.`
+          : 'Bare --force push used. Always use --force-with-lease instead — it refuses to push if someone else has pushed to the branch since your last fetch. If you need to rewrite history, coordinate with collaborators first and ensure your local refs are up to date with `git fetch` before force pushing.',
+        evidence: this.hasForcePushedToDefaultBranch
+          ? `${this.bareForcePushCount} bare --force push(es) this session, including at least one on the default branch`
+          : `${this.bareForcePushCount} bare --force push(es) this session`,
       });
-    } else if (stats.forcePushes === 1) {
+    } else if (stats.riskIndicators.usesForceWithLease && stats.forcePushes >= 2) {
       suggestions.push({
         severity: 'info',
         category: 'force_push',
         message:
-          "Force push used. Prefer --force-with-lease for safer force pushes — it refuses to overwrite commits you haven't seen locally.",
-        evidence: '1 force push',
+          'Multiple force pushes this session, all using --force-with-lease — the safe pattern. Repeated history rewrites can still be worth a second look if they indicate a workflow issue upstream.',
+        evidence: `${stats.forcePushes} lease-protected force pushes this session`,
       });
     }
 
@@ -1358,17 +1528,20 @@ export class GitEfficiencyTracker {
   }
 
   private computeConflictStrategy(): ConflictResolutionStrategy {
-    const manualMergeCount =
+    const manualMergeCount = Math.max(
+      0,
       this.conflictRecords.filter((c) => c.resolution === 'resolved').length -
-      this.oursCount -
-      this.theirsCount;
+        this.oursCount -
+        this.theirsCount -
+        this.cherryPickCount,
+    );
 
     return {
       oursCount: this.oursCount,
       theirsCount: this.theirsCount,
-      manualMergeCount: Math.max(0, manualMergeCount),
+      manualMergeCount,
       cherryPickCount: this.cherryPickCount,
-      totalResolutions: this.oursCount + this.theirsCount + Math.max(0, manualMergeCount),
+      totalResolutions: this.oursCount + this.theirsCount + this.cherryPickCount + manualMergeCount,
     };
   }
 }

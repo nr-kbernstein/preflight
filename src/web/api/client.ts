@@ -10,8 +10,8 @@ export class NotFoundError extends Error {
   }
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(path, { signal });
   if (res.status === 404) throw new NotFoundError(path);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${path}`);
   return (await res.json()) as T;
@@ -25,7 +25,8 @@ export interface HealthResponse {
   readonly updateAvailable: boolean;
 }
 
-export const fetchHealth = (): Promise<HealthResponse> => getJson<HealthResponse>('/api/health');
+export const fetchHealth = (signal?: AbortSignal): Promise<HealthResponse> =>
+  getJson<HealthResponse>('/api/health', signal);
 
 export interface AntiPattern {
   readonly type: 'thrashing' | 're_reading' | 'stuck_loop' | 'blind_editing' | 'over_delegation';
@@ -40,6 +41,11 @@ export interface AntiPattern {
   readonly suggestion: string;
 }
 
+// Which source produced a session's display name, mirroring the server's
+// SessionNameSource (src/hooks/session-resolver.ts). Declared locally so the
+// web bundle never imports server code; keep the union in sync with the server.
+export type SessionNameSource = 'user' | 'ai-title' | 'auto' | 'cwd';
+
 // Real server type also has `sessionId`/`sessionName`/`liveSessions`/many more
 // counters (see SessionTracker.getMetrics() + efficiencyScore/liveSessions
 // added by the route). Declared fully so every current and future consumer
@@ -47,6 +53,10 @@ export interface AntiPattern {
 export interface SessionCurrentResponse {
   readonly sessionId: string;
   readonly sessionName: string | null;
+  // Lets the UI distinguish an authoritative user/ai-title/auto name from a
+  // cwd-basename fallback (null when unnamed). Matches session_name_source in
+  // the MCP tool response and the persisted summaries.
+  readonly sessionNameSource: SessionNameSource | null;
   readonly sessionStartTime: number;
   readonly sessionDurationMs: number;
   readonly toolCallCount: number;
@@ -86,17 +96,6 @@ export interface LatencyPercentiles {
   readonly count: number;
 }
 
-export interface LatencyMetrics {
-  readonly overall: LatencyPercentiles | null;
-  readonly byTool: Readonly<Record<string, LatencyPercentiles | null>>;
-  readonly slowestCalls: ReadonlyArray<{
-    readonly toolName: string;
-    readonly durationMs: number;
-    readonly timestamp: number;
-    readonly filePath?: string;
-  }>;
-}
-
 export interface ReplayTimelineEntry {
   readonly timestamp: number;
   readonly toolName: string;
@@ -108,6 +107,9 @@ export interface ReplayTimelineEntry {
   readonly isBuildCommand?: boolean;
   readonly isLintCommand?: boolean;
   readonly errorType?: string;
+  readonly agentId?: string;
+  readonly skillName?: string;
+  readonly agentType?: string;
 }
 
 export interface AntiPatternSegment {
@@ -117,6 +119,8 @@ export interface AntiPatternSegment {
   readonly iterations: number;
   readonly target: string;
   readonly severity: 'warning' | 'critical';
+  readonly agentId?: string;
+  readonly agentScoped?: boolean;
 }
 
 export interface SessionReplayResponse {
@@ -126,9 +130,21 @@ export interface SessionReplayResponse {
   readonly worstSegment: AntiPatternSegment | null;
 }
 
+// Mirrors src/metrics/session-status.ts's SessionStatus.
+export type SessionStatus = 'needs_input' | 'ready_for_review' | 'working' | 'completed';
+
 export interface TodayAggregateResponse {
   readonly toolCallCount: number;
   readonly totalCostUsd: number;
+  readonly unpricedByModel?: Readonly<
+    Record<string, { readonly calls: number; readonly tokens: number }>
+  >;
+  readonly estimatedByModel?: Readonly<
+    Record<
+      string,
+      { readonly calls: number; readonly tokens: number; readonly estimatedFrom: string }
+    >
+  >;
   readonly antiPatternCount: number;
   readonly avgDurationMs: number;
   readonly sessionCount: number;
@@ -144,6 +160,23 @@ export interface TodayAggregateResponse {
   readonly subagentUsd?: number;
   readonly subagentTurnCount?: number;
   readonly workflowRunCount?: number;
+  readonly avgEfficiencyScore?: number | null;
+  readonly forecastEndOfDayUsd?: number | null;
+  readonly latency?: {
+    readonly overall: LatencyPercentiles | null;
+    readonly byTool: Readonly<Record<string, LatencyPercentiles | null>>;
+  };
+  readonly cacheHealth?: {
+    readonly status: 'no_cache_activity' | 'needs_attention' | 'can_improve' | 'excellent';
+    readonly cacheHitRatePct: number | null;
+    readonly totalCacheReadTokens: number;
+    readonly totalCacheCreationTokens: number;
+    readonly totalSavingsUsd: number;
+  };
+  readonly sessionStatus?: {
+    readonly counts: Record<SessionStatus, number>;
+    readonly sessionIds: Record<SessionStatus, readonly string[]>;
+  };
 }
 
 // /api/sessions returns a heterogeneous mix of full persisted session
@@ -157,12 +190,28 @@ export interface SessionListEntry {
   readonly durationMs?: number;
   readonly toolCallCount?: number;
   readonly estimatedCostUsd?: number | null;
-  readonly antiPatterns?: Array<{ type: string; count: number }>;
+  readonly antiPatterns?: Array<{
+    readonly type: string;
+    readonly file?: string;
+    readonly command?: string;
+    readonly iterations?: number;
+    readonly readCount?: number;
+    readonly repeatCount?: number;
+    readonly editCount?: number;
+    readonly agentCount?: number;
+  }>;
   readonly model?: string | null;
   readonly toolSuccessRate?: number | null;
   readonly efficiencyScore?: number | null;
   readonly tokensInput?: number;
   readonly tokensOutput?: number;
+  readonly tokensCacheRead?: number;
+  readonly tokensCacheCreation?: number;
+  readonly tokensThinking?: number;
+  /** Absent on live-session stub entries (see this interface's docstring) —
+   *  only persisted full summaries carry it. Powers the Git Efficiency tab's
+   *  "view sessions for this repo" deep link. */
+  readonly repoName?: string | null;
 }
 
 export interface LiveSessionEntry {
@@ -184,7 +233,6 @@ export interface CostBreakdown {
 
 export interface CostMetrics {
   readonly sessionTotalCostUsd: number | null;
-  readonly costByTask: null;
   readonly costByModel: Record<string, number>;
   readonly costPerLineOfCode: number | null;
   readonly costPerFileModified: number | null;
@@ -218,17 +266,17 @@ export interface CostResponse {
   readonly sessionTodayUsd: number | null;
 }
 
-export const fetchSessionCurrent = (): Promise<SessionCurrentResponse> =>
-  getJson<SessionCurrentResponse>('/api/session/current');
-export const fetchSessionsList = (limit = 50): Promise<SessionListEntry[]> =>
-  getJson<SessionListEntry[]>(`/api/sessions?limit=${limit}`);
+export const fetchSessionCurrent = (signal?: AbortSignal): Promise<SessionCurrentResponse> =>
+  getJson<SessionCurrentResponse>('/api/session/current', signal);
+export const fetchSessionsList = (limit = 50, signal?: AbortSignal): Promise<SessionListEntry[]> =>
+  getJson<SessionListEntry[]>(`/api/sessions?limit=${limit}`, signal);
 // Cross-session aggregate KPIs for the Today view.
-export const fetchTodayAggregate = (): Promise<TodayAggregateResponse> =>
-  getJson<TodayAggregateResponse>('/api/sessions/today/aggregate');
+export const fetchTodayAggregate = (signal?: AbortSignal): Promise<TodayAggregateResponse> =>
+  getJson<TodayAggregateResponse>('/api/sessions/today/aggregate', signal);
 // Currently-live session list (for the Today selector to default to the
 // most-recently-active session).
-export const fetchLiveSessions = (): Promise<LiveSessionEntry[]> =>
-  getJson<LiveSessionEntry[]>('/api/sessions/live');
+export const fetchLiveSessions = (signal?: AbortSignal): Promise<LiveSessionEntry[]> =>
+  getJson<LiveSessionEntry[]>('/api/sessions/live', signal);
 // /api/sessions/:id returns one of three shapes depending on session state:
 // a persisted session record, a live session owned by this dashboard's own
 // SessionTracker, or a live session tracked by LiveSessionRegistry but owned
@@ -242,12 +290,54 @@ export interface SessionDetail {
   readonly durationMs?: number;
   readonly estimatedCostUsd?: number | null;
   readonly model?: string | null;
+  // Per-model request/token/cost counters for this session. Present when the
+  // session used one or more models — when it used more than one (a
+  // mid-session model switch, e.g. via /model), `model` above only reflects
+  // whichever model was current at read time, so the UI should prefer this
+  // for display when it has more than one key.
+  readonly modelBreakdown?: Readonly<
+    Record<
+      string,
+      {
+        readonly requestCount: number;
+        readonly totalInputTokens: number;
+        readonly totalOutputTokens: number;
+        readonly totalCostUsd: number;
+        readonly totalCacheReadTokens: number;
+        readonly totalCacheCreationTokens: number;
+        readonly totalThinkingTokens: number;
+      }
+    >
+  >;
   readonly outcome?: string;
   readonly toolBreakdown?: Record<string, number>;
   readonly filesRead?: string[];
   readonly filesModified?: string[];
-  readonly antiPatterns?: Array<{ type: string; count: number }>;
+  readonly antiPatterns?: Array<{
+    readonly type: string;
+    readonly file?: string;
+    readonly command?: string;
+    readonly iterations?: number;
+    readonly readCount?: number;
+    readonly repeatCount?: number;
+    readonly editCount?: number;
+    readonly agentCount?: number;
+  }>;
   readonly timeline?: ReadonlyArray<ReplayTimelineEntry>;
+  readonly linesAdded?: number;
+  readonly linesRemoved?: number;
+  readonly tokensInput?: number;
+  readonly tokensOutput?: number;
+  readonly tokensCacheRead?: number;
+  readonly tokensCacheCreation?: number;
+  // Mirrors SessionAttribution (src/storage/types.ts, not importable).
+  readonly attribution?: {
+    readonly buckets: Partial<
+      Record<'tool' | 'skill' | 'subagent', Record<string, AttributionBucket>>
+    >;
+    readonly highContextCostUsd: number;
+    readonly apiDurationMs: number | null;
+  };
   readonly qualityProxy?: {
     readonly diffApplyRate: number | null;
     readonly testPassRate: number | null;
@@ -262,11 +352,124 @@ export interface SessionDetail {
   };
 }
 
-export const fetchSessionDetail = (id: string): Promise<SessionDetail> =>
-  getJson<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`);
-export const fetchCost = (): Promise<CostResponse> => getJson<CostResponse>('/api/cost');
-export const fetchAntiPatterns = (): Promise<AntiPattern[]> =>
-  getJson<AntiPattern[]>('/api/anti-patterns');
+export const fetchSessionDetail = (id: string, signal?: AbortSignal): Promise<SessionDetail> =>
+  getJson<SessionDetail>(`/api/sessions/${encodeURIComponent(id)}`, signal);
+export const fetchCost = (signal?: AbortSignal): Promise<CostResponse> =>
+  getJson<CostResponse>('/api/cost', signal);
+export const fetchAntiPatterns = (signal?: AbortSignal): Promise<AntiPattern[]> =>
+  getJson<AntiPattern[]>('/api/anti-patterns', signal);
+
+export interface ComputeWasteResponse {
+  readonly total_tokens_wasted: number;
+  readonly retry_tokens_wasted: number;
+  readonly anti_pattern_tokens_wasted: number;
+  readonly breakdown: ReadonlyArray<{
+    readonly type: string;
+    readonly tokens_wasted: number;
+    readonly instances: number;
+  }>;
+  // Attributes retry_tokens_wasted back to the session(s) that caused it —
+  // anti-pattern waste has no per-session attribution yet, so this only ever
+  // covers the retry portion. Sorted descending by tokens_wasted.
+  readonly by_session: ReadonlyArray<{
+    readonly session_id: string;
+    readonly tokens_wasted: number;
+    readonly alert_count: number;
+  }>;
+  readonly status: 'clean' | 'moderate' | 'needs_attention';
+}
+
+export const fetchComputeWaste = (signal?: AbortSignal): Promise<ComputeWasteResponse> =>
+  getJson<ComputeWasteResponse>('/api/compute-waste', signal);
+
+export interface DecisionBranchEntry {
+  readonly turnNumber: number;
+  readonly timestamp: number;
+  readonly reasoning: string;
+  readonly chosenAction: string;
+  readonly toolName: string | null;
+  readonly outcome: 'unknown' | 'success' | 'failure';
+  readonly nextToolSuccess: boolean | null;
+  readonly sessionSucceeded: boolean | null;
+}
+
+export interface DecisionTreeResponse {
+  readonly totalBranches: number;
+  readonly successRate: number | null;
+  readonly failurePoints: readonly DecisionBranchEntry[];
+  readonly longestFailureStreak: number;
+  readonly firstFailureIndex: number | null;
+  readonly note: string;
+}
+
+export interface TurnCostEntry {
+  readonly turnId: string;
+  readonly startTime: number;
+  readonly endTime: number;
+  readonly toolCalls: readonly string[];
+  readonly toolNames: readonly string[];
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly model: string;
+  readonly estimatedCostUsd: number;
+  readonly costPerToolCall: number;
+}
+
+export interface TurnCostsResponse {
+  readonly turns: readonly TurnCostEntry[];
+  readonly costByToolType: Record<
+    string,
+    { totalCost: number; callCount: number; avgCost: number; tokens?: number }
+  >;
+  readonly costBySkill?: Record<
+    string,
+    {
+      callCount: number;
+      attributedCallCount: number;
+      totalCost: number;
+      avgCost: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      totalDurationMs: number;
+      readonly tokens?: number;
+    }
+  >;
+  readonly totalAttributedCost: number;
+  readonly attributionRate: number;
+  // Set only by the windowed (?days=) GET /api/cost-per-tool path — how many
+  // of the window's sessions actually carry attribution.buckets data, since
+  // most historical sessions predate that field. Absent on the unwindowed
+  // (today) response, which never had this concept.
+  readonly attributedSessionCount?: number;
+  readonly totalSessionCount?: number;
+}
+
+// sessionId scopes the result to one session's own decision-
+// tree/turn-cost data instead of whichever session(s) this process-global
+// tracker happened to have most recently accumulated (in `--local` mode,
+// several concurrently-live sessions blended together). Omit to preserve
+// the old unscoped behavior.
+export const fetchDecisionTree = (
+  sessionId?: string,
+  signal?: AbortSignal,
+): Promise<DecisionTreeResponse> =>
+  getJson<DecisionTreeResponse>(
+    sessionId
+      ? `/api/decision-tree?sessionId=${encodeURIComponent(sessionId)}`
+      : '/api/decision-tree',
+    signal,
+  );
+export const fetchTurnCosts = (
+  sessionId?: string,
+  signal?: AbortSignal,
+): Promise<TurnCostsResponse> =>
+  getJson<TurnCostsResponse>(
+    sessionId ? `/api/turn-costs?sessionId=${encodeURIComponent(sessionId)}` : '/api/turn-costs',
+    signal,
+  );
+
 export interface QualityEvent {
   readonly signal:
     | 'diff_applied_clean'
@@ -321,17 +524,24 @@ export interface ToolSelectionMetrics {
 // Mirrors AuditEntryDto in src/dashboard/routes/api-handler.ts (not importable —
 // tsconfig.web.json excludes server source). sessionId is `string | null` at
 // runtime (never `undefined`) — the real handler's toAuditEntry() always sets it,
-// falling back to null when the underlying audit record has none.
+// falling back to null when the underlying audit record has none. id is a stable
+// per-call identifier (sourced from AuditRecord.id) — use it as the React key
+// instead of deriving one from ts/tool/target, which collide when two distinct
+// calls share a timestamp.
 export interface AuditEntry {
+  readonly id: string;
   readonly ts: number;
   readonly sessionId: string | null;
   readonly tool: string;
   readonly target: string;
   readonly classification: string;
   readonly severity?: string;
+  readonly agentId?: string;
+  readonly agentType?: string;
 }
 
-export const fetchAuditLog = (): Promise<AuditEntry[]> => getJson<AuditEntry[]>('/api/audit');
+export const fetchAuditLog = (signal?: AbortSignal): Promise<AuditEntry[]> =>
+  getJson<AuditEntry[]>('/api/audit', signal);
 
 // Mirrors WeeklySummary in src/storage/weekly-summary.ts (not importable —
 // tsconfig.web.json excludes server source). Only the fields the History
@@ -345,7 +555,8 @@ export interface WeeklyRow {
   readonly antiPatternCounts: Record<string, number>;
 }
 
-export const fetchWeekly = (): Promise<WeeklyRow[]> => getJson<WeeklyRow[]>('/api/weekly');
+export const fetchWeekly = (signal?: AbortSignal): Promise<WeeklyRow[]> =>
+  getJson<WeeklyRow[]>('/api/weekly', signal);
 
 // Mirrors BudgetStatus in src/metrics/budget-tracker.ts (not importable —
 // tsconfig.web.json excludes server source). Alerts.tsx never reads
@@ -372,8 +583,8 @@ export interface BudgetStatus {
   readonly alerts: readonly BudgetAlert[];
 }
 
-export const fetchBudget = (): Promise<BudgetStatus> => getJson<BudgetStatus>('/api/budget');
-export const fetchLatency = (): Promise<LatencyMetrics> => getJson<LatencyMetrics>('/api/latency');
+export const fetchBudget = (signal?: AbortSignal): Promise<BudgetStatus> =>
+  getJson<BudgetStatus>('/api/budget', signal);
 
 // Mirrors CostAttribution in src/metrics/cost-per-outcome.ts (not importable).
 export interface CostPerOutcomeResponse {
@@ -386,8 +597,92 @@ export interface CostPerOutcomeResponse {
   readonly totalTasks: number;
 }
 
-export const fetchCostPerOutcome = (days = 30): Promise<CostPerOutcomeResponse> =>
-  getJson<CostPerOutcomeResponse>(`/api/cost-per-outcome?days=${days}`);
+export const fetchCostPerOutcome = (
+  days = 30,
+  signal?: AbortSignal,
+): Promise<CostPerOutcomeResponse> =>
+  getJson<CostPerOutcomeResponse>(`/api/cost-per-outcome?days=${days}`, signal);
+
+export interface AttributionBucket {
+  readonly costUsd: number;
+  readonly tokens: number;
+  readonly count: number;
+  readonly durationMs: number;
+}
+
+// Mirrors src/metrics/usage-insights.ts (not importable from the web bundle).
+export type UsageInsightId =
+  'high_context' | 'subagent_heavy' | 'long_sessions' | 'loops' | 'plugins';
+
+// Mirrors src/storage/types.ts's TokenBreakdown.
+export interface TokenBreakdown {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheCreationTokens: number;
+}
+
+export interface UsageShareRow {
+  readonly key: string;
+  readonly costUsd: number;
+  readonly tokens: number;
+  readonly count: number;
+  readonly sharePct: number;
+  readonly breakdown?: TokenBreakdown;
+}
+
+export interface UsageInsight extends UsageShareRow {
+  readonly id: UsageInsightId;
+  readonly sessionCount: number;
+  readonly headline: string;
+  readonly advice: string;
+}
+
+export interface LoopRow {
+  readonly sessionId: string;
+  readonly sessionName: string | null;
+  readonly runs: number;
+  readonly tokens: number;
+  readonly tokensPerRun: number;
+  readonly costUsd: number;
+  readonly lastRunMs: number;
+}
+
+export interface UsageInsightsReport {
+  readonly windowDays: number;
+  readonly sessionCount: number;
+  readonly totalCostUsd: number;
+  readonly totalTokens: number;
+  readonly insights: readonly UsageInsight[];
+  readonly skills: readonly UsageShareRow[];
+  readonly subagents: readonly UsageShareRow[];
+  readonly plugins: readonly UsageShareRow[];
+  readonly loops: readonly LoopRow[];
+  /** Distinct keys seen in the window before each table was capped to its top rows. */
+  readonly skillsTotalCount: number;
+  readonly subagentsTotalCount: number;
+  readonly pluginsTotalCount: number;
+  readonly loopsTotalCount: number;
+  readonly attributionRatePct: number | null;
+}
+
+export const fetchUsageInsights = (
+  window: number | 'today' = 7,
+  signal?: AbortSignal,
+): Promise<UsageInsightsReport> =>
+  getJson<UsageInsightsReport>(
+    window === 'today' ? '/api/usage-insights?window=today' : `/api/usage-insights?days=${window}`,
+    signal,
+  );
+
+// Mirrors the subset of PersonalWeekMetrics (src/metrics/personal-coach.ts,
+// not importable) actually rendered by CoachMetricsTable.
+export interface PersonalWeekMetrics {
+  readonly avgEfficiencyScore: number | null;
+  readonly avgCostPerSession: number;
+  readonly antiPatternRate: number;
+  readonly sessionsCount: number;
+}
 
 // Mirrors the 'ok'/'insufficient_data' union returned by PersonalCoach.generate()
 // in src/metrics/personal-coach.ts (not importable).
@@ -397,6 +692,9 @@ export interface PersonalCoachReport {
   readonly regressions: readonly string[];
   readonly streaks: readonly string[];
   readonly topRecommendation: string;
+  readonly thisWeek: PersonalWeekMetrics;
+  readonly baseline: PersonalWeekMetrics;
+  readonly weeksAnalyzed: number;
 }
 
 export interface PersonalCoachInsufficientData {
@@ -406,12 +704,101 @@ export interface PersonalCoachInsufficientData {
 
 export type PersonalCoachResult = PersonalCoachReport | PersonalCoachInsufficientData;
 
-export const fetchPersonalCoach = (): Promise<PersonalCoachResult> =>
-  getJson<PersonalCoachResult>('/api/personal-coach');
-export const fetchRecentAlerts = (): Promise<AlertEvent[]> =>
-  getJson<AlertEvent[]>('/api/alerts/recent');
-export const fetchSessionReplay = (id: string): Promise<SessionReplayResponse> =>
-  getJson<SessionReplayResponse>(`/api/sessions/${encodeURIComponent(id)}/replay`);
+export const fetchPersonalCoach = (signal?: AbortSignal): Promise<PersonalCoachResult> =>
+  getJson<PersonalCoachResult>('/api/personal-coach', signal);
+
+// Mirrors Recommendation in src/metrics/recommendation-engine.ts (not importable).
+export interface RecommendationItem {
+  readonly id: string;
+  readonly category: string;
+  readonly priority: 'high' | 'medium' | 'low';
+  readonly title: string;
+  readonly detail: string;
+  readonly evidence: string;
+  readonly estimatedSavings?: string;
+}
+
+export interface RecommendationsApiResponse {
+  readonly recommendations: readonly RecommendationItem[];
+  readonly count: number;
+}
+
+export const fetchRecommendations = (signal?: AbortSignal): Promise<RecommendationsApiResponse> =>
+  getJson<RecommendationsApiResponse>('/api/recommendations', signal);
+
+// Mirrors the subset of AggregateMetrics (src/metrics/claudemd-tracker.ts, not
+// importable) actually rendered by ClaudeMdImpactPanel.
+export interface AggregateMetricsSubset {
+  readonly avgEfficiencyScore: number | null;
+  readonly avgCostUsd: number;
+  readonly avgCorrectionRate: number;
+  readonly sessionCount: number;
+}
+
+export interface MetricDelta {
+  readonly value: number;
+  readonly percentChange: number | null;
+  readonly improved: boolean;
+}
+
+// Mirrors the shape built by GET /api/claudemd-impact in api-handler.ts.
+export interface ClaudeMdImpactApiResponse {
+  readonly message?: string;
+  readonly change?: {
+    readonly filePath: string;
+    readonly changeType: 'created' | 'modified' | 'deleted';
+    readonly timestamp: number;
+    readonly linesAdded: number;
+    readonly linesRemoved: number;
+  };
+  readonly before?: AggregateMetricsSubset;
+  readonly after?: AggregateMetricsSubset;
+  readonly deltas?: {
+    readonly efficiencyScore: MetricDelta | null;
+    readonly cost: MetricDelta;
+    readonly correctionRate: MetricDelta;
+  };
+  readonly contextTokensForClaudeMd?: number | null;
+  readonly verdict?: string;
+}
+
+export const fetchClaudeMdImpact = (signal?: AbortSignal): Promise<ClaudeMdImpactApiResponse> =>
+  getJson<ClaudeMdImpactApiResponse>('/api/claudemd-impact', signal);
+
+// Mirrors the shape built by GET /api/collaboration-profile in api-handler.ts.
+export interface CollaborationProfileApiResponse {
+  readonly classification: string;
+  readonly dimensions: {
+    readonly specificity: number;
+    readonly autonomy: number;
+    readonly correctionRate: number;
+    readonly taskComplexity: number;
+  };
+  readonly sessionCount: number;
+  readonly teamDeltas: {
+    readonly specificity: number;
+    readonly autonomy: number;
+    readonly correctionRate: number;
+    readonly taskComplexity: number;
+  };
+  // Number of distinct developers folded into the team baseline `teamDeltas`
+  // was compared against. <= 1 means there's no other developer's data yet,
+  // so "vs team" is really "vs yourself".
+  readonly developerCount: number;
+}
+
+export const fetchCollaborationProfile = (
+  signal?: AbortSignal,
+): Promise<CollaborationProfileApiResponse> =>
+  getJson<CollaborationProfileApiResponse>('/api/collaboration-profile', signal);
+
+export const fetchRecentAlerts = (signal?: AbortSignal): Promise<AlertEvent[]> =>
+  getJson<AlertEvent[]>('/api/alerts/recent', signal);
+export const fetchSessionReplay = (
+  id: string,
+  signal?: AbortSignal,
+): Promise<SessionReplayResponse> =>
+  getJson<SessionReplayResponse>(`/api/sessions/${encodeURIComponent(id)}/replay`, signal);
 // Mirrors GET /api/sessions/:sessionId/subagents `agents[]`.
 export interface AgentSpan {
   readonly agentId: string;
@@ -434,8 +821,11 @@ export interface SessionSubagentsResponse {
 
 // Subagent fan-out timeline for a session, sorted by startMs ASC. Consumed
 // by the Sessions detail pane's AgentSwimlanes chart and by SessionTrace.
-export const fetchSessionSubagents = (id: string): Promise<SessionSubagentsResponse> =>
-  getJson<SessionSubagentsResponse>(`/api/sessions/${encodeURIComponent(id)}/subagents`);
+export const fetchSessionSubagents = (
+  id: string,
+  signal?: AbortSignal,
+): Promise<SessionSubagentsResponse> =>
+  getJson<SessionSubagentsResponse>(`/api/sessions/${encodeURIComponent(id)}/subagents`, signal);
 
 // GET /api/sessions/:id/subagents/:agentId/calls → { calls: [...] }. No
 // file/command detail in this wire shape (kept lean for the per-agent
@@ -453,14 +843,19 @@ export interface AgentCallsResponse {
 
 // ONE subagent's individual tool calls for the attributed session-trace
 // view, sorted by timestamp ASC. Lazily fetched when a swimlane row expands.
-export const fetchAgentCalls = (sessionId: string, agentId: string): Promise<AgentCallsResponse> =>
+export const fetchAgentCalls = (
+  sessionId: string,
+  agentId: string,
+  signal?: AbortSignal,
+): Promise<AgentCallsResponse> =>
   getJson<AgentCallsResponse>(
     `/api/sessions/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(agentId)}/calls`,
+    signal,
   );
-export const fetchQualityProxy = (): Promise<QualityProxyMetrics> =>
-  getJson<QualityProxyMetrics>('/api/quality-proxy');
-export const fetchToolSelectionScore = (): Promise<ToolSelectionMetrics> =>
-  getJson<ToolSelectionMetrics>('/api/tool-selection-score');
+export const fetchQualityProxy = (signal?: AbortSignal): Promise<QualityProxyMetrics> =>
+  getJson<QualityProxyMetrics>('/api/quality-proxy', signal);
+export const fetchToolSelectionScore = (signal?: AbortSignal): Promise<ToolSelectionMetrics> =>
+  getJson<ToolSelectionMetrics>('/api/tool-selection-score', signal);
 export interface GitSuggestion {
   readonly severity: 'info' | 'warning' | 'critical';
   readonly category: string;
@@ -473,6 +868,7 @@ export interface MergeConflictRecord {
   readonly resolution: 'resolved' | 'aborted' | 'pending';
   readonly resolutionTimeMs: number | null;
   readonly command: string;
+  readonly files: readonly string[];
 }
 
 export interface GitEvent {
@@ -481,12 +877,20 @@ export interface GitEvent {
   readonly command?: string;
   readonly success: boolean;
   readonly durationMs: number | null;
+  readonly repo?: string | null;
+  readonly subject?: string | null;
+  readonly url?: string | null;
 }
 
 export interface BestPractice {
   readonly id: string;
   readonly label: string;
-  readonly status: 'pass' | 'fail' | 'warn' | 'unknown';
+  /**
+   * `'n/a'` (fully known, not applicable) is distinct from `'unknown'`
+   * (genuinely insufficient data) — see `BestPractice`'s docstring in
+   * `git-efficiency-tracker.ts` for the full explanation.
+   */
+  readonly status: 'pass' | 'fail' | 'warn' | 'unknown' | 'n/a';
   readonly detail: string;
 }
 
@@ -504,13 +908,6 @@ export interface RiskIndicators {
   readonly commitsBehindMain: number | null;
   readonly sessionDurationMs: number | null;
   readonly quickConflictResolutions: number;
-}
-
-export interface RepoContext {
-  readonly repoName: string | null;
-  readonly branch: string | null;
-  readonly remoteName: string | null;
-  readonly defaultBranch: string | null;
 }
 
 export interface PrEvent {
@@ -545,9 +942,33 @@ export interface ConflictResolutionStrategy {
   readonly totalResolutions: number;
 }
 
-// Mirrors GitEfficiencyTracker.getMetrics()'s return shape in
-// src/metrics/git-efficiency-tracker.ts (not importable).
-export interface GitEfficiencyData {
+// Mirrors WorktreeIdentity in src/metrics/git-workspace-identity.ts (not
+// importable — tsconfig.web.json excludes server source).
+export interface WorktreeIdentity {
+  readonly repoKey: string;
+  readonly worktreeKey: string;
+  readonly repoName: string | null;
+  readonly worktreeRoot: string | null;
+  readonly worktreeLabel: string;
+  readonly branch: string | null;
+}
+
+// Mirrors WorktreeLiveState in src/metrics/git-workspace-report.ts (not
+// importable). Only ever non-null when scope.kind === 'worktree'.
+export interface WorktreeLiveState {
+  readonly branch: string | null;
+  readonly defaultBranch: string | null;
+  readonly ahead: number | null;
+  readonly behind: number | null;
+  readonly measuredAtMs: number;
+}
+
+// Mirrors WorkspaceMetrics in src/metrics/git-workspace-report.ts (not
+// importable). Same fields GitEfficiencyData used to carry, minus
+// `repoContext` (there's no single repo context at rollup scope — the header
+// shows whichever scope is selected instead), plus `liveState` and the
+// rollup-support fields below.
+export interface WorkspaceMetrics {
   readonly totalGitCommands: number;
   readonly mergeConflicts: number;
   readonly rebaseConflicts: number;
@@ -572,26 +993,77 @@ export interface GitEfficiencyData {
   readonly velocityMetrics: VelocityMetrics;
   readonly conflictResolutionStrategy: ConflictResolutionStrategy;
   readonly prMetrics: PullRequestMetrics;
-  readonly repoContext: RepoContext;
+  readonly liveState: WorktreeLiveState | null;
+  readonly commitTimestamps: readonly number[];
+  readonly lastPushTimestamp: number | null;
+  readonly editedFiles: readonly string[];
+  readonly hasUsedBareForcePush: boolean;
+  readonly bareForcePushCount: number;
+  readonly hasForcePushedToDefaultBranch: boolean;
+  readonly mergeEventCount: number;
+  readonly rebaseEventCount: number;
+  readonly lastActivityMs: number | null;
+  readonly sessionIds: readonly string[];
 }
 
-export const fetchGitEfficiency = (): Promise<GitEfficiencyData> =>
-  getJson<GitEfficiencyData>('/api/git-efficiency');
-
-export interface GitEfficiencyReposResponse {
-  readonly repos: string[];
-  readonly currentRepo: string | null;
+// Mirrors ScopeRef in src/metrics/git-workspace-report.ts (not importable).
+export interface ScopeRef {
+  readonly kind: 'all' | 'repo' | 'worktree';
+  readonly id?: string;
 }
 
-export const fetchGitEfficiencyRepos = (): Promise<GitEfficiencyReposResponse> =>
-  getJson<GitEfficiencyReposResponse>('/api/git-efficiency/repos');
+// Client-side convenience shape for building a scope query string, kept
+// distinct from the wire-level `ScopeRef` so callers don't have to spell out
+// `{ kind: 'repo', id }` at every call site.
+export type ScopeRefInput = 'all' | { readonly repo: string } | { readonly worktree: string };
+
+/** Formats a `ScopeRefInput` into the `scope` query param the server parses
+ *  (`all` / `repo:<id>` / `worktree:<id>`). Does not encode — callers pass
+ *  the result through `encodeURIComponent` when building the URL. */
+export function formatScope(ref: ScopeRefInput): string {
+  if (ref === 'all') return 'all';
+  if ('repo' in ref) return `repo:${ref.repo}`;
+  return `worktree:${ref.worktree}`;
+}
+
+// Mirrors WorkspaceRow in src/metrics/git-workspace-report.ts (not importable).
+export interface WorkspaceRow {
+  readonly identity: WorktreeIdentity;
+  readonly metrics: WorkspaceMetrics;
+}
+
+// Mirrors GitWorkspaceReport in src/metrics/git-workspace-report.ts (not
+// importable) — the response shape GET /api/git-efficiency now returns.
+export interface GitWorkspaceReport {
+  readonly scope: ScopeRef;
+  readonly metrics: WorkspaceMetrics;
+  readonly rows: readonly WorkspaceRow[];
+  readonly worstBehind: {
+    readonly identity: WorktreeIdentity;
+    readonly behind: number;
+  } | null;
+  /** The exact `[since, until)` bounds the server resolved the requested
+   *  `window` string into — lets the UI render the real date range instead
+   *  of re-deriving "what 'week' means" itself. */
+  readonly since: number;
+  readonly until: number;
+}
+
+export const fetchGitEfficiency = (
+  window: string = 'today',
+  scope: string = 'all',
+  signal?: AbortSignal,
+): Promise<GitWorkspaceReport> =>
+  getJson<GitWorkspaceReport>(
+    `/api/git-efficiency?window=${encodeURIComponent(window)}&scope=${encodeURIComponent(scope)}`,
+    signal,
+  );
 
 export interface ModelStats {
   readonly requestCount: number;
   readonly totalInputTokens: number;
   readonly totalOutputTokens: number;
   readonly totalCostUsd: number;
-  readonly costPerOutputToken: number | null;
   readonly costPerMillionTokens: number | null;
   readonly avgOutputTokensPerRequest: number | null;
 }
@@ -599,7 +1071,6 @@ export interface ModelStats {
 export interface ModelUsageMetrics {
   readonly byModel: Readonly<Record<string, ModelStats>>;
   readonly mostUsedModel: string | null;
-  readonly mostEfficientModel: string | null;
   readonly totalModelsUsed: number;
 }
 
@@ -647,25 +1118,39 @@ export interface ActivityHeatmapHistoryResponse {
   readonly maxCount: number;
 }
 
-export const fetchConcurrency = (): Promise<ConcurrencyResponse> =>
-  getJson<ConcurrencyResponse>('/api/concurrency');
+export const fetchConcurrency = (signal?: AbortSignal): Promise<ConcurrencyResponse> =>
+  getJson<ConcurrencyResponse>('/api/concurrency', signal);
 export interface ConcurrencyHistoryResponse {
   readonly dailyPeaks: ReadonlyArray<{ readonly date: string; readonly peak: number }>;
 }
 
-export const fetchConcurrencyHistory = (days = 30): Promise<ConcurrencyHistoryResponse> =>
-  getJson<ConcurrencyHistoryResponse>(`/api/concurrency?view=history&days=${days}`);
-export function fetchActivityHeatmap(view: 'today'): Promise<ActivityHeatmapTodayResponse>;
+export const fetchConcurrencyHistory = (
+  days = 30,
+  signal?: AbortSignal,
+): Promise<ConcurrencyHistoryResponse> =>
+  getJson<ConcurrencyHistoryResponse>(`/api/concurrency?view=history&days=${days}`, signal);
+export function fetchActivityHeatmap(
+  view: 'today',
+  weeks?: undefined,
+  signal?: AbortSignal,
+): Promise<ActivityHeatmapTodayResponse>;
 export function fetchActivityHeatmap(
   view: 'history',
   weeks?: number,
+  signal?: AbortSignal,
 ): Promise<ActivityHeatmapHistoryResponse>;
 export function fetchActivityHeatmap(
   view: string,
   weeks?: number,
+  signal?: AbortSignal,
 ): Promise<ActivityHeatmapTodayResponse | ActivityHeatmapHistoryResponse> {
+  // The server has no way to know the viewing browser's timezone on its own —
+  // send it explicitly so "today"/each day's boundary is drawn where the
+  // browser is, not where the dashboard server process happens to run.
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   return getJson<ActivityHeatmapTodayResponse | ActivityHeatmapHistoryResponse>(
-    `/api/activity-heatmap?view=${encodeURIComponent(view)}${weeks ? `&weeks=${weeks}` : ''}`,
+    `/api/activity-heatmap?view=${encodeURIComponent(view)}${weeks ? `&weeks=${weeks}` : ''}&tz=${encodeURIComponent(tz)}`,
+    signal,
   );
 }
 // Mirrors ContextTrackerMetrics in src/metrics/context-tracker.ts (not
@@ -718,10 +1203,58 @@ export interface ContextResponse {
   readonly history: readonly ContextTurnSnapshot[];
 }
 
-export const fetchContext = (sessionId?: string): Promise<ContextResponse> =>
+export const fetchContext = (sessionId?: string, signal?: AbortSignal): Promise<ContextResponse> =>
   getJson<ContextResponse>(
     sessionId ? `/api/context?sessionId=${encodeURIComponent(sessionId)}` : '/api/context',
+    signal,
   );
+
+export type ContextCategory =
+  'system_prompt' | 'conversation_history' | 'tool_results' | 'injected_file_content' | 'other';
+
+export interface ContextCompositionResponse {
+  readonly currentFillPercent: number;
+  readonly currentBreakdown: Record<ContextCategory, number>;
+  readonly turnCount: number;
+  readonly thresholdAlerts: ReadonlyArray<{
+    readonly threshold: number;
+    readonly fillPercent: number;
+    readonly timestamp: number;
+    readonly turnNumber: number;
+    readonly dominantCategory: ContextCategory;
+    readonly dominantPercent: number;
+  }>;
+  readonly dominanceAlerts: ReadonlyArray<{
+    readonly category: ContextCategory;
+    readonly percent: number;
+    readonly timestamp: number;
+    readonly turnNumber: number;
+  }>;
+  readonly history: ReadonlyArray<{
+    readonly turnNumber: number;
+    readonly timestamp: number;
+    readonly totalTokens: number;
+    readonly breakdown: Record<ContextCategory, number>;
+    readonly fillPercent: number;
+    readonly dominantCategory: ContextCategory | null;
+  }>;
+  readonly note: string;
+}
+
+export interface ContextEfficiencyResponse {
+  readonly uniqueFilesRead: number;
+  readonly totalReadOperations: number;
+  readonly repeatedReadCount: number;
+  readonly repeatedReadRatio: number | null;
+  readonly topRepeatedFiles: ReadonlyArray<{ readonly file: string; readonly readCount: number }>;
+}
+
+export const fetchContextComposition = (
+  signal?: AbortSignal,
+): Promise<ContextCompositionResponse> =>
+  getJson<ContextCompositionResponse>('/api/context-composition', signal);
+export const fetchContextEfficiency = (signal?: AbortSignal): Promise<ContextEfficiencyResponse> =>
+  getJson<ContextEfficiencyResponse>('/api/context-efficiency', signal);
 
 export interface SettingsPatch {
   developer?: string;
@@ -743,10 +1276,29 @@ export interface SettingsPatch {
   };
 }
 
-export const fetchModelUsage = (): Promise<ModelUsageMetrics> =>
-  getJson<ModelUsageMetrics>('/api/model-usage');
-export const fetchCacheHealth = (): Promise<CacheHealthResponse> =>
-  getJson<CacheHealthResponse>('/api/cache-health');
+export const fetchModelUsage = (signal?: AbortSignal): Promise<ModelUsageMetrics> =>
+  getJson<ModelUsageMetrics>('/api/model-usage', signal);
+export const fetchCacheHealth = (signal?: AbortSignal): Promise<CacheHealthResponse> =>
+  getJson<CacheHealthResponse>('/api/cache-health', signal);
+// Same underlying tracker/shape as fetchTurnCosts (both read
+// TurnCostAttributor.getMetrics()) — reuses TurnCostsResponse rather than
+// duplicating an identical interface. sessionId scopes the same way; days
+// requests the windowed, persisted-sessions-only variant (History's Tools
+// table). The two are mutually exclusive server-side — sessionId wins if
+// both are passed.
+export const fetchCostPerTool = (
+  sessionId?: string,
+  days?: number,
+  signal?: AbortSignal,
+): Promise<TurnCostsResponse> =>
+  getJson<TurnCostsResponse>(
+    sessionId
+      ? `/api/cost-per-tool?sessionId=${encodeURIComponent(sessionId)}`
+      : days !== undefined
+        ? `/api/cost-per-tool?days=${days}`
+        : '/api/cost-per-tool',
+    signal,
+  );
 
 // Mirrors the real GET /api/settings handler response in
 // src/dashboard/routes/api-handler.ts (not importable — tsconfig.web.json
@@ -780,8 +1332,8 @@ export interface SettingsResponse {
   };
 }
 
-export const fetchSettings = (): Promise<SettingsResponse> =>
-  getJson<SettingsResponse>('/api/settings');
+export const fetchSettings = (signal?: AbortSignal): Promise<SettingsResponse> =>
+  getJson<SettingsResponse>('/api/settings', signal);
 
 // Mirrors the real exported DiagnosticCheck in src/install/diagnostics.ts
 // (not importable — tsconfig.web.json excludes server source).
@@ -792,8 +1344,8 @@ export interface DiagnosticCheck {
   readonly fix?: string;
 }
 
-export const fetchDiagnostics = (): Promise<DiagnosticCheck[]> =>
-  getJson<DiagnosticCheck[]>('/api/diagnostics');
+export const fetchDiagnostics = (signal?: AbortSignal): Promise<DiagnosticCheck[]> =>
+  getJson<DiagnosticCheck[]>('/api/diagnostics', signal);
 
 export interface PatchSettingsResponse {
   readonly ok: boolean;
@@ -825,10 +1377,15 @@ export interface ObservabilityHealthResponse {
   readonly watcherDisabledByLock?: boolean;
   readonly filesWatched?: number;
   readonly parseErrors?: number;
+  // Absent on older server builds — treat as equivalent to 'env_var' (the
+  // banner's original behavior) rather than hiding the message.
+  readonly watcherDisabledReason?: 'env_var' | null;
 }
 
-export const fetchObservabilityHealth = (): Promise<ObservabilityHealthResponse> =>
-  getJson<ObservabilityHealthResponse>('/api/observability-health');
+export const fetchObservabilityHealth = (
+  signal?: AbortSignal,
+): Promise<ObservabilityHealthResponse> =>
+  getJson<ObservabilityHealthResponse>('/api/observability-health', signal);
 type WorkflowRunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown';
 
 // Mirrors WorkflowRunDto serialized by both GET /api/workflows (list, one
@@ -845,6 +1402,14 @@ export interface WorkflowRunInfo {
   readonly agentCount?: number | null;
   readonly totalTokens?: number | null;
   readonly totalUsd?: number | null;
+  /**
+   * True when `totalUsd` is `null` because the cost was never observed by
+   * any process (as opposed to a confirmed $0) — see
+   * `WorkflowRunRow.cost_unknown`'s docstring (`workflow-store.ts`). Sum a
+   * KPI over several runs' `totalUsd` and flag the sum as partial when any
+   * contributing run has `costUnknown: true`.
+   */
+  readonly costUnknown?: boolean;
   readonly declaredPhases?: number | null;
   readonly observedPhases?: number | null;
   readonly declaredParallelWidths?: ReadonlyArray<number | 'dynamic'> | null;
@@ -893,10 +1458,110 @@ export interface WorkflowRunDetailResponse {
 
 // Bare array (not { runs }) — feeds straight into Array.isArray() at call
 // sites; a wrapper object would render an empty list.
-export const fetchWorkflows = (): Promise<ReadonlyArray<WorkflowRunInfo>> =>
-  getJson<ReadonlyArray<WorkflowRunInfo>>('/api/workflows');
-export const fetchWorkflowDetail = (runId: string): Promise<WorkflowRunDetailResponse> =>
-  getJson<WorkflowRunDetailResponse>(`/api/workflows/${encodeURIComponent(runId)}`);
+export const fetchWorkflows = (signal?: AbortSignal): Promise<ReadonlyArray<WorkflowRunInfo>> =>
+  getJson<ReadonlyArray<WorkflowRunInfo>>('/api/workflows', signal);
+export const fetchWorkflowDetail = (
+  runId: string,
+  signal?: AbortSignal,
+): Promise<WorkflowRunDetailResponse> =>
+  getJson<WorkflowRunDetailResponse>(`/api/workflows/${encodeURIComponent(runId)}`, signal);
+
+export interface DriftCorrelationEntry {
+  readonly fromHash: string;
+  readonly toHash: string;
+  readonly successRateDelta: number | null;
+  readonly tokensDelta: number;
+  readonly thrashingDelta: number;
+  readonly efficiencyDelta: number | null;
+  readonly verdict: 'improved' | 'degraded' | 'neutral' | 'insufficient_data';
+}
+
+export interface PromptVariantStatsEntry {
+  readonly promptHash: string;
+  readonly sessionCount: number;
+  readonly avgSuccessRate: number | null;
+  readonly avgTokensPerSession: number;
+  readonly avgThrashingIncidents: number;
+  readonly avgEfficiency: number | null;
+  readonly firstSeen: number;
+  readonly lastSeen: number;
+}
+
+export interface InstructionDriftResponse {
+  readonly currentPromptHash: string | null;
+  readonly uniquePromptVariants: number;
+  readonly variantStats: readonly PromptVariantStatsEntry[];
+  readonly recentCorrelations: readonly DriftCorrelationEntry[];
+  readonly currentVariantSessionCount: number;
+}
+
+export const fetchInstructionDrift = (signal?: AbortSignal): Promise<InstructionDriftResponse> =>
+  getJson<InstructionDriftResponse>('/api/instruction-drift', signal);
+
+// Mirrors ApiFailureTracker's own shapes (src/metrics/api-failure-tracker.ts)
+// verbatim — this file has no import wired to server-side tracker types, so
+// every response shape here is re-declared rather than imported, same as
+// QualityProxyMetrics above.
+export type ApiErrorType =
+  | 'rate_limit'
+  | 'timeout'
+  | 'connection_error'
+  | 'server_error'
+  | 'context_length_exceeded'
+  | 'authentication'
+  | 'unknown';
+
+export type SessionPhase = 'early' | 'middle' | 'late';
+
+export interface ApiFailureEvent {
+  readonly errorType: ApiErrorType;
+  readonly model: string;
+  readonly timestamp: number;
+  readonly turnNumber: number;
+  readonly tokensInFlight: number;
+  readonly recoveryMs: number | null;
+  readonly retryCount: number;
+  readonly recoverySucceeded: boolean | null;
+  readonly sessionPhase: SessionPhase;
+  readonly duringToolExecution: boolean;
+}
+
+export interface ModelReliabilityScorecard {
+  readonly model: string;
+  readonly totalRequests: number;
+  readonly failureCount: number;
+  readonly failureRate: number | null;
+  readonly throttleCount: number;
+  readonly throttleFrequency: number | null;
+  readonly meanRecoveryMs: number | null;
+  readonly p95LatencyMs: number | null;
+  readonly tokensLost: number;
+  readonly estimatedCostLostUsd: number;
+}
+
+export interface ThrottleAlert {
+  readonly model: string;
+  readonly count: number;
+  readonly windowMinutes: number;
+  readonly timestamp: number;
+}
+
+export interface ApiFailureMetrics {
+  readonly totalFailures: number;
+  readonly byErrorType: Readonly<Record<ApiErrorType, number>>;
+  readonly byModel: Readonly<Record<string, ModelReliabilityScorecard>>;
+  readonly bySessionPhase: Readonly<Record<SessionPhase, number>>;
+  readonly totalTokensLost: number;
+  readonly totalEstimatedCostLostUsd: number;
+  readonly meanTimeToRecoveryMs: number | null;
+  readonly throttleAlerts: readonly ThrottleAlert[];
+  readonly recentFailures: readonly ApiFailureEvent[];
+  readonly dataAvailable: boolean;
+  readonly note: string;
+}
+
+export const fetchApiFailures = (signal?: AbortSignal): Promise<ApiFailureMetrics> =>
+  getJson<ApiFailureMetrics>('/api/api-failures', signal);
 
 export const qk = {
   sessionCurrent: ['session', 'current'] as const,
@@ -904,12 +1569,18 @@ export const qk = {
   sessionDetail: (id: string) => ['session', id] as const,
   cost: ['cost'] as const,
   antiPatterns: ['anti-patterns'] as const,
+  computeWaste: ['compute-waste'] as const,
   audit: ['audit'] as const,
   weekly: ['weekly'] as const,
   budget: ['budget'] as const,
-  latency: ['latency'] as const,
   costPerOutcome: (days: number) => ['cost-per-outcome', days] as const,
+  usageInsights: (window: number | 'today') => ['usage-insights', window] as const,
   personalCoach: ['personal-coach'] as const,
+  instructionDrift: ['instruction-drift'] as const,
+  apiFailures: ['api-failures'] as const,
+  recommendations: ['recommendations'] as const,
+  claudeMdImpact: ['claudemd-impact'] as const,
+  collaborationProfile: ['collaboration-profile'] as const,
   alertsRecent: ['alerts', 'recent'] as const,
   sessionReplay: (id: string) => ['session', id, 'replay'] as const,
   sessionSubagents: (id: string) => ['session', id, 'subagents'] as const,
@@ -917,14 +1588,14 @@ export const qk = {
     ['session', sessionId, 'subagent', agentId, 'calls'] as const,
   qualityProxy: ['quality-proxy'] as const,
   toolSelectionScore: ['tool-selection-score'] as const,
-  gitEfficiency: ['git-efficiency'] as const,
-  gitEfficiencyRepos: ['git-efficiency-repos'] as const,
+  gitEfficiency: (window: string, scope: string) => ['git-efficiency', window, scope] as const,
   concurrency: ['concurrency'] as const,
   concurrencyHistory: (days: number) => ['concurrency', 'history', days] as const,
   activityHeatmap: (view: string) => ['activity-heatmap', view] as const,
   context: ['context'] as const,
   modelUsage: ['model-usage'] as const,
   cacheHealth: ['cache-health'] as const,
+  costPerTool: (days?: number) => ['cost-per-tool', days] as const,
   settings: ['settings'] as const,
   sessionsLive: ['sessions', 'live'] as const,
   sessionsTodayAggregate: ['sessions', 'today', 'aggregate'] as const,

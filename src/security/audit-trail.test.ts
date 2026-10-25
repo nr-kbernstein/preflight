@@ -1,6 +1,7 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
 import {
   AuditTrailManager,
+  attachAuditAttribution,
   auditRecordToNrEvent,
   securityAlertToNrEvent,
   DEFAULT_SENSITIVE_FILE_PATTERNS,
@@ -180,10 +181,75 @@ describe('AuditTrailManager', () => {
     expect(audit.securityAlert!.alertType).toBe('destructive_command');
   });
 
-  it('does not flag "rm -f file.txt" as destructive (no recursive flag)', () => {
+  it('flags "rm -f file.txt" as file_deletion at medium severity (no recursive flag)', () => {
     const mgr = makeManager();
     const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command: 'rm -f file.txt' }));
-    expect(audit.securityAlert?.alertType).not.toBe('destructive_command');
+    expect(audit.securityAlert).toMatchObject({ severity: 'medium', alertType: 'file_deletion' });
+    expect(audit.securityAlert!.description).toMatch(/^File deletion:/);
+  });
+
+  it.each(['rm file.txt', 'sudo rm file.txt', 'cd x && rm -f y', 'unlink f'])(
+    'flags "%s" as file_deletion',
+    (command) => {
+      const mgr = makeManager();
+      const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command }));
+      expect(audit.securityAlert?.alertType).toBe('file_deletion');
+    },
+  );
+
+  it.each(['rm -rf /tmp/x', 'rm -r d'])(
+    'still flags "%s" as destructive_command at critical (recursive form wins over file_deletion)',
+    (command) => {
+      const mgr = makeManager();
+      const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command }));
+      expect(audit.securityAlert).toMatchObject({
+        severity: 'critical',
+        alertType: 'destructive_command',
+      });
+    },
+  );
+
+  it('flags "rm f && curl http://x" as external_network (tie goes to the earlier row)', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(
+      makeRecord({ toolName: 'Bash', command: 'rm f && curl http://x' }),
+    );
+    expect(audit.securityAlert?.alertType).toBe('external_network');
+  });
+
+  it.each(['npm rm lodash', 'git rm f', 'docker rm c', 'echo "rm foo"', 'npm test'])(
+    '"%s" yields no security alert',
+    (command) => {
+      const mgr = makeManager();
+      const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command }));
+      expect(audit.securityAlert).toBeUndefined();
+    },
+  );
+
+  it('flags an env-prefixed rm through the classifier leading token when the regex misses', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(
+      makeRecord({ toolName: 'Bash', command: 'FOO=bar rm -f f', bashLeading: 'rm' }),
+    );
+    expect(audit.securityAlert?.alertType).toBe('file_deletion');
+  });
+
+  it('does not treat a package-manager rm subcommand as a deletion via the leading token', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(
+      makeRecord({ toolName: 'Bash', command: 'npm rm lodash', bashLeading: 'npm' }),
+    );
+    expect(audit.securityAlert).toBeUndefined();
+  });
+
+  it('does not flag file deletion when deletionPatterns is explicitly disabled', () => {
+    const mgr = new AuditTrailManager({
+      developer: 'dev',
+      sessionId: 'sess-001',
+      deletionPatterns: [],
+    });
+    const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command: 'rm -f f' }));
+    expect(audit.securityAlert).toBeUndefined();
   });
 
   // Classifier consolidation: detectSecurityAlert is the OR of the
@@ -297,6 +363,44 @@ describe('AuditTrailManager', () => {
     expect(audit.securityAlert).toBeUndefined();
   });
 
+  it.each(['git push --force-with-lease origin main', 'git push --force-if-includes origin main'])(
+    'does not flag "%s" as destructive (safe force variant)',
+    (command) => {
+      const mgr = makeManager();
+      const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command }));
+
+      expect(audit.securityAlert).toBeUndefined();
+    },
+  );
+
+  it.each([
+    'git clean -f',
+    'git clean -fd',
+    'git clean -xdf',
+    'git clean -df -e keep',
+    'git clean --force',
+    'git clean -d --force',
+    "find . -name '*.tmp' -delete",
+    'find /tmp -type f -delete',
+  ])('detects "%s" as critical destructive command', (command) => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command }));
+
+    expect(audit.securityAlert).toBeDefined();
+    expect(audit.securityAlert!.severity).toBe('critical');
+    expect(audit.securityAlert!.alertType).toBe('destructive_command');
+  });
+
+  it.each(['git clean -n', 'git clean --dry-run', 'git clean', "find . -name '*.ts'"])(
+    'does not flag "%s" as destructive (safe form)',
+    (command) => {
+      const mgr = makeManager();
+      const audit = mgr.recordToolCall(makeRecord({ toolName: 'Bash', command }));
+
+      expect(audit.securityAlert?.alertType).not.toBe('destructive_command');
+    },
+  );
+
   // 6. External network request (medium)
   it('detects curl as medium external network alert', () => {
     const mgr = makeManager();
@@ -382,6 +486,23 @@ describe('AuditTrailManager', () => {
 
     expect(mgr.getAuditLog()).toHaveLength(0);
     expect(mgr.getSensitiveAccessLog()).toHaveLength(0);
+  });
+
+  // entries is append-only in processing order, not timestamp order.
+  // Audit.tsx does `visible.slice(0, VISIBLE_LIMIT)` assuming newest-first,
+  // so getAuditLog() must sort by timestamp descending before returning —
+  // otherwise, once more than VISIBLE_LIMIT entries exist, the page shows
+  // the oldest entries forever instead of the most recent ones.
+  it('getAuditLog returns entries sorted by timestamp descending regardless of push order', () => {
+    const mgr = makeManager();
+    mgr.recordToolCall(makeRecord({ toolName: 'Read', timestamp: 300 }));
+    mgr.recordToolCall(makeRecord({ toolName: 'Write', timestamp: 100 }));
+    mgr.recordToolCall(makeRecord({ toolName: 'Bash', timestamp: 200 }));
+
+    // Unsorted, this would equal [300, 100, 200] — raw push order — so
+    // slice(0, N) on the frontend would keep whichever N happened to be
+    // pushed first, not the true newest N.
+    expect(mgr.getAuditLog().map((e) => e.timestamp)).toEqual([300, 200, 100]);
   });
 
   // 11. Write → FileWrite
@@ -550,6 +671,391 @@ describe('AuditTrailManager', () => {
     const mgr = makeManager();
     expect(() => mgr.recordToolCall(makeRecord())).not.toThrow();
   });
+
+  // 21. carries ToolCallRecord.id through to AuditRecord.id
+  it('carries the ToolCallRecord id through to AuditRecord.id on recordToolCall', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(makeRecord({ id: 'tool-call-xyz' }));
+    expect(audit.id).toBe('tool-call-xyz');
+  });
+
+  // 22. carries ProxyToolCallRecord.id through to AuditRecord.id
+  it('carries the ProxyToolCallRecord id through to AuditRecord.id on recordProxyCall', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordProxyCall(makeProxyRecord({ id: 'proxy-call-xyz' }));
+    expect(audit.id).toBe('proxy-call-xyz');
+  });
+
+  // 23. persists id to disk
+  it('includes id in the object persisted to disk', () => {
+    const { store, appendSpy } = makeLocalStore();
+    const mgr = makeManager({ localStore: store });
+    mgr.recordToolCall(makeRecord({ id: 'tool-call-persisted' }));
+    expect(appendSpy.mock.calls[0][0]).toMatchObject({ id: 'tool-call-persisted' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Synthetic session-id filtering on record.sessionId itself
+// ---------------------------------------------------------------------------
+
+describe('AuditTrailManager synthetic sessionId filtering', () => {
+  it.each(['pending-1738000000000', 'local-1738000000000', 'proxy-1738000000000'])(
+    'nulls out a synthetic record.sessionId ("%s") on recordToolCall, even though it is non-null',
+    (syntheticId) => {
+      const mgr = makeManager({ sessionId: 'sess-real' });
+      const audit = mgr.recordToolCall(makeRecord({ sessionId: syntheticId }));
+      expect(audit.sessionId).toBeNull();
+    },
+  );
+
+  it('nulls out a synthetic record.sessionId on recordProxyCall', () => {
+    const mgr = makeManager({ sessionId: 'sess-real' });
+    const audit = mgr.recordProxyCall(makeProxyRecord({ sessionId: 'proxy-conn-abc123' }));
+    expect(audit.sessionId).toBeNull();
+  });
+
+  it('still nulls out via the manager fallback when record.sessionId is null and the manager id is synthetic', () => {
+    const mgr = makeManager({ sessionId: 'local-1738000000000' });
+    const audit = mgr.recordToolCall(makeRecord({ sessionId: null }));
+    expect(audit.sessionId).toBeNull();
+  });
+
+  it('keeps a real, non-synthetic record.sessionId', () => {
+    const mgr = makeManager({ sessionId: 'local-1738000000000' });
+    const audit = mgr.recordToolCall(makeRecord({ sessionId: 'sess-abc-real' }));
+    expect(audit.sessionId).toBe('sess-abc-real');
+  });
+
+  it("a synthetic sessionId never appears in getAuditLog()'s output", () => {
+    const mgr = makeManager({ sessionId: 'sess-real' });
+    mgr.recordToolCall(makeRecord({ sessionId: 'pending-1738000000000', toolName: 'Read' }));
+    mgr.recordToolCall(makeRecord({ sessionId: 'sess-real', toolName: 'Write' }));
+
+    const log = mgr.getAuditLog();
+    expect(
+      log.every((e) => e.sessionId == null || !e.sessionId.match(/^(pending|local|proxy)-/)),
+    ).toBe(true);
+    expect(log.find((e) => e.tool === 'Read')?.sessionId).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Disk read-back merges other processes' persisted audit history
+// ---------------------------------------------------------------------------
+
+describe('AuditTrailManager.getAuditLog() disk read-back', () => {
+  function makeLocalStoreWithDisk(diskEntries: unknown[]): {
+    store: LocalStore;
+    appendSpy: ReturnType<typeof jest.fn>;
+  } {
+    const appendSpy = jest.fn();
+    const store = {
+      appendAuditLog: appendSpy,
+      peekAllAuditLogs: jest.fn(() => diskEntries),
+    } as unknown as LocalStore;
+    return { store, appendSpy };
+  }
+
+  it("merges in a second (simulated) process's persisted audit records", () => {
+    // Simulates a second --stdio process that wrote to the shared audit/
+    // directory but whose in-memory AuditTrailManager this process never saw.
+    const otherProcessEntry = {
+      timestamp: 999,
+      sessionId: 'sess-other-process',
+      action: 'FileRead',
+      tool: 'Read',
+      detail: 'Read src/other-process-file.ts',
+      developer: 'bob',
+    };
+    const { store } = makeLocalStoreWithDisk([otherProcessEntry]);
+    const mgr = makeManager({ localStore: store });
+
+    mgr.recordToolCall(makeRecord({ toolName: 'Write', filePath: 'src/this-process-file.ts' }));
+
+    const log = mgr.getAuditLog();
+    expect(log.some((e) => e.detail === 'Read src/other-process-file.ts')).toBe(true);
+    expect(log.some((e) => e.detail.includes('this-process-file.ts'))).toBe(true);
+  });
+
+  it('does not double-count a record this process already has in memory AND already persisted to disk', () => {
+    const { store } = makeLocalStoreWithDisk([]);
+    const mgr = makeManager({ localStore: store });
+    const audit = mgr.recordToolCall(makeRecord({ toolName: 'Read', filePath: 'src/app.ts' }));
+
+    // The disk read-back sees this exact record (same shape it was
+    // persisted as) reflected back — simulating peekAllAuditLogs() reading
+    // the very entry this process's own persistToDisk() just wrote.
+    (store.peekAllAuditLogs as unknown as jest.Mock).mockReturnValue([
+      {
+        timestamp: audit.timestamp,
+        sessionId: audit.sessionId,
+        action: audit.action,
+        tool: audit.tool,
+        detail: audit.detail,
+        developer: audit.developer,
+        filePath: audit.filePath,
+      },
+    ]);
+
+    expect(mgr.getAuditLog()).toHaveLength(1);
+  });
+
+  it("round-trips a disk entry's id unchanged", () => {
+    const { store } = makeLocalStoreWithDisk([
+      {
+        id: 'disk-entry-id',
+        timestamp: 555,
+        sessionId: 'sess-other',
+        action: 'FileRead',
+        tool: 'Read',
+        detail: 'Read src/old.ts',
+        developer: 'alice',
+      },
+    ]);
+    const mgr = makeManager({ localStore: store });
+
+    const log = mgr.getAuditLog();
+    expect(log[0]?.id).toBe('disk-entry-id');
+  });
+
+  it('falls back to a generated id for a legacy disk entry with no id', () => {
+    const { store } = makeLocalStoreWithDisk([
+      {
+        timestamp: 555,
+        sessionId: 'sess-other',
+        action: 'FileRead',
+        tool: 'Read',
+        detail: 'Read src/old.ts',
+        developer: 'alice',
+      },
+    ]);
+    const mgr = makeManager({ localStore: store });
+
+    const log = mgr.getAuditLog();
+    expect(typeof log[0]?.id).toBe('string');
+    expect(log[0]?.id.length).toBeGreaterThan(0);
+  });
+
+  it('drops a disk entry missing required fields instead of surfacing a broken row', () => {
+    const { store } = makeLocalStoreWithDisk([
+      { timestamp: 123, action: 'not-a-real-action', tool: 'Read', detail: 'x', developer: 'x' },
+      { timestamp: 123, tool: 'Read' }, // missing action/detail/developer
+    ]);
+    const mgr = makeManager({ localStore: store });
+
+    expect(mgr.getAuditLog()).toEqual([]);
+  });
+
+  it('re-filters a synthetic sessionId found in an old on-disk entry written before this filtering existed', () => {
+    const { store } = makeLocalStoreWithDisk([
+      {
+        timestamp: 555,
+        sessionId: 'pending-1738000000000',
+        action: 'FileRead',
+        tool: 'Read',
+        detail: 'Read src/old.ts',
+        developer: 'alice',
+      },
+    ]);
+    const mgr = makeManager({ localStore: store });
+
+    const log = mgr.getAuditLog();
+    expect(log).toHaveLength(1);
+    expect(log[0]?.sessionId).toBeNull();
+  });
+
+  it('works with no localStore configured (falls back to in-memory only)', () => {
+    const mgr = makeManager();
+    mgr.recordToolCall(makeRecord({ toolName: 'Read' }));
+    expect(mgr.getAuditLog()).toHaveLength(1);
+  });
+
+  // Regression for the unbounded CPU/payload finding: getAuditLog() must
+  // cap its result and must forward that cap to peekAllAuditLogs() so the
+  // disk read itself stays bounded — not just the final in-memory slice.
+  it('passes an explicit limit through to localStore.peekAllAuditLogs()', () => {
+    const { store } = makeLocalStoreWithDisk([]);
+    const mgr = makeManager({ localStore: store });
+
+    mgr.getAuditLog(42);
+
+    expect(store.peekAllAuditLogs).toHaveBeenCalledWith(42);
+  });
+
+  it('defaults the limit passed to peekAllAuditLogs() when the caller omits one', () => {
+    const { store } = makeLocalStoreWithDisk([]);
+    const mgr = makeManager({ localStore: store });
+
+    mgr.getAuditLog();
+
+    // Whatever the concrete default is, it must be a bounded number, not
+    // "call with no argument" (which is what regressed to an unbounded
+    // disk read).
+    const [calledLimit] = (store.peekAllAuditLogs as unknown as jest.Mock).mock.calls[0] as [
+      number,
+    ];
+    expect(typeof calledLimit).toBe('number');
+    expect(calledLimit).toBeGreaterThan(0);
+  });
+
+  it('caps the merged in-memory + disk result to the requested limit', () => {
+    const diskEntries = Array.from({ length: 10 }, (_, i) => ({
+      timestamp: 1000 + i,
+      sessionId: null,
+      action: 'FileRead',
+      tool: 'Read',
+      detail: `disk-${i}`,
+      developer: 'alice',
+    }));
+    const { store } = makeLocalStoreWithDisk(diskEntries);
+    const mgr = makeManager({ localStore: store });
+    for (let i = 0; i < 10; i++) {
+      mgr.recordToolCall(makeRecord({ toolName: 'Read', filePath: `mem-${i}.ts` }));
+    }
+
+    const log = mgr.getAuditLog(5);
+    expect(log).toHaveLength(5);
+  });
+});
+
+describe('attachAuditAttribution()', () => {
+  it('writes session_id, agent_id, and agent_type and skips absent values', () => {
+    const full: Record<string, string | number | boolean> = {};
+    attachAuditAttribution(full, { sessionId: 'sess-1', agentId: 'a9f8', agentType: 'workflow' });
+    expect(full).toEqual({ session_id: 'sess-1', agent_id: 'a9f8', agent_type: 'workflow' });
+
+    const bare: Record<string, string | number | boolean> = {};
+    attachAuditAttribution(bare, { sessionId: null });
+    expect(bare).toEqual({});
+  });
+});
+
+describe('AuditTrailManager subagent attribution', () => {
+  it('carries agentId and agentType from the ToolCallRecord onto the AuditRecord', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(
+      makeRecord({
+        toolName: 'Bash',
+        command: 'rm -rf /tmp/x',
+        agentId: 'a9f8',
+        agentType: 'workflow',
+      }),
+    );
+
+    expect(audit.agentId).toBe('a9f8');
+    expect(audit.agentType).toBe('workflow');
+  });
+
+  it('leaves agentId and agentType undefined when the record has neither', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(makeRecord({ toolName: 'Read', filePath: 'src/app.ts' }));
+
+    expect(audit.agentId).toBeUndefined();
+    expect(audit.agentType).toBeUndefined();
+  });
+
+  it('includes agentId and agentType in the entry persisted to disk', () => {
+    const { store, appendSpy } = makeLocalStore();
+    const mgr = makeManager({ localStore: store });
+
+    mgr.recordToolCall(
+      makeRecord({
+        toolName: 'Bash',
+        command: 'rm -rf /tmp/x',
+        agentId: 'a9f8',
+        agentType: 'workflow',
+      }),
+    );
+
+    expect(appendSpy.mock.calls[0][0]).toMatchObject({ agentId: 'a9f8', agentType: 'workflow' });
+  });
+
+  it('carries agentId and agentType through recordProxyCall', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordProxyCall(makeProxyRecord({ agentId: 'a9f8', agentType: 'workflow' }));
+
+    expect(audit.agentId).toBe('a9f8');
+    expect(audit.agentType).toBe('workflow');
+  });
+
+  it('reads agentId and agentType back from a disk entry via getAuditLog()', () => {
+    const appendSpy = jest.fn();
+    const store = {
+      appendAuditLog: appendSpy,
+      peekAllAuditLogs: jest.fn(() => [
+        {
+          timestamp: 555,
+          sessionId: 'sess-other',
+          action: 'BashCommand',
+          tool: 'Bash',
+          detail: 'Bash: rm -rf /tmp/x',
+          developer: 'alice',
+          agentId: 'a9f8',
+          agentType: 'workflow',
+        },
+      ]),
+    } as unknown as LocalStore;
+    const mgr = makeManager({ localStore: store });
+
+    const [entry] = mgr.getAuditLog();
+    expect(entry?.agentId).toBe('a9f8');
+    expect(entry?.agentType).toBe('workflow');
+  });
+
+  it('leaves agentId and agentType undefined for a disk entry with neither field', () => {
+    const appendSpy = jest.fn();
+    const store = {
+      appendAuditLog: appendSpy,
+      peekAllAuditLogs: jest.fn(() => [
+        {
+          timestamp: 555,
+          sessionId: 'sess-other',
+          action: 'FileRead',
+          tool: 'Read',
+          detail: 'Read src/old.ts',
+          developer: 'alice',
+        },
+      ]),
+    } as unknown as LocalStore;
+    const mgr = makeManager({ localStore: store });
+
+    const [entry] = mgr.getAuditLog();
+    expect(entry?.agentId).toBeUndefined();
+    expect(entry?.agentType).toBeUndefined();
+  });
+
+  it('emits agent_id and agent_type on auditRecordToNrEvent when present', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(
+      makeRecord({
+        toolName: 'Read',
+        filePath: 'src/app.ts',
+        agentId: 'a9f8',
+        agentType: 'workflow',
+      }),
+    );
+    const event = auditRecordToNrEvent(audit);
+
+    expect(event.agent_id).toBe('a9f8');
+    expect(event.agent_type).toBe('workflow');
+  });
+
+  it('emits agent_id and agent_type on securityAlertToNrEvent when present', () => {
+    const mgr = makeManager();
+    const audit = mgr.recordToolCall(
+      makeRecord({
+        toolName: 'Bash',
+        command: 'rm -rf /tmp/x',
+        agentId: 'a9f8',
+        agentType: 'workflow',
+      }),
+    );
+    const event = securityAlertToNrEvent(audit);
+
+    expect(event.agent_id).toBe('a9f8');
+    expect(event.agent_type).toBe('workflow');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -582,6 +1088,15 @@ describe('auditRecordToNrEvent', () => {
     expect(event['audit.security_alert']).toBe(false);
     expect(event['audit.severity']).toBeUndefined();
   });
+
+  it('includes event_version: 1 on AiAuditEvent', () => {
+    const mgr = makeManager();
+    const record = makeRecord({ toolName: 'Read', filePath: 'src/app.ts' });
+    const audit = mgr.recordToolCall(record);
+    const event = auditRecordToNrEvent(audit);
+
+    expect(event.event_version).toBe(1);
+  });
 });
 
 describe('securityAlertToNrEvent', () => {
@@ -597,6 +1112,15 @@ describe('securityAlertToNrEvent', () => {
     expect(event.tool).toBe('Bash');
     expect(event.command).toBe('rm -rf /');
     expect(event.developer).toBe('alice');
+  });
+
+  it('includes event_version: 1 on SecurityAlert', () => {
+    const mgr = makeManager();
+    const record = makeRecord({ toolName: 'Bash', command: 'rm -rf /' });
+    const audit = mgr.recordToolCall(record);
+    const event = securityAlertToNrEvent(audit);
+
+    expect(event.event_version).toBe(1);
   });
 });
 

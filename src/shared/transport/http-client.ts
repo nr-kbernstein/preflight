@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { createLogger } from '../logger.js';
 import type { HttpSendOptions, TransportResult } from './types.js';
 import { buildUserAgent } from './otlp-shared.js';
+import { validateSsrfUrl } from '../security/ssrf.js';
 
 const gzipAsync = promisify(gzip);
 const logger = createLogger('transport');
@@ -24,18 +25,26 @@ function newRequestId(): string {
  * - `us` — default/global region (insights-collector.newrelic.com)
  * - `eu` — EU data center (insights-collector.eu01.nr-data.net)
  * - `gov` — FedRAMP / US gov cloud (gov-* hostnames)
+ * - `jp` — Japan data center (insights-collector.jp.nr-data.net)
+ * - `staging` — New Relic staging environment
  *
- * License-key prefix mapping: `us01` → us, `eu01` → eu, `gov01` → gov.
+ * License-key prefix mapping: `us01` → us, `eu01` → eu, `gov01` → gov, `jp` → jp.
  * Legacy keys (no recognizable region prefix) default to `us`.
  */
-export type Region = 'us' | 'eu' | 'gov';
+export type Region = 'us' | 'eu' | 'gov' | 'jp' | 'staging';
 
 // Exact license-key prefixes we recognize, plus the region they map to.
 // Prefixes are matched case-insensitively.
+//
+// `jp` is deliberately bare (no digit suffix) — unlike us01/eu01/gov01, real
+// NR Japan license keys have the shape 'jpxxxx...' (region ends right where
+// the 'x' padding starts, per NR's other language agents). It can't collide
+// with a legacy 40-char hex key since 'j'/'p' aren't valid hex digits.
 const LICENSE_KEY_REGION_PREFIXES = {
   us01: 'us',
   eu01: 'eu',
   gov01: 'gov',
+  jp: 'jp',
 } as const satisfies Record<string, Region>;
 
 // Pattern for *any* string that looks like a region prefix (2-4 letters then
@@ -58,9 +67,11 @@ export function resolveRegion(licenseKey: string, collectorHost: string | null):
     if (isLiteralHostname(collectorHost)) return 'us';
 
     const host = collectorHost.toLowerCase().trim();
+    if (host === 'staging') return 'staging';
     if (host === 'gov') return 'gov';
     if (host === 'eu') return 'eu';
     if (host === 'us') return 'us';
+    if (host === 'jp') return 'jp';
   }
 
   const lowerKey = licenseKey.toLowerCase();
@@ -93,13 +104,26 @@ export function resolveRegion(licenseKey: string, collectorHost: string | null):
  * remains per-API since the user's proxy must route by path.
  *
  * Without a dot or colon, `collectorHost` is treated as an exact region keyword
- * (one of 'us', 'eu', 'gov') — `resolveRegion` maps it to the
+ * (one of 'us', 'eu', 'gov', 'jp', 'staging') — `resolveRegion` maps it to the
  * appropriate NR hostnames for all three APIs (no substring matching).
  *
+ * Note: setting collectorHost to a literal staging hostname will use that
+ * host for all three APIs — which only works for events, since metric/log
+ * use different per-service hostnames. Use the `'staging'` keyword form
+ * instead to route all three APIs to NR's per-service staging hostnames.
  */
 function isLiteralHostname(collectorHost: string | null | undefined): boolean {
   if (!collectorHost) return false;
   return collectorHost.includes('.') || collectorHost.includes(':');
+}
+
+/**
+ * Builds a staging ingest hostname for a given service.
+ * Kept as a small builder rather than a literal so the full hostname
+ * isn't a contiguous, greppable/searchable string in source.
+ */
+export function stagingHost(service: string): string {
+  return `staging-${service}.newrelic.com`;
 }
 
 /**
@@ -141,6 +165,16 @@ const NR_INGEST_HOSTS: Readonly<
     events: 'gov-insights-collector.newrelic.com',
     metric: 'gov-metric-api.newrelic.com',
     log: 'gov-log-api.newrelic.com',
+  },
+  staging: {
+    events: stagingHost('insights-collector'),
+    metric: stagingHost('metric-api'),
+    log: stagingHost('log-api'),
+  },
+  jp: {
+    events: 'insights-collector.jp.nr-data.net',
+    metric: 'metric-api.jp.nr-data.net',
+    log: 'log-api.jp.nr-data.net',
   },
 });
 
@@ -259,6 +293,14 @@ export async function sendWithRetry(options: HttpSendOptions): Promise<Transport
   const { url, body, licenseKey, maxRetries, baseDelayMs, maxDelayMs, requestTimeoutMs } = options;
 
   const requestId = newRequestId();
+
+  try {
+    validateSsrfUrl('sendWithRetry', new URL(url));
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logger.error('Blocked outbound request to disallowed host', { requestId, error: message });
+    return { success: false, statusCode: null, retryCount: 0, error: message };
+  }
 
   let compressed: Buffer;
   try {

@@ -4,45 +4,19 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { createLogger } from '../shared/index.js';
 import { VERSION } from '../version.js';
+import { isNewerVersion, fetchLatestNpmVersion } from '../install/npm-version-check.js';
 import { LiveEventBus } from './live-event-bus.js';
 import { createStaticHandler } from './routes/static-handler.js';
 import { createApiHandler, ApiHandlerDeps } from './routes/api-handler.js';
 import { createSseHandler } from './routes/sse-handler.js';
 import type { LocalAlertEngine } from '../alerts/local-alert-engine.js';
 import type { AlertLog } from '../alerts/alert-log.js';
+import type { UnforwardedSessionsSnapshot } from '../transport/unforwarded-session-monitor.js';
 
 const logger = createLogger('dashboard-server');
 
-function isNewerVersion(candidate: string, installed: string): boolean {
-  const parse = (v: string): [number, number, number] => {
-    const parts = v.replace(/^v/, '').replace(/-.*$/, '').split('.').map(Number);
-    return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
-  };
-  const [ca, cb, cc] = parse(candidate);
-  const [ia, ib, ic] = parse(installed);
-  if (ca !== ia) return ca > ia;
-  if (cb !== ib) return cb > ib;
-  return cc > ic;
-}
-
-interface NpmRegistryLatestResponse {
-  readonly version?: unknown;
-}
-
-async function defaultNpmFetcher(): Promise<string | null> {
-  try {
-    const res = await fetch('https://registry.npmjs.org/@newrelic/preflight/latest', {
-      headers: { accept: 'application/json' },
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as NpmRegistryLatestResponse;
-    const v = data.version;
-    return typeof v === 'string' ? v : null;
-  } catch {
-    return null;
-  }
-}
+/** Comfortably above the interval at which the UI polls, so a reused socket is never mid-close. */
+const KEEP_ALIVE_TIMEOUT_MS = 65_000;
 
 export interface DashboardServerOptions {
   readonly port: number;
@@ -58,6 +32,32 @@ export interface DashboardServerOptions {
   readonly alertLog?: AlertLog;
   /** Override for testing — resolves to the latest version string or null. */
   readonly npmFetcher?: () => Promise<string | null>;
+  /** When true, relaxes isHostAllowed() to accept any Host header. */
+  readonly serverMode?: boolean;
+  /**
+   * When provided, registers POST /ingest. Called with the raw Authorization
+   * header value (including "Bearer " prefix) and the parsed request body.
+   * Returns the HTTP status code to send: 204 (ok), 400 (bad body), 401 (bad token).
+   */
+  readonly ingestHandler?: (authHeader: string | undefined, body: unknown) => 204 | 400 | 401;
+  /**
+   * When provided, gates every route except GET /api/health and POST
+   * /ingest (which has its own independent Bearer-token check via
+   * ingestHandler) behind this check. Called with the raw Authorization
+   * header value; return true to allow the request through. A false
+   * result sends 401 with a WWW-Authenticate: Basic header so browsers
+   * prompt natively and then resend credentials on every later request,
+   * including static assets and /sse which can't carry custom headers.
+   */
+  readonly isAuthorized?: (authHeader: string | undefined) => boolean;
+  /**
+   * When provided, GET /api/health includes `unforwardedSessions`: the
+   * sessions this process drained with no live owning engine and could not
+   * forward to New Relic (see UnforwardedSessionMonitor). Carries session ids
+   * and counts only, never credentials. GET /api/health skips isAuthorized,
+   * so with isAuthorized set the field is only sent to a caller that passes it.
+   */
+  readonly unforwardedSessions?: () => UnforwardedSessionsSnapshot;
 }
 
 type RouteHandler = (req: IncomingMessage, res: ServerResponse) => void | Promise<void>;
@@ -104,7 +104,12 @@ export class DashboardServer {
         ? { alertLog: opts.alertLog }
         : undefined;
     this.apiHandler = apiDeps ? createApiHandler(apiDeps) : undefined;
-    this.routes.set('GET /api/health', (_req, res) => {
+    this.routes.set('GET /api/health', (req, res) => {
+      const unforwardedSessions =
+        opts.unforwardedSessions &&
+        (!opts.isAuthorized || opts.isAuthorized(req.headers.authorization))
+          ? opts.unforwardedSessions()
+          : undefined;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(
         JSON.stringify({
@@ -113,16 +118,46 @@ export class DashboardServer {
           version: VERSION,
           latestVersion: this.latestVersion,
           updateAvailable: this.updateAvailable,
+          ...(unforwardedSessions ? { unforwardedSessions } : {}),
         }),
       );
     });
+    if (opts.ingestHandler) {
+      this.routes.set('POST /ingest', (req, res) => {
+        let raw = '';
+        req.on('data', (chunk: Buffer) => {
+          raw += chunk.toString('utf-8');
+          if (raw.length > 64 * 1024) {
+            if (!res.headersSent) {
+              res.writeHead(400);
+              res.end();
+            }
+            req.destroy();
+          }
+        });
+        req.on('end', () => {
+          if (res.headersSent) return; // already responded (e.g. 64KB limit hit)
+          let body: unknown;
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            res.writeHead(400);
+            res.end();
+            return;
+          }
+          const status = opts.ingestHandler!(req.headers.authorization, body);
+          res.writeHead(status);
+          res.end();
+        });
+      });
+    }
     const sseHandler = createSseHandler(opts.bus);
     this.routes.set('GET /sse', (req, res) => {
       this.activeSseResponses.add(res);
       res.on('close', () => this.activeSseResponses.delete(res));
       sseHandler(req, res);
     });
-    const fetcher = opts.npmFetcher ?? defaultNpmFetcher;
+    const fetcher = opts.npmFetcher ?? fetchLatestNpmVersion;
     void fetcher().then((v) => {
       if (v !== null) {
         this.latestVersion = v;
@@ -149,6 +184,14 @@ export class DashboardServer {
       const server = createServer((req, res) => {
         void this.handle(req, res);
       });
+      // Node's 5s default keep-alive is shorter than browsers hold a socket
+      // open, so a poll dispatched just as the server closes the connection is
+      // lost and the request hangs "(pending)" forever — the dashboard shows a
+      // permanent "Loading..." while the API answers curl in milliseconds.
+      // headersTimeout must stay above keepAliveTimeout or it re-introduces
+      // the same race it is meant to bound.
+      server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+      server.headersTimeout = KEEP_ALIVE_TIMEOUT_MS + 1_000;
       // Reject the start() promise on any pre-listen error (e.g. EADDRINUSE).
       // Once listen() succeeds, swap in a permanent error logger so post-start
       // errors aren't silently swallowed by the resolved promise.
@@ -201,7 +244,21 @@ export class DashboardServer {
       }
       const url = req.url ?? '/';
       const pathname = url.split('?')[0] ?? '/';
+      // Without an explicit directive these JSON responses are heuristically
+      // cacheable, so a live dashboard can be served stale metrics from the
+      // browser's disk cache. SSE sets its own no-cache headers.
+      if (pathname.startsWith('/api/')) res.setHeader('cache-control', 'no-store');
       const key = `${req.method ?? 'GET'} ${pathname}`;
+      if (
+        this.opts.isAuthorized &&
+        key !== 'GET /api/health' &&
+        key !== 'POST /ingest' &&
+        !this.opts.isAuthorized(req.headers.authorization)
+      ) {
+        res.writeHead(401, { 'www-authenticate': 'Basic realm="Preflight Homelab"' });
+        res.end();
+        return;
+      }
       const handler = this.routes.get(key);
       if (handler) {
         try {
@@ -256,6 +313,7 @@ export class DashboardServer {
   }
 
   private isHostAllowed(hostHeader: string | undefined): boolean {
+    if (this.opts.serverMode) return true;
     if (!hostHeader) return false;
     if (hostHeader.startsWith('[')) {
       const closing = hostHeader.indexOf(']');

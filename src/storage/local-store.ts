@@ -11,11 +11,26 @@ import {
 } from 'node:fs';
 import { resolve, sep } from 'node:path';
 import { createLogger } from '../shared/index.js';
+import { AGENT_ID_PATTERN } from '../lib/agent-id.js';
 import type { HookEvent, AuditEntry } from './types.js';
 
 const logger = createLogger('local-store');
 
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+/**
+ * Matches `.subagent-pos-<parentSessionId>-<agentId>` cursor filenames.
+ * Group 1 (parentSessionId) is pinned to the UUID shape (mirrors
+ * SubagentWatcher's SESSION_ID_RE) rather than a greedy `.+`, because group 2
+ * (agentId, see ../lib/agent-id.js) can itself contain internal hyphens for a
+ * named-subagent spawn — a greedy `.+` paired with a strict agentId tail
+ * would no longer reliably separate the two groups once the agentId can
+ * contain its own hyphens.
+ */
+const SUBAGENT_CURSOR_RE = new RegExp(
+  `^\\.subagent-pos-([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})-(${AGENT_ID_PATTERN})$`,
+);
+const TRANSCRIPT_CURSOR_RE = /^\.transcript-pos-(.+)$/;
+const PARENT_TRANSCRIPT_CURSOR_RE = /^\.parent-transcript-pos-(.+)$/;
 
 /**
  * A buffer file is treated as orphan when its mtime is older than this AND
@@ -69,6 +84,26 @@ function isPidAlive(pid: number): boolean {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'EPERM') return true; // exists, owned by another uid
+    return false;
+  }
+}
+
+/**
+ * True when `<storagePath>/active-<sessionId>.pid` names a live process, i.e.
+ * some `--stdio` engine has adopted `sessionId` and is still running. An
+ * absent, unreadable or malformed heartbeat, or one naming a dead PID, is not
+ * a live owner.
+ */
+export function hasLiveOwningEngine(storagePath: string, sessionId: string): boolean {
+  if (!SESSION_ID_RE.test(sessionId)) return false;
+  const heartbeatPath = resolve(storagePath, `active-${sessionId}.pid`);
+  if (!existsSync(heartbeatPath)) return false;
+  try {
+    const pid = Number.parseInt(readFileSync(heartbeatPath, 'utf-8').trim(), 10);
+    return isPidAlive(pid);
+  } catch {
+    // Unreadable heartbeat — treat as not-live; gcOrphanBuffers() cleans up
+    // a genuinely dead/corrupt heartbeat file separately.
     return false;
   }
 }
@@ -175,6 +210,15 @@ export class LocalStore {
    * sessions' events. Each file is drained atomically (rename-then-read) so a
    * concurrent writer for that session can't lose events; orphan files (whose
    * MCP isn't running) are picked up too.
+   *
+   * A per-session buffer whose `active-<sessionId>.pid` heartbeat names a
+   * live PID is skipped: that session's own `--stdio` process is already
+   * polling and draining that exact file via its own scoped drainBuffer() on
+   * the same cadence. Draining it here too would race that rename-then-read
+   * against the owner's — whichever process wins a given poll cycle silently
+   * keeps the batch, and the loser sees nothing, with no error on either
+   * side. The owner's copy always wins fairly since this call skips the file
+   * outright rather than racing it.
    */
   drainAllBuffers(): HookEvent[] {
     const all: HookEvent[] = [];
@@ -191,12 +235,26 @@ export class LocalStore {
       // buffer.jsonl so a freshly-upgraded user's pre-existing events still flow.
       if (!name.endsWith('.jsonl')) continue;
       if (name !== 'buffer.jsonl' && !name.startsWith('buffer-')) continue;
+
+      if (name !== 'buffer.jsonl' && this.hasLiveOwner(name)) continue;
+
       const drained = this.drainPath(resolve(this.storagePath, name));
       if (drained.length > 0) {
         for (const event of drained) all.push(event);
       }
     }
     return all;
+  }
+
+  /**
+   * True when `buffer-<sessionId>.jsonl`'s matching `active-<sessionId>.pid`
+   * heartbeat names a currently-alive PID. `bufferFileName` must already be
+   * confirmed to start with `buffer-` and end with `.jsonl` (checked by the
+   * caller) and not be the legacy shared `buffer.jsonl`.
+   */
+  private hasLiveOwner(bufferFileName: string): boolean {
+    const sessionId = bufferFileName.slice('buffer-'.length, -'.jsonl'.length);
+    return hasLiveOwningEngine(this.storagePath, sessionId);
   }
 
   /**
@@ -280,35 +338,71 @@ export class LocalStore {
    * resolving its session_id, and remove it on graceful shutdown via
    * `removeHeartbeat()`.
    *
+   * Also writes a sidecar `active-<sessionId>.meta.json` file with `argv`
+   * and `cwd`, consumed by `listActiveStdioInstances()`. `argv`/`cwd`
+   * default to the current process's own argv/cwd.
+   *
    * No-op if the LocalStore is not bound to a sessionId (e.g. --local mode).
    */
-  writeHeartbeat(pid: number = process.pid): void {
+  writeHeartbeat(
+    pid: number = process.pid,
+    argv: readonly string[] = process.argv.slice(1),
+    cwd: string = process.cwd(),
+  ): void {
     if (!this.sessionId) return;
     if (!Number.isFinite(pid) || pid <= 0) return;
     const heartbeatPath = resolve(this.storagePath, `active-${this.sessionId}.pid`);
+    const metaPath = resolve(this.storagePath, `active-${this.sessionId}.meta.json`);
     try {
       if (!existsSync(this.storagePath)) {
         mkdirSync(this.storagePath, { recursive: true, mode: 0o700 });
       }
       writeFileSync(heartbeatPath, String(pid), { mode: 0o600 });
+      // Sidecar metadata for listActiveStdioInstances() — kept separate from
+      // the heartbeat's own bare-PID content so hasLiveOwner(),
+      // getActiveSessionIdsFromHeartbeats(), and gcOrphanBuffers() (which all
+      // parse active-<sessionId>.pid as a bare PID) are unaffected.
+      writeFileSync(metaPath, JSON.stringify({ argv: Array.from(argv), cwd }), { mode: 0o600 });
     } catch (err) {
       logger.warn('Failed to write heartbeat file', { error: String(err) });
     }
   }
 
   /**
-   * Remove this MCP's heartbeat file. Called from the shutdown handler so the
-   * next maintenance GC pass knows the buffer is up for adoption.
+   * Remove this MCP's heartbeat file (and its sidecar metadata, if present).
+   * Called from the shutdown handler so the next maintenance GC pass knows
+   * the buffer is up for adoption.
    *
    * No-op if no heartbeat was ever written or if the file is already gone.
    */
   removeHeartbeat(): void {
     if (!this.sessionId) return;
     const heartbeatPath = resolve(this.storagePath, `active-${this.sessionId}.pid`);
+    const metaPath = resolve(this.storagePath, `active-${this.sessionId}.meta.json`);
     try {
       if (existsSync(heartbeatPath)) unlinkSync(heartbeatPath);
+      if (existsSync(metaPath)) unlinkSync(metaPath);
     } catch (err) {
       logger.debug('Failed to remove heartbeat file', { error: String(err) });
+    }
+  }
+
+  /**
+   * Remove another session's heartbeat + sidecar metadata by explicit
+   * sessionId. Unlike removeHeartbeat() (which only ever acts on `this`
+   * LocalStore's own bound sessionId), this lets a caller — the `preflight
+   * local --clean` CLI command, which isn't scoped to any one session —
+   * clean up a *different* session's files after killing that session's
+   * process. Safe to call even if the files are already gone.
+   */
+  removeStdioHeartbeat(sessionId: string): void {
+    const heartbeatPath = resolve(this.storagePath, `active-${sessionId}.pid`);
+    const metaPath = resolve(this.storagePath, `active-${sessionId}.meta.json`);
+    try {
+      if (existsSync(heartbeatPath)) unlinkSync(heartbeatPath);
+      if (existsSync(metaPath)) unlinkSync(metaPath);
+    } catch (err) {
+      logger.debug('Failed to remove stdio heartbeat/sidecar', { error: String(err) });
     }
   }
 
@@ -635,6 +729,18 @@ export class LocalStore {
               error: String(err),
             });
           }
+          // Sidecar metadata written by writeHeartbeat() alongside the
+          // heartbeat — removed separately so a missing/unlinkable sidecar
+          // never blocks the heartbeat cleanup above.
+          const metaPath = resolve(this.storagePath, `active-${sessionId}.meta.json`);
+          try {
+            if (existsSync(metaPath)) unlinkSync(metaPath);
+          } catch (err) {
+            logger.debug('Failed to remove sidecar metadata after archive', {
+              sessionId,
+              error: String(err),
+            });
+          }
         }
       } catch (err) {
         logger.warn('Failed to archive orphan buffer', { sessionId, error: String(err) });
@@ -642,6 +748,112 @@ export class LocalStore {
     }
 
     return { archived, staleHeartbeats };
+  }
+
+  /**
+   * Garbage-collect SubagentWatcher and transcript-collector cursor files that
+   * can never be revisited:
+   *
+   *   - `.subagent-pos-<parentSessionId>-<agentId>`: removed once its parent
+   *     session is no longer live AND the cursor's mtime is older than
+   *     `discoveryHours` — past that window `SubagentWatcher.discoverFiles()`
+   *     will never cold-scan the corresponding transcript again, so the
+   *     cursor is dead by construction. Losing it costs at most one re-read
+   *     from byte 0 on a transcript that no longer exists, which downstream
+   *     dedupes by (agent_id, message.id).
+   *   - `.transcript-pos-<sessionId>`: removed once its session is no longer
+   *     live AND no `buffer-<sessionId>.jsonl` remains for it.
+   *
+   * @returns counts of each cursor kind removed
+   */
+  gcWatcherCursors(
+    activeSessionIds: ReadonlySet<string>,
+    discoveryHours: number,
+  ): { subagentCursors: number; transcriptCursors: number; parentTranscriptCursors: number } {
+    if (!existsSync(this.storagePath)) {
+      return { subagentCursors: 0, transcriptCursors: 0, parentTranscriptCursors: 0 };
+    }
+    let entries: string[];
+    try {
+      entries = readdirSync(this.storagePath);
+    } catch (err) {
+      logger.warn('Failed to enumerate storage path for gcWatcherCursors', {
+        error: String(err),
+      });
+      return { subagentCursors: 0, transcriptCursors: 0, parentTranscriptCursors: 0 };
+    }
+
+    const cutoffMs = Date.now() - discoveryHours * 60 * 60 * 1000;
+    const bufferNames = new Set(
+      entries.filter((n) => n.startsWith('buffer-') && n.endsWith('.jsonl')),
+    );
+
+    let subagentCursors = 0;
+    let transcriptCursors = 0;
+    let parentTranscriptCursors = 0;
+
+    for (const name of entries) {
+      const subagentMatch = SUBAGENT_CURSOR_RE.exec(name);
+      if (subagentMatch) {
+        const parentSessionId = subagentMatch[1];
+        if (!SESSION_ID_RE.test(parentSessionId)) continue;
+        if (activeSessionIds.has(parentSessionId)) continue;
+        const path = resolve(this.storagePath, name);
+        try {
+          if (statSync(path).mtimeMs >= cutoffMs) continue;
+          unlinkSync(path);
+          subagentCursors++;
+        } catch (err) {
+          logger.debug('Failed to delete stale subagent cursor', { error: String(err) });
+        }
+        continue;
+      }
+
+      const transcriptMatch = TRANSCRIPT_CURSOR_RE.exec(name);
+      if (transcriptMatch) {
+        const sessionId = transcriptMatch[1];
+        if (!SESSION_ID_RE.test(sessionId)) continue;
+        if (activeSessionIds.has(sessionId)) continue;
+        if (bufferNames.has(`buffer-${sessionId}.jsonl`)) continue;
+        const path = resolve(this.storagePath, name);
+        try {
+          unlinkSync(path);
+          transcriptCursors++;
+        } catch (err) {
+          logger.debug('Failed to delete stale transcript cursor', { error: String(err) });
+        }
+        continue;
+      }
+
+      // ParentTranscriptWatcher tails its session's own main transcript
+      // continuously (unlike the retired per-hook scanner the legacy
+      // .transcript-pos- rule above was written for), so it uses the same
+      // not-live + mtime rule as subagent cursors, not the buffer-file rule.
+      const parentTranscriptMatch = PARENT_TRANSCRIPT_CURSOR_RE.exec(name);
+      if (parentTranscriptMatch) {
+        const sessionId = parentTranscriptMatch[1];
+        if (!SESSION_ID_RE.test(sessionId)) continue;
+        if (activeSessionIds.has(sessionId)) continue;
+        const path = resolve(this.storagePath, name);
+        try {
+          if (statSync(path).mtimeMs >= cutoffMs) continue;
+          unlinkSync(path);
+          parentTranscriptCursors++;
+        } catch (err) {
+          logger.debug('Failed to delete stale parent-transcript cursor', { error: String(err) });
+        }
+      }
+    }
+
+    if (subagentCursors > 0 || transcriptCursors > 0 || parentTranscriptCursors > 0) {
+      logger.info('Cleaned up watcher cursor files', {
+        subagentCursors,
+        transcriptCursors,
+        parentTranscriptCursors,
+      });
+    }
+
+    return { subagentCursors, transcriptCursors, parentTranscriptCursors };
   }
 
   /**
@@ -673,6 +885,80 @@ export class LocalStore {
       }
     }
     return active;
+  }
+
+  /**
+   * List every live `--stdio` MCP process from `active-<sessionId>.pid`
+   * heartbeats — the same files `getActiveSessionIdsFromHeartbeats()` and
+   * `hasLiveOwner()` already read, scanned here for user-facing detail
+   * (`preflight local`) instead of internal GC/ownership bookkeeping.
+   * `argv`/`cwd` come from the sidecar `active-<sessionId>.meta.json`
+   * written by `writeHeartbeat()`; a heartbeat from a pre-upgrade build that
+   * predates the sidecar reports `argv: []`, `cwd: null`. `startedAt` is the
+   * heartbeat file's mtime — `writeHeartbeat()` is called exactly once at
+   * process startup (never refreshed), so mtime is an accurate proxy for
+   * process start time. Malformed entries are skipped silently.
+   */
+  listActiveStdioInstances(): Array<{
+    pid: number;
+    sessionId: string;
+    argv: string[];
+    cwd: string | null;
+    startedAt: number;
+    alive: boolean;
+  }> {
+    if (!existsSync(this.storagePath)) return [];
+    let entries: string[];
+    try {
+      entries = readdirSync(this.storagePath);
+    } catch (err) {
+      logger.warn('Failed to enumerate storage path for listActiveStdioInstances', {
+        error: String(err),
+      });
+      return [];
+    }
+    const result: Array<{
+      pid: number;
+      sessionId: string;
+      argv: string[];
+      cwd: string | null;
+      startedAt: number;
+      alive: boolean;
+    }> = [];
+    for (const name of entries) {
+      if (!name.startsWith('active-') || !name.endsWith('.pid')) continue;
+      const sessionId = name.slice('active-'.length, -'.pid'.length);
+      if (!SESSION_ID_RE.test(sessionId)) continue;
+      const heartbeatPath = resolve(this.storagePath, name);
+      let pid: number;
+      let startedAt: number;
+      try {
+        pid = Number.parseInt(readFileSync(heartbeatPath, 'utf-8').trim(), 10);
+        startedAt = statSync(heartbeatPath).mtimeMs;
+      } catch {
+        continue;
+      }
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+
+      let argv: string[] = [];
+      let cwd: string | null = null;
+      try {
+        const metaPath = resolve(this.storagePath, `active-${sessionId}.meta.json`);
+        const meta = JSON.parse(readFileSync(metaPath, 'utf-8')) as {
+          argv?: unknown;
+          cwd?: unknown;
+        };
+        if (Array.isArray(meta.argv) && meta.argv.every((a) => typeof a === 'string')) {
+          argv = meta.argv as string[];
+        }
+        if (typeof meta.cwd === 'string') cwd = meta.cwd;
+      } catch {
+        // No sidecar (pre-upgrade heartbeat) or unreadable — leave argv/cwd at their defaults.
+      }
+
+      result.push({ pid, sessionId, argv, cwd, startedAt, alive: isPidAlive(pid) });
+    }
+    return result;
   }
 
   /**
@@ -897,5 +1183,92 @@ export class LocalStore {
     } catch (err) {
       logger.warn('Failed to append audit log', { error: String(err) });
     }
+  }
+
+  /**
+   * Read persisted audit-log JSONL files under `audit/` (one per calendar
+   * day, written by `appendAuditLog()` — including by *other* processes'
+   * `AuditTrailManager` instances, since every `--stdio`/`--local` process
+   * persists to the same shared `audit/` directory) WITHOUT deleting or
+   * moving anything — read-only, unlike `drainAllBuffers()`, because the
+   * audit log is meant to be a durable record, not a work queue. Used by
+   * `AuditTrailManager.getAuditLog()` to merge in every process's
+   * persisted history instead of returning only the calling process's own
+   * capped in-memory `entries` array.
+   *
+   * Mirrors `peekAllBuffers()`'s torn-tail-tolerant parse pattern above: the
+   * last non-empty line of a file may legitimately be torn by a concurrent
+   * appender and is dropped silently, but a parse failure on any earlier
+   * line is real corruption and is logged.
+   *
+   * @param limit Optional cap on how many rows to return. Filenames are
+   *   `YYYY-MM-DD.jsonl`, which sort lexicographically in calendar order, so
+   *   files are read newest-day-first and reading stops as soon as `limit`
+   *   rows have been collected — older files are never opened. A whole file
+   *   is always read to completion once opened (rows aren't truncated
+   *   mid-file), so the result may overshoot `limit` slightly; callers that
+   *   need an exact count should slice the result themselves. Without a
+   *   `limit`, every file is read (unbounded, same as `peekAllBuffers()`) —
+   *   audit files are never pruned, so a very long-lived
+   *   `~/.newrelic-preflight/audit/` directory means more files read on
+   *   every call in that mode.
+   */
+  peekAllAuditLogs(limit?: number): AuditEntry[] {
+    const all: AuditEntry[] = [];
+    const auditDir = resolve(this.storagePath, 'audit');
+    let entries: string[];
+    try {
+      if (!existsSync(auditDir)) return [];
+      entries = readdirSync(auditDir);
+    } catch (err) {
+      logger.warn('Failed to enumerate audit dir for peekAllAuditLogs', { error: String(err) });
+      return [];
+    }
+    // Newest day-file first so a `limit` can stop opening older files once
+    // enough rows are collected — `YYYY-MM-DD.jsonl` names sort
+    // chronologically as plain strings, so lexicographic descending order
+    // is newest-first.
+    const jsonlFiles = entries
+      .filter((name) => name.endsWith('.jsonl'))
+      .sort()
+      .reverse();
+    for (const name of jsonlFiles) {
+      const path = resolve(auditDir, name);
+      let raw: string;
+      try {
+        raw = readFileSync(path, 'utf-8');
+      } catch {
+        continue;
+      }
+      if (!raw.trim()) continue;
+      const lines = raw.split('\n');
+      let lastNonEmptyIdx = -1;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i]!.trim()) {
+          lastNonEmptyIdx = i;
+          break;
+        }
+      }
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!;
+        if (!line.trim()) continue;
+        try {
+          all.push(JSON.parse(line) as AuditEntry);
+        } catch {
+          if (i === lastNonEmptyIdx) {
+            // Torn-tail race against a concurrent appender — expected.
+            continue;
+          }
+          logger.warn('peekAllAuditLogs: dropping malformed mid-file line', {
+            file: name,
+            lineIndex: i,
+            preview: line.slice(0, 100),
+            entriesSoFar: all.length,
+          });
+        }
+      }
+      if (limit !== undefined && all.length >= limit) break;
+    }
+    return all;
   }
 }

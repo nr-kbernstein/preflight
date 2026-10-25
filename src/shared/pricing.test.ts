@@ -1,4 +1,4 @@
-import type { TokenUsage } from './tokens.js';
+import { extractGeminiTokens, extractOpenAITokens, type TokenUsage } from './tokens.js';
 import {
   calculateCost,
   resolveModelPricing,
@@ -6,7 +6,7 @@ import {
   loadCustomPricing,
   PricingTable,
 } from './pricing.js';
-import { DEFAULT_PRICING_TABLE } from './pricing-data.js';
+import { DEFAULT_PRICING_TABLE, MODEL_ALIASES } from './pricing-data.js';
 import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -116,6 +116,19 @@ describe('calculateCost', () => {
     stderrSpy.mockRestore();
   });
 
+  // A trailing bracketed context-window tag (e.g. "[1m]", as Claude Code
+  // sometimes appends to a model id) must not defeat resolution and
+  // silently produce a $0 cost.
+  it('strips a trailing context-suffix tag so cost matches the untagged model', () => {
+    const tokenUsage = usage({ inputTokens: 1000, outputTokens: 1000 });
+
+    const tagged = calculateCost('claude-sonnet-5[1m]', tokenUsage);
+    const untagged = calculateCost('claude-sonnet-5', tokenUsage);
+
+    expect(tagged.totalUsd).toBeGreaterThan(0);
+    expect(tagged).toEqual(untagged);
+  });
+
   // ---------------------------------------------------------------------------
   // 10. All costs non-negative, totalUsd equals sum of components
   // ---------------------------------------------------------------------------
@@ -182,6 +195,81 @@ describe('calculateCost', () => {
   // ---------------------------------------------------------------------------
   // 11b. Marginal-mode tiered pricing
   // ---------------------------------------------------------------------------
+  describe('tiered cache-read rate', () => {
+    it('bills cache reads at the base rate at or below the threshold', () => {
+      const cost = calculateCost(
+        'gpt-6-astra',
+        usage({ inputTokens: 72_000, cacheReadTokens: 200_000 }),
+      );
+      expect(cost.cacheReadUsd).toBeCloseTo(0.2, 6);
+    });
+
+    it('bills cache reads at tierCacheReadPerMTok above the threshold (flat mode)', () => {
+      const cost = calculateCost(
+        'gpt-6-astra',
+        usage({ inputTokens: 272_001, cacheReadTokens: 1_000_000 }),
+      );
+      expect(cost.cacheReadUsd).toBeCloseTo(2, 6);
+      // Savings compare the tier input rate ($20) with the tier cache rate ($2).
+      expect(cost.savingsFromCacheUsd).toBeCloseTo(18, 6);
+    });
+
+    it('prices xAI grok-4.5 long-context cache reads at $0.6/MTok', () => {
+      const cost = calculateCost(
+        'grok-4.5',
+        usage({ inputTokens: 250_000, cacheReadTokens: 1_000_000 }),
+      );
+      expect(cost.cacheReadUsd).toBeCloseTo(0.6, 6);
+    });
+
+    it('bills Gemini 2.5 Pro long-prompt cache reads at its tier rate, counting cached tokens toward the threshold', () => {
+      const cost = calculateCost(
+        'gemini-2.5-pro',
+        usage({ inputTokens: 50_000, cacheReadTokens: 200_000 }),
+      );
+      expect(cost.cacheReadUsd).toBeCloseTo(0.05, 6); // 200k at $0.25/MTok
+      expect(cost.inputUsd).toBeCloseTo(0.125, 6); // 50k at the $2.50 tier rate
+    });
+
+    it('falls back to cacheReadPerMTok when no tier cache-read rate is set', () => {
+      const cost = calculateCost(
+        'gpt-5.5',
+        usage({ inputTokens: 250_000, cacheReadTokens: 1_000_000 }),
+      );
+      expect(cost.cacheReadUsd).toBeCloseTo(0.5, 6);
+    });
+
+    it('ignores tierCacheReadPerMTok in marginal mode', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'tier-cache-'));
+      try {
+        const file = join(dir, 'p.json');
+        writeFileSync(
+          file,
+          JSON.stringify({
+            'marginal-cache': {
+              inputPerMTok: 1,
+              outputPerMTok: 2,
+              cacheReadPerMTok: 0.1,
+              contextWindow: 1_000_000,
+              tierThreshold: 100_000,
+              tierMode: 'marginal',
+              tierInputPerMTok: 2,
+              tierCacheReadPerMTok: 0.9,
+            },
+          }),
+        );
+        initPricing(file);
+        const cost = calculateCost(
+          'marginal-cache',
+          usage({ inputTokens: 200_000, cacheReadTokens: 1_000_000 }),
+        );
+        expect(cost.cacheReadUsd).toBeCloseTo(0.1, 6);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('marginal-mode tiered pricing', () => {
     let tmpDir: string;
 
@@ -277,6 +365,17 @@ describe('calculateCost', () => {
       expect(costBelow.savingsFromCacheUsd).toBeCloseTo(0.02, 6);
     });
 
+    it('computes cache savings at tier rate when only input plus cache reads exceed the threshold', () => {
+      loadMarginalPricing();
+      // 50k input + 60k cache read = 110k prompt > 100k threshold
+      // savings = 60_000 * (4 - 0) / 1_000_000 = 0.24
+      const cost = calculateCost(
+        'marginal-test',
+        usage({ inputTokens: 50_000, cacheReadTokens: 60_000, outputTokens: 0 }),
+      );
+      expect(cost.savingsFromCacheUsd).toBeCloseTo(0.24, 6);
+    });
+
     it('defaults to flat mode when tierMode is omitted (regression: gemini-2.5-pro behavior)', () => {
       // gemini-2.5-pro has no tierMode set — must continue to bill flat
       const cost = calculateCost(
@@ -287,14 +386,13 @@ describe('calculateCost', () => {
       expect(cost.inputUsd).toBeCloseTo(0.75, 6);
     });
 
-    it('bills gpt-5.5 output at the base rate above the tier threshold (marginal mode has no tiered output)', () => {
-      // Regression: gpt-5.5 is 'marginal' mode and must not carry a
-      // tierOutputPerMTok — output always bills at outputPerMTok ($30),
-      // never the base rate's would-be tier multiplier, even when input
-      // exceeds the 270k threshold.
+    it('bills gpt-5.5 output at the tier rate once input exceeds the threshold (flat mode)', () => {
+      // gpt-5.5 is 'flat' mode (the default): OpenAI's own docs say
+      // long-context requests are "priced at 2x input and 1.5x output for
+      // the full request" — output tiers too, unlike marginal mode.
       const cost = calculateCost('gpt-5.5', usage({ inputTokens: 300_000, outputTokens: 10_000 }));
-      // Output: 10_000 * 30 / 1_000_000 = 0.3
-      expect(cost.outputUsd).toBeCloseTo(0.3, 6);
+      // Output: 10_000 * 45 / 1_000_000 = 0.45 (tierOutputPerMTok, 1.5x base)
+      expect(cost.outputUsd).toBeCloseTo(0.45, 6);
     });
   });
 });
@@ -374,7 +472,21 @@ describe('resolveModelPricing', () => {
     expect(haiku4!.outputPerMTok).toBe(5);
   });
 
-  it('resolves gpt-5, gemini-2.5, gemini-2.0 via added MODEL_ALIASES', () => {
+  it.each([
+    ['claude-haiku-5', 0.1, 0.5],
+    ['gpt-4', 30, 60],
+    ['mistral-large', 0.68, 2.09],
+  ])('resolves bare %s through an explicit alias', (name, input, output) => {
+    const pricing = resolveModelPricing(name);
+    expect(pricing).not.toBeNull();
+    expect(pricing!.inputPerMTok).toBe(input);
+    expect(pricing!.outputPerMTok).toBe(output);
+    expect(MODEL_ALIASES[name]).toBeDefined();
+  });
+
+  it('resolves gpt-5 via exact match, gemini-2.5/gemini-2.0 via added MODEL_ALIASES', () => {
+    // gpt-5 is a real, separately-priced model with its own table entry
+    // (not an alias) — see the MODEL_ALIASES comment in pricing-data.ts.
     const gpt5 = resolveModelPricing('gpt-5');
     expect(gpt5).not.toBeNull();
     expect(gpt5!.inputPerMTok).toBeGreaterThan(0);
@@ -388,6 +500,60 @@ describe('resolveModelPricing', () => {
     expect(gemini20).not.toBeNull();
     // Routes to gemini-2.0-flash
     expect(gemini20!.inputPerMTok).toBeGreaterThan(0);
+  });
+
+  // AWS Bedrock geo cross-region inference profile IDs (us./eu./au./jp.)
+  // route via exact-match alias to the bare `anthropic.*` key's Geo/In-region
+  // pricing; `global.anthropic.*` is a distinct real key priced ~10% cheaper.
+  it('resolves Bedrock regional-prefix aliases to the same pricing as the bare in-region key', () => {
+    const bare = resolveModelPricing('anthropic.claude-sonnet-5');
+    const usProfile = resolveModelPricing('us.anthropic.claude-sonnet-5');
+    const euProfile = resolveModelPricing('eu.anthropic.claude-sonnet-5');
+    expect(usProfile).toEqual(bare);
+    expect(euProfile).toEqual(bare);
+
+    const global = resolveModelPricing('global.anthropic.claude-sonnet-5');
+    expect(global).not.toBeNull();
+    expect(global!.inputPerMTok).toBeLessThan(bare!.inputPerMTok);
+  });
+
+  it.each([
+    'anthropic.claude-sonnet-5-5',
+    'anthropic.claude-opus-5-5',
+    'anthropic.claude-fable-5-1',
+    'anthropic.claude-3-5-sonnet-20241022-v2:0',
+    'anthropic.claude-3-5-haiku-20241022-v1:0',
+    'anthropic.claude-3-opus-20240229-v1:0',
+  ])('resolves us./eu. profiles of %s to the bare in-region key', (bareId) => {
+    const bare = resolveModelPricing(bareId);
+    expect(bare).not.toBeNull();
+    expect(resolveModelPricing(`us.${bareId}`)).toEqual(bare);
+    expect(resolveModelPricing(`eu.${bareId}`)).toEqual(bare);
+  });
+
+  it.each([
+    'anthropic.claude-mythos-5',
+    'anthropic.claude-opus-4-6-v1',
+    'anthropic.claude-sonnet-4-5-20250929-v1:0',
+    'anthropic.claude-3-haiku-20240307-v1:0',
+  ])('resolves us./eu./au./jp. profiles of %s to the bare in-region key', (bareId) => {
+    const bare = resolveModelPricing(bareId);
+    expect(bare).not.toBeNull();
+    for (const region of ['us', 'eu', 'au', 'jp']) {
+      expect(resolveModelPricing(`${region}.${bareId}`)).toEqual(bare);
+    }
+  });
+
+  it.each([
+    ['in.anthropic.claude-sonnet-5', 'anthropic.claude-sonnet-5'],
+    ['apac.anthropic.claude-sonnet-4-20250514-v1:0', 'anthropic.claude-sonnet-4-20250514-v1:0'],
+    ['jp.amazon.nova-2-lite-v1:0', 'amazon.nova-2-lite-v1:0'],
+    ['us.meta.llama4-scout-17b-instruct-v1:0', 'meta.llama4-scout-17b-instruct-v1:0'],
+    ['eu.mistral.pixtral-large-2502-v1:0', 'mistral.pixtral-large-2502-v1:0'],
+  ])('resolves Bedrock profile %s to %s', (profileId, bareId) => {
+    const bare = resolveModelPricing(bareId);
+    expect(bare).not.toBeNull();
+    expect(resolveModelPricing(profileId)).toEqual(bare);
   });
 
   // 13. Reverse prefix does not match unrelated models
@@ -456,6 +622,38 @@ describe('resolveModelPricing', () => {
     // flash = $0.30/MTok input; flash-lite = $0.10/MTok input
     expect(flash!.inputPerMTok).toBe(0.3);
     expect(flashLite!.inputPerMTok).toBe(0.1);
+  });
+
+  // A trailing bracketed context-window tag (e.g. "[1m]") must be stripped
+  // before exact/alias/reverse-prefix matching.
+  describe('trailing context-suffix tags (e.g. "[1m]")', () => {
+    it('resolves via exact match after stripping the tag', () => {
+      const tagged = resolveModelPricing('claude-sonnet-5[1m]');
+      const untagged = resolveModelPricing('claude-sonnet-5');
+      expect(tagged).not.toBeNull();
+      expect(tagged).toEqual(untagged);
+    });
+
+    it('resolves via alias after stripping the tag', () => {
+      const tagged = resolveModelPricing('claude-opus-4[1m]');
+      const untagged = resolveModelPricing('claude-opus-4');
+      expect(tagged).not.toBeNull();
+      expect(tagged).toEqual(untagged);
+    });
+
+    it('resolves via reverse-prefix+alias after stripping the tag', () => {
+      const tagged = resolveModelPricing('claude-opus-4-99[1m]');
+      const untagged = resolveModelPricing('claude-opus-4-99');
+      expect(tagged).not.toBeNull();
+      expect(tagged).toEqual(untagged);
+    });
+
+    it('strips consecutive trailing tags (e.g. "[1m][queue]")', () => {
+      const tagged = resolveModelPricing('claude-sonnet-5[1m][queue]');
+      const untagged = resolveModelPricing('claude-sonnet-5');
+      expect(tagged).not.toBeNull();
+      expect(tagged).toEqual(untagged);
+    });
   });
 });
 
@@ -1018,6 +1216,7 @@ describe('custom pricing file', () => {
           tierInputPerMTok: 2,
           tierOutputPerMTok: 4,
           tierThinkingPerMTok: 6,
+          tierCacheReadPerMTok: 1,
           tierMode: 'marginal',
         },
       }),
@@ -1025,6 +1224,7 @@ describe('custom pricing file', () => {
 
     const result = loadCustomPricing(customFile);
     const entry = result!['optionals-model'];
+    expect(entry.tierCacheReadPerMTok).toBe(1);
     expect(entry.thinkingPerMTok).toBe(3);
     expect(entry.cacheReadPerMTok).toBe(0.5);
     expect(entry.cacheCreationPerMTok).toBe(1.5);
@@ -1364,5 +1564,87 @@ describe('PricingTable (instance-based)', () => {
     expect(logs.some((l) => l.includes('Ambiguous forward-prefix match'))).toBe(true);
 
     warnSpy.mockRestore();
+  });
+});
+
+describe('audio input pricing', () => {
+  it('bills audio input and audio cache reads at their own rates (gemini-2.5-flash)', () => {
+    const cost = calculateCost(
+      'gemini-2.5-flash',
+      usage({
+        inputTokens: 1_000_000,
+        audioInputTokens: 400_000,
+        cacheReadTokens: 500_000,
+        audioCacheReadTokens: 100_000,
+      }),
+    );
+    // text 600k * 0.30 + audio 400k * 1.00
+    expect(cost.inputUsd).toBeCloseTo(0.18 + 0.4, 6);
+    // text 400k * 0.03 + audio 100k * 0.10
+    expect(cost.cacheReadUsd).toBeCloseTo(0.012 + 0.01, 6);
+    // savings: 400k * (0.30-0.03) + 100k * (1.00-0.10)
+    expect(cost.savingsFromCacheUsd).toBeCloseTo(0.108 + 0.09, 6);
+    expect(cost.totalUsd).toBeCloseTo(cost.inputUsd + cost.cacheReadUsd, 6);
+  });
+
+  it('falls back to the text rate when a model has no audio rate', () => {
+    const cost = calculateCost(
+      'gemini-2.0-flash',
+      usage({ inputTokens: 1_000_000, audioInputTokens: 500_000 }),
+    );
+    expect(cost.inputUsd).toBeCloseTo(0.1, 6);
+  });
+
+  it('clamps audio counts that exceed the parent count', () => {
+    const cost = calculateCost(
+      'gemini-2.5-flash',
+      usage({ inputTokens: 1_000_000, audioInputTokens: 5_000_000 }),
+    );
+    expect(cost.inputUsd).toBeCloseTo(1.0, 6);
+  });
+
+  it('accepts audio rates from a custom pricing file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'audio-pricing-'));
+    try {
+      const file = join(dir, 'p.json');
+      writeFileSync(
+        file,
+        JSON.stringify({
+          m: {
+            inputPerMTok: 1,
+            outputPerMTok: 2,
+            contextWindow: 1000,
+            audioInputPerMTok: 3,
+            audioCacheReadPerMTok: 0.5,
+          },
+        }),
+      );
+      expect(loadCustomPricing(file)?.m).toMatchObject({
+        audioInputPerMTok: 3,
+        audioCacheReadPerMTok: 0.5,
+      });
+    } finally {
+      rmSync(dir, { recursive: true });
+    }
+  });
+});
+
+describe('cached tokens are billed once (extractor to cost)', () => {
+  it('bills a Gemini cached prompt at the cache rate for the cached part only', () => {
+    const tokens = extractGeminiTokens({
+      usageMetadata: { promptTokenCount: 1_000_000, cachedContentTokenCount: 400_000 },
+    });
+    const cost = calculateCost('gemini-2.5-flash', tokens);
+    expect(cost.inputUsd).toBeCloseTo(0.18, 6); // 600k at $0.30
+    expect(cost.cacheReadUsd).toBeCloseTo(0.012, 6); // 400k at $0.03
+  });
+
+  it('bills an OpenAI cached prompt at the cache rate for the cached part only', () => {
+    const tokens = extractOpenAITokens({
+      usage: { prompt_tokens: 200_000, prompt_tokens_details: { cached_tokens: 80_000 } },
+    });
+    const cost = calculateCost('gpt-5.5', tokens);
+    expect(cost.inputUsd).toBeCloseTo(0.6, 6); // 120k at $5
+    expect(cost.cacheReadUsd).toBeCloseTo(0.04, 6); // 80k at $0.50
   });
 });

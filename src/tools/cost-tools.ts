@@ -15,8 +15,10 @@ import type { CostTracker } from '../metrics/cost-tracker.js';
 import type { TaskDetector } from '../metrics/task-detector.js';
 import type { BudgetTracker } from '../metrics/budget-tracker.js';
 import type { ModelUsageTracker } from '../metrics/model-usage-tracker.js';
+import type { SessionResumeTracker } from '../metrics/session-resume-tracker.js';
 import { buildCostForecastFromInputs } from '../metrics/cost-forecast.js';
 import { localDateKey } from '../lib/date.js';
+import { resolvePricing } from '../metrics/pricing-overlay.js';
 import type { TokenUsage } from '../shared/index.js';
 import {
   errorResult,
@@ -117,7 +119,7 @@ export function handleReportTokens(
   };
 
   const breakdown = costTracker.recordTokenUsage(usage, safeModel);
-  modelUsageTracker?.recordUsage(safeModel, inputTokens, outputTokens, breakdown.totalUsd);
+  modelUsageTracker?.recordUsage(safeModel, usage, breakdown.totalUsd);
   const metrics = costTracker.getMetrics();
 
   return {
@@ -146,7 +148,7 @@ export function handleReportTokens(
 export const COST_BREAKDOWN_TOOL = {
   name: 'nr_observe_get_cost_breakdown',
   description:
-    'Get a breakdown of session costs by task, model, and efficiency metrics like cost per line of code.',
+    "Get a breakdown of session costs by task, model, and efficiency metrics like cost per line of code. Cost figures are Preflight's own list-price estimate unless costRateMultiplier/dataResidencyPremium are configured for an org's contracted rate — see rate_multiplier_applied in the response.",
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -168,6 +170,12 @@ export function handleGetCostBreakdown(costTracker: CostTracker, taskDetector?: 
   const result = {
     total_usd: metrics.sessionTotalCostUsd ?? 0,
     by_model: metrics.costByModel,
+    by_agent_type: Object.fromEntries(
+      Object.entries(metrics.subagentByAgentType).map(([agentType, bucket]) => [
+        agentType,
+        bucket.costUsd,
+      ]),
+    ),
     by_task: byTask,
     cost_per_line_of_code: metrics.costPerLineOfCode,
     cost_per_file_modified: metrics.costPerFileModified,
@@ -179,6 +187,14 @@ export function handleGetCostBreakdown(costTracker: CostTracker, taskDetector?: 
       cache_read: metrics.totalCacheReadTokens,
       cache_creation: metrics.totalCacheCreationTokens,
     },
+    // 1 unless costRateMultiplier/dataResidencyPremium are configured — see
+    // CostMetrics.costRateMultiplierApplied. A value other than 1 means every
+    // dollar figure above reflects that correction, not Preflight's default
+    // list-price computation, which is still only an estimate either way.
+    rate_multiplier_applied: metrics.costRateMultiplierApplied,
+    unpriced_by_model: metrics.unpricedByModel,
+    unpriced_models: Object.keys(metrics.costByModel).filter((model) => !resolvePricing(model)),
+    estimated_by_model: metrics.estimatedByModel,
   };
 
   return {
@@ -208,7 +224,8 @@ export const BUDGET_STATUS_TOOL = {
 export const COST_FORECAST_TOOL = {
   name: 'nr_observe_get_cost_forecast',
   description:
-    'Project AI spending forward based on current session rate. Returns forecast cost for end-of-day, end-of-week, and end-of-session (8h), with a confidence note.',
+    'Project AI spending forward based on current session rate. Returns forecast cost for end-of-day, end-of-week, and end-of-session (8h), with a confidence note. ' +
+    "When this session was resumed after being stale, also includes resumeContext: Claude Code's own report of how long it had been and its estimated cost to re-warm the prompt cache — context for a cost spike the rate-based forecast alone would not explain.",
   inputSchema: {
     type: 'object' as const,
     properties: {},
@@ -230,6 +247,7 @@ export function handleGetBudgetStatus(budgetTracker: BudgetTracker): {
 export function handleGetCostForecast(
   costTracker: CostTracker,
   sessionStartMs: number,
+  sessionResumeTracker?: SessionResumeTracker,
 ): { content: Array<{ type: 'text'; text: string }> } {
   const metrics = costTracker.getMetrics();
   const todayKey = localDateKey();
@@ -239,7 +257,13 @@ export function handleGetCostForecast(
     dailySpentUsd: costTracker.getCostForDay(todayKey),
     dailyFirstActivityMs: costTracker.getFirstActivityMsForDay(todayKey),
   });
-  return { content: [{ type: 'text', text: JSON.stringify(forecast, null, 2) }] };
+  // resumeContext rides alongside the forecast as extra informational JSON —
+  // the forecast math itself (buildCostForecastFromInputs) is untouched, so
+  // this can never perturb its well-tested rate/confidence calculations.
+  const response = sessionResumeTracker
+    ? { ...forecast, resumeContext: sessionResumeTracker.getMetrics() }
+    : forecast;
+  return { content: [{ type: 'text', text: JSON.stringify(response, null, 2) }] };
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +360,7 @@ export interface CostToolsDeps {
   budgetTracker?: BudgetTracker;
   taskDetector?: TaskDetector;
   modelUsageTracker?: ModelUsageTracker;
+  sessionResumeTracker?: SessionResumeTracker;
   sessionStartMs?: number;
 }
 
@@ -395,7 +420,11 @@ export function registerCostTools(deps: CostToolsDeps): RegisteredToolSet {
           'CostTracker or sessionStartMs not available',
         );
         if (missing) return missing;
-        return handleGetCostForecast(deps.costTracker!, deps.sessionStartMs!);
+        return handleGetCostForecast(
+          deps.costTracker!,
+          deps.sessionStartMs!,
+          deps.sessionResumeTracker,
+        );
       },
     },
   ]);

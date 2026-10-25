@@ -2,6 +2,9 @@ import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals
 import { EfficiencyScorer } from './efficiency-score.js';
 import type { AiCodingTask } from './task-detector.js';
 import type { AntiPattern } from './anti-patterns.js';
+import { CostTracker } from './cost-tracker.js';
+import { SessionTracker } from './session-tracker.js';
+import { makeUsage } from '../__test-utils__/token-usage.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -71,7 +74,7 @@ describe('Perfect task', () => {
 // ---------------------------------------------------------------------------
 
 describe('Poor task', () => {
-  it('scores near 0.0 for a slow, failing, non-autonomous task with thrashing', () => {
+  it('scores low for a slow, failing, non-autonomous task with thrashing', () => {
     const scorer = new EfficiencyScorer();
 
     const task = makeTask({
@@ -88,17 +91,21 @@ describe('Poor task', () => {
         type: 'thrashing',
         file: '/a.ts',
         iterations: 5,
+        tokensWasted: 0,
         suggestion: 'Consider reading the test output more carefully',
       },
     ];
 
     const result = scorer.computeScore(task, antiPatterns);
 
-    expect(result.score).toBeLessThan(0.15);
+    // firstAttemptQuality = 1 - 5/10 = 0.5 is no longer a hard 0, so the
+    // composite can't be as low as before, but every other component is
+    // still at its floor.
+    expect(result.score).toBeLessThan(0.2);
     expect(result.components.speed).toBeLessThan(0.01);
     expect(result.components.correctness).toBe(0);
-    expect(result.components.autonomy).toBeLessThan(0.25);
-    expect(result.components.firstAttemptQuality).toBe(0);
+    expect(result.components.autonomy).toBe(0);
+    expect(result.components.firstAttemptQuality).toBe(0.5);
   });
 });
 
@@ -137,7 +144,7 @@ describe('No user questions', () => {
 // ---------------------------------------------------------------------------
 
 describe('Thrash iterations', () => {
-  it('3 thrash iterations → first-attempt quality = 0.0', () => {
+  it('3 thrash iterations → first-attempt quality = 0.7', () => {
     const scorer = new EfficiencyScorer();
 
     const antiPatterns: AntiPattern[] = [
@@ -145,16 +152,18 @@ describe('Thrash iterations', () => {
         type: 'thrashing',
         file: '/a.ts',
         iterations: 3,
+        tokensWasted: 0,
         suggestion: '',
       },
     ];
 
     const result = scorer.computeScore(makeTask(), antiPatterns);
 
-    expect(result.components.firstAttemptQuality).toBe(0);
+    // 1 - 3/10 = 0.7
+    expect(result.components.firstAttemptQuality).toBeCloseTo(0.7, 2);
   });
 
-  it('1 thrash iteration → first-attempt quality = 0.667', () => {
+  it('1 thrash iteration → first-attempt quality = 0.9', () => {
     const scorer = new EfficiencyScorer();
 
     const antiPatterns: AntiPattern[] = [
@@ -162,41 +171,45 @@ describe('Thrash iterations', () => {
         type: 'thrashing',
         file: '/a.ts',
         iterations: 1,
+        tokensWasted: 0,
         suggestion: '',
       },
     ];
 
     const result = scorer.computeScore(makeTask(), antiPatterns);
 
-    expect(result.components.firstAttemptQuality).toBeCloseTo(0.667, 2);
+    // 1 - 1/10 = 0.9
+    expect(result.components.firstAttemptQuality).toBeCloseTo(0.9, 2);
   });
 
   it('uses the worst thrashing pattern when multiple files thrash', () => {
     const scorer = new EfficiencyScorer();
 
     const antiPatterns: AntiPattern[] = [
-      { type: 'thrashing', file: '/a.ts', iterations: 1, suggestion: '' },
-      { type: 'thrashing', file: '/b.ts', iterations: 4, suggestion: '' },
-      { type: 'thrashing', file: '/c.ts', iterations: 2, suggestion: '' },
+      { type: 'thrashing', file: '/a.ts', iterations: 1, tokensWasted: 0, suggestion: '' },
+      { type: 'thrashing', file: '/b.ts', iterations: 4, tokensWasted: 0, suggestion: '' },
+      { type: 'thrashing', file: '/c.ts', iterations: 2, tokensWasted: 0, suggestion: '' },
     ];
 
     const result = scorer.computeScore(makeTask(), antiPatterns);
 
-    // 1 - 4/3 = negative → clamped to 0
-    expect(result.components.firstAttemptQuality).toBe(0);
+    // 1 - 4/10 = 0.6
+    expect(result.components.firstAttemptQuality).toBeCloseTo(0.6, 2);
   });
 
-  it('non-thrashing anti-patterns do not affect first-attempt quality', () => {
+  it('non-thrashing anti-patterns also affect first-attempt quality', () => {
     const scorer = new EfficiencyScorer();
 
     const antiPatterns: AntiPattern[] = [
-      { type: 're_reading', file: '/a.ts', readCount: 10, suggestion: '' },
-      { type: 'stuck_loop', command: 'npm test', repeatCount: 5, suggestion: '' },
+      { type: 're_reading', file: '/a.ts', readCount: 10, tokensWasted: 0, suggestion: '' },
+      { type: 'stuck_loop', command: 'npm test', repeatCount: 5, tokensWasted: 0, suggestion: '' },
     ];
 
     const result = scorer.computeScore(makeTask(), antiPatterns);
 
-    expect(result.components.firstAttemptQuality).toBe(1);
+    // Worst severity across ALL pattern types (not just thrashing) is 10
+    // (re_reading's readCount) → 1 - 10/10 = 0
+    expect(result.components.firstAttemptQuality).toBe(0);
   });
 });
 
@@ -251,6 +264,105 @@ describe('Speed normalization', () => {
     const result = scorer.computeScore(task);
 
     expect(result.components.speed).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zero-lines-changed tasks: speed must not penalize investigation/review/
+// delegated tasks that made zero edits by design.
+// ---------------------------------------------------------------------------
+
+describe('Zero linesChanged tasks', () => {
+  it('excludes speed from the composite score entirely, renormalizing the rest', () => {
+    const scorer = new EfficiencyScorer();
+
+    const task = makeTask({
+      linesChanged: 0,
+      testsRun: 4,
+      testsPassed: 4,
+      askedUserQuestions: 0,
+      toolCallCount: 10,
+    });
+    const result = scorer.computeScore(task);
+
+    // The speed component still reports the raw (zero) rate for diagnostics...
+    expect(result.components.speed).toBe(0);
+    // ...but correctness=1, autonomy=1, firstAttemptQuality=1 average to a
+    // perfect score once speed is excluded rather than dragging it down.
+    expect(result.score).toBe(1);
+  });
+
+  it('renormalizes correctly when custom weights do not sum to 1', () => {
+    // correctness=0.9, autonomy=0.3, firstAttemptQuality=0.3 → sum 1.5, not 1.
+    const scorer = new EfficiencyScorer({
+      correctnessWeight: 0.9,
+      autonomyWeight: 0.3,
+      firstAttemptQualityWeight: 0.3,
+    });
+
+    const task = makeTask({
+      linesChanged: 0,
+      testsRun: 4,
+      testsPassed: 4, // correctness = 1
+      askedUserQuestions: 5, // autonomy = 1 - (5-1)/4 = 0
+      toolCallCount: 10,
+    });
+    const antiPatterns: AntiPattern[] = [
+      { type: 'thrashing', file: '/a.ts', iterations: 3, tokensWasted: 0, suggestion: '' },
+    ];
+    // firstAttemptQuality = 1 - 3/10 = 0.7
+
+    const result = scorer.computeScore(task, antiPatterns);
+
+    // (1*0.9 + 0*0.3 + 0.7*0.3) / 1.5 = (0.9 + 0 + 0.21) / 1.5 = 0.74
+    expect(result.score).toBeCloseTo(0.74, 3);
+  });
+
+  it('scores 0 rather than NaN when the non-speed weights are all 0', () => {
+    const scorer = new EfficiencyScorer({
+      speedWeight: 1,
+      correctnessWeight: 0,
+      autonomyWeight: 0,
+      firstAttemptQualityWeight: 0,
+    });
+
+    const task = makeTask({
+      linesChanged: 0,
+      testsRun: 4,
+      testsPassed: 4,
+      askedUserQuestions: 0,
+      toolCallCount: 10,
+    });
+    const result = scorer.computeScore(task);
+
+    expect(result.score).toBe(0);
+    expect(Number.isNaN(result.score)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Speed weight: speed's influence on the composite score is reduced from
+// 0.25 to 0.10 so raw line-churn can no longer buy most of the score on
+// its own.
+// ---------------------------------------------------------------------------
+
+describe('Speed weight reduced', () => {
+  it('a fast bulk edit no longer dominates the composite score via speed alone', () => {
+    const scorer = new EfficiencyScorer();
+
+    const task = makeTask({
+      linesChanged: 400,
+      durationMs: 1_000, // 400 lines/sec, far above baseline → speed clamps to 1.0
+      testsRun: 0,
+      testsPassed: 0, // correctness defaults to 0.5
+      askedUserQuestions: 5, // autonomy = 1 - (5-1)/4 = 0
+      toolCallCount: 10,
+    });
+    const result = scorer.computeScore(task);
+
+    expect(result.components.speed).toBe(1);
+    // 1*0.10 + 0.5*0.30 + 0*0.30 + 1*0.30 = 0.55
+    expect(result.score).toBeCloseTo(0.55, 2);
   });
 });
 
@@ -364,6 +476,101 @@ describe('emitMetrics()', () => {
     expect(names).toContain('ai.efficiency.correctness');
     expect(names).toContain('ai.efficiency.autonomy');
     expect(names).toContain('ai.efficiency.first_attempt_quality');
+  });
+
+  it('attaches a model attr from costTracker, matching CostTracker.emitMetrics()', () => {
+    const costTracker = new CostTracker(new SessionTracker('s1'));
+    costTracker.recordTokenUsage(makeUsage(), 'claude-sonnet-5');
+    const scorer = new EfficiencyScorer({ costTracker });
+
+    scorer.computeScore(makeTask({ taskId: 't1' }));
+
+    const recorded: Array<{ name: string; attrs: Record<string, unknown> }> = [];
+    const aggregator = {
+      record(name: string, _value: number, attrs: Record<string, unknown> = {}) {
+        recorded.push({ name, attrs });
+      },
+    } as unknown as import('../shared/index.js').MetricAggregator;
+
+    scorer.emitMetrics(aggregator);
+
+    expect(recorded).toHaveLength(5);
+    for (const r of recorded) {
+      expect(r.attrs.model).toBe('claude-sonnet-5');
+    }
+  });
+
+  it('keeps a scored task on the model that produced it, even if costTracker moves on before emit', () => {
+    // Regression for a subagent on a different model (e.g. a Bedrock/Gemini
+    // call) reporting tokens after the parent task is scored but before the
+    // next emitMetrics() — the task's gauges must not pick up that later
+    // model.
+    const costTracker = new CostTracker(new SessionTracker('s1'));
+    costTracker.recordTokenUsage(makeUsage(), 'claude-sonnet-5');
+    const scorer = new EfficiencyScorer({ costTracker });
+
+    scorer.computeScore(makeTask({ taskId: 't1' }));
+    costTracker.recordTokenUsage(makeUsage(), 'claude-haiku-4-5');
+
+    const recorded: Array<{ name: string; attrs: Record<string, unknown> }> = [];
+    const aggregator = {
+      record(name: string, _value: number, attrs: Record<string, unknown> = {}) {
+        recorded.push({ name, attrs });
+      },
+    } as unknown as import('../shared/index.js').MetricAggregator;
+
+    scorer.emitMetrics(aggregator);
+
+    expect(recorded).toHaveLength(5);
+    for (const r of recorded) {
+      expect(r.attrs.model).toBe('claude-sonnet-5');
+    }
+  });
+
+  it.each(['computeScore', 'updateScore'] as const)(
+    'keeps the stored model when %s re-scores an already-scored task',
+    (method) => {
+      const costTracker = new CostTracker(new SessionTracker('s1'));
+      costTracker.recordTokenUsage(makeUsage(), 'claude-sonnet-5');
+      const scorer = new EfficiencyScorer({ costTracker });
+
+      scorer.computeScore(makeTask({ taskId: 't1' }));
+      costTracker.recordTokenUsage(makeUsage(), 'claude-haiku-4-5');
+      scorer[method](makeTask({ taskId: 't1' }));
+
+      const recorded: Array<Record<string, unknown>> = [];
+      const aggregator = {
+        record(_name: string, _value: number, attrs: Record<string, unknown> = {}) {
+          recorded.push(attrs);
+        },
+      } as unknown as import('../shared/index.js').MetricAggregator;
+
+      scorer.emitMetrics(aggregator);
+
+      expect(recorded).toHaveLength(5);
+      for (const attrs of recorded) {
+        expect(attrs.model).toBe('claude-sonnet-5');
+      }
+    },
+  );
+
+  it('omits the model attr when no costTracker is provided', () => {
+    const scorer = new EfficiencyScorer();
+    scorer.computeScore(makeTask({ taskId: 't1' }));
+
+    const recorded: Array<Record<string, unknown>> = [];
+    const aggregator = {
+      record(_name: string, _value: number, attrs: Record<string, unknown> = {}) {
+        recorded.push(attrs);
+      },
+    } as unknown as import('../shared/index.js').MetricAggregator;
+
+    scorer.emitMetrics(aggregator);
+
+    expect(recorded).toHaveLength(5);
+    for (const attrs of recorded) {
+      expect(attrs.model).toBeUndefined();
+    }
   });
 });
 
@@ -509,14 +716,24 @@ describe('updateScore()', () => {
 // ---------------------------------------------------------------------------
 
 describe('Autonomy edge cases', () => {
-  it('many user questions reduces autonomy', () => {
+  it('a single clarifying question is not penalized', () => {
     const scorer = new EfficiencyScorer();
 
-    const task = makeTask({ askedUserQuestions: 5, toolCallCount: 10 });
+    const task = makeTask({ askedUserQuestions: 1, toolCallCount: 3 });
     const result = scorer.computeScore(task);
 
-    // 1 - 5/10 = 0.5
-    expect(result.components.autonomy).toBe(0.5);
+    expect(result.components.autonomy).toBe(1);
+  });
+
+  it('many user questions reduces autonomy, independent of tool call count', () => {
+    const scorer = new EfficiencyScorer();
+
+    const small = makeTask({ askedUserQuestions: 5, toolCallCount: 10 });
+    const large = makeTask({ askedUserQuestions: 5, toolCallCount: 200 });
+
+    // 1 - (5-1)/4 = 0, the same regardless of task size
+    expect(scorer.computeScore(small).components.autonomy).toBe(0);
+    expect(scorer.computeScore(large).components.autonomy).toBe(0);
   });
 
   it('0 tool calls → autonomy = 1.0 (no work to judge)', () => {
@@ -602,5 +819,77 @@ describe('scores cap (MAX_SCORES = 1000)', () => {
     } as unknown as import('../shared/index.js').MetricAggregator;
     scorer.emitMetrics(agg2);
     expect(recorded).toHaveLength(5); // only t2, not t1 again
+  });
+});
+
+// ---------------------------------------------------------------------------
+// seedFromPersisted
+// ---------------------------------------------------------------------------
+
+describe('seedFromPersisted', () => {
+  it('blends a weighted seeded average into getSessionAverage()', () => {
+    const scorer = new EfficiencyScorer();
+    // Seed represents 4 pre-restart tasks averaging score=0.8.
+    scorer.seedFromPersisted({
+      score: 0.8,
+      components: { speed: 0.9, correctness: 0.7, autonomy: 1, firstAttemptQuality: 0.6 },
+      sampleCount: 4,
+    });
+    // One fresh task scoring 0 across the board post-restart.
+    scorer.computeScore(
+      makeTask({ linesChanged: 0, testsRun: 0, testsPassed: 0, askedUserQuestions: 10 }),
+    );
+
+    const avg = scorer.getSessionAverage();
+    expect(avg).not.toBeNull();
+    // Weighted: (0.8*4 + freshScore*1) / 5 — assert via the same math the
+    // fresh task's own computeScore() result reports, rather than a second
+    // hardcoded literal, so this test can't drift from computeScore()'s own
+    // formula.
+    const fresh = scorer.getScores()[0]!;
+    expect(avg!.score).toBeCloseTo((0.8 * 4 + fresh.score * 1) / 5, 6);
+    expect(avg!.components.speed).toBeCloseTo((0.9 * 4 + fresh.components.speed * 1) / 5, 6);
+  });
+
+  it('returns the seed unweighted-by-fresh-data average when no fresh tasks have been scored yet', () => {
+    const scorer = new EfficiencyScorer();
+    scorer.seedFromPersisted({
+      score: 0.65,
+      components: { speed: 0.5, correctness: 0.6, autonomy: 0.7, firstAttemptQuality: 0.8 },
+      sampleCount: 2,
+    });
+    const avg = scorer.getSessionAverage();
+    expect(avg!.score).toBeCloseTo(0.65, 6);
+    expect(avg!.components).toEqual({
+      speed: 0.5,
+      correctness: 0.6,
+      autonomy: 0.7,
+      firstAttemptQuality: 0.8,
+    });
+  });
+
+  it('is additive across multiple calls', () => {
+    const scorer = new EfficiencyScorer();
+    scorer.seedFromPersisted({
+      score: 1,
+      components: { speed: 1, correctness: 1, autonomy: 1, firstAttemptQuality: 1 },
+      sampleCount: 1,
+    });
+    scorer.seedFromPersisted({
+      score: 0,
+      components: { speed: 0, correctness: 0, autonomy: 0, firstAttemptQuality: 0 },
+      sampleCount: 1,
+    });
+    expect(scorer.getSessionAverage()!.score).toBeCloseTo(0.5, 6);
+  });
+
+  it('is a no-op for a zero sampleCount', () => {
+    const scorer = new EfficiencyScorer();
+    scorer.seedFromPersisted({
+      score: 1,
+      components: { speed: 1, correctness: 1, autonomy: 1, firstAttemptQuality: 1 },
+      sampleCount: 0,
+    });
+    expect(scorer.getSessionAverage()).toBeNull();
   });
 });

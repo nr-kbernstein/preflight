@@ -12,6 +12,7 @@ import {
   getEventsApiUrl,
   getNerdgraphUrl,
 } from './key-validator.js';
+import { stagingHost } from '../shared/transport/http-client.js';
 
 afterEach(() => {
   jest.mocked(validateSsrfUrl).mockReset();
@@ -40,9 +41,21 @@ describe('getEventsApiUrl', () => {
     );
   });
 
+  it('returns staging endpoint', () => {
+    expect(getEventsApiUrl('12345', 'staging')).toBe(
+      `https://${stagingHost('insights-collector')}/v1/accounts/12345/events`,
+    );
+  });
+
   it('returns gov endpoint', () => {
     expect(getEventsApiUrl('12345', 'gov')).toBe(
       'https://gov-insights-collector.newrelic.com/v1/accounts/12345/events',
+    );
+  });
+
+  it('returns JP endpoint', () => {
+    expect(getEventsApiUrl('12345', 'jp')).toBe(
+      'https://insights-collector.jp.nr-data.net/v1/accounts/12345/events',
     );
   });
 
@@ -62,8 +75,16 @@ describe('getNerdgraphUrl', () => {
     expect(getNerdgraphUrl('eu')).toBe('https://api.eu.newrelic.com/graphql');
   });
 
+  it('returns staging endpoint', () => {
+    expect(getNerdgraphUrl('staging')).toBe(`https://${stagingHost('api')}/graphql`);
+  });
+
   it('returns US endpoint for gov (no distinct gov NerdGraph URL)', () => {
     expect(getNerdgraphUrl('gov')).toBe('https://api.newrelic.com/graphql');
+  });
+
+  it('returns JP endpoint', () => {
+    expect(getNerdgraphUrl('jp')).toBe('https://api.jp.newrelic.com/graphql');
   });
 });
 
@@ -160,6 +181,15 @@ describe('validateLicenseKey', () => {
     await validateLicenseKey({ licenseKey: 'EU01-KEY', accountId: '12345', collectorHost: 'eu' });
     expect(fetchSpy).toHaveBeenCalledWith(
       expect.stringContaining('eu01.nr-data.net'),
+      expect.any(Object),
+    );
+  });
+
+  it('uses JP ingest URL when collectorHost is jp', async () => {
+    fetchSpy.mockResolvedValue(new Response('{}', { status: 200 }));
+    await validateLicenseKey({ licenseKey: 'JP-KEY', accountId: '12345', collectorHost: 'jp' });
+    expect(fetchSpy).toHaveBeenCalledWith(
+      expect.stringContaining('jp.nr-data.net'),
       expect.any(Object),
     );
   });

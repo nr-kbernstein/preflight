@@ -104,11 +104,7 @@ export function TopBar({
         <button
           type="button"
           onClick={() => onNavigate('/alerts')}
-          aria-label={
-            alertCount > 0
-              ? `Alerts, ${alertCount} firing`
-              : 'Alerts'
-          }
+          aria-label={alertCount > 0 ? `Alerts, ${alertCount} firing` : 'Alerts'}
           className={ICON_BUTTON}
         >
           <Bell size={18} />

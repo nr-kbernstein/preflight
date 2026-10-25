@@ -62,10 +62,28 @@ export interface WorkflowRunRow {
   readonly error_reason: string | null;
   readonly default_model: string;
   readonly started_at: number;
-  readonly duration_ms: number;
+  /**
+   * `null` when the on-disk rollup has no numeric `durationMs` yet (e.g. a
+   * run still in progress or killed before it wrote one) — distinct from a
+   * confirmed 0ms run. Averaging over several runs' `duration_ms` must
+   * filter out nulls rather than let them silently count as zero.
+   */
+  readonly duration_ms: number | null;
   readonly agent_count: number;
   readonly total_tokens: number;
   readonly total_usd: number | null;
+  /**
+   * True when `total_usd` is `null` because this process never personally
+   * observed this run's cost (no `hasCostForRun` callback, or it returned
+   * false), as opposed to a confirmed $0. Lets a KPI summing several runs'
+   * `total_usd` flag its total as partial instead of silently treating
+   * "unknown" the same as "zero". As of CostTracker.seedFromPersisted()
+   * restoring costByWorkflowRunId across a process restart, this should now
+   * only be true for a run a different, concurrently-running process is
+   * paying for (e.g. a `--local` dashboard reading a `--stdio` process's
+   * run) — not for a run whose owning process simply restarted.
+   */
+  readonly cost_unknown: boolean;
   readonly declared_phases: number | null;
   readonly observed_phases: number;
   readonly declared_parallel_widths: Array<number | 'dynamic'>;
@@ -105,6 +123,15 @@ export interface WorkflowStoreOptions {
   readonly windowHours?: number;
   /** Hook so the dashboard can inflate cost from the live cost tracker. */
   readonly getCostForRun?: (runId: string) => number;
+  /**
+   * Hook so the dashboard can tell "confirmed $0" apart from "this process
+   * never observed this run's cost" (a partial mitigation — see
+   * `CostTracker.hasCostForWorkflowRun`'s docstring). Optional: when
+   * omitted, every row with `total_usd === null` is conservatively treated
+   * as `cost_unknown: true` — the whole point of this hook is resolving an
+   * ambiguity that otherwise can't be told apart at all.
+   */
+  readonly hasCostForRun?: (runId: string) => boolean;
 }
 
 interface CacheEntry {
@@ -116,12 +143,14 @@ export class WorkflowStore {
   private readonly projectsDir: string;
   private readonly windowHours: number;
   private readonly getCostForRun: WorkflowStoreOptions['getCostForRun'];
+  private readonly hasCostForRun: WorkflowStoreOptions['hasCostForRun'];
   private readonly cache = new Map<string, CacheEntry>();
 
   constructor(options: WorkflowStoreOptions = {}) {
     this.projectsDir = options.projectsDir ?? join(homedir(), PROJECTS_DIR_NAME);
     this.windowHours = options.windowHours ?? 24 * 30; // 30 days for dashboard listing
     this.getCostForRun = options.getCostForRun;
+    this.hasCostForRun = options.hasCostForRun;
   }
 
   /**
@@ -259,7 +288,9 @@ export class WorkflowStore {
     const runId = typeof parsed.runId === 'string' ? parsed.runId : '';
     if (!runId) return null;
     const startTime = typeof parsed.startTime === 'number' ? parsed.startTime : 0;
-    const durationMs = typeof parsed.durationMs === 'number' ? parsed.durationMs : 0;
+    // null (not 0) when absent — an unfinished/killed run's duration is
+    // unknown, not a confirmed instant completion. See WorkflowRunRow's docstring.
+    const durationMs = typeof parsed.durationMs === 'number' ? parsed.durationMs : null;
     const status = typeof parsed.status === 'string' ? parsed.status : 'unknown';
     const wfName = typeof parsed.workflowName === 'string' ? parsed.workflowName : 'unknown';
     const defaultModel = typeof parsed.defaultModel === 'string' ? parsed.defaultModel : 'unknown';
@@ -353,6 +384,11 @@ export class WorkflowStore {
 
     const usd = this.getCostForRun?.(runId) ?? 0;
     const totalUsd = usd > 0 ? usd : null;
+    // usd resolving to 0 is ambiguous: it means either "confirmed $0" or
+    // "this process never observed the cost at all". hasCostForRun
+    // distinguishes them (a partial mitigation); costUnknown is only ever
+    // true when total_usd is null AND the run's cost was never observed.
+    const costUnknown = totalUsd === null && this.hasCostForRun?.(runId) !== true;
 
     const row: WorkflowRunRow = {
       workflow_run_id: runId,
@@ -368,6 +404,7 @@ export class WorkflowStore {
       agent_count: agentCount,
       total_tokens: totalTokens,
       total_usd: totalUsd,
+      cost_unknown: costUnknown,
       declared_phases: topology?.declaredPhases ?? null,
       observed_phases: observedPhases,
       declared_parallel_widths: topology?.declaredParallelWidths

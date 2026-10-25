@@ -1,5 +1,8 @@
 export { Card } from './Card';
-export type { CardProps, CardPadding, CardTone, CardGlow } from './Card';
+export type { CardProps, CardPadding, CardTone } from './Card';
+
+export { Panel } from './Panel';
+export type { PanelProps } from './Panel';
 
 export { Button } from './Button';
 export type { ButtonProps, ButtonVariant, ButtonSize } from './Button';
@@ -18,3 +21,6 @@ export type { EyebrowProps, EyebrowAs } from './Eyebrow';
 
 export { SectionHeader } from './SectionHeader';
 export type { SectionHeaderProps } from './SectionHeader';
+
+export { InfoTooltip } from './InfoTooltip';
+export type { InfoTooltipProps } from './InfoTooltip';

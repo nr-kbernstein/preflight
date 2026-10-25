@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Hook collector script for Claude Code PreToolUse / PostToolUse / PostToolUseFailure hooks.
+ * Hook collector script for Claude Code PreToolUse / PostToolUse /
+ * PostToolUseFailure / PermissionRequest / PermissionDenied hooks.
  *
  * Called by Claude Code on every tool invocation. Reads the hook JSON from stdin,
  * extracts key fields, and appends a single JSONL line to the buffer file.
@@ -14,22 +15,21 @@
 
 import {
   readFileSync,
-  readSync,
   writeFileSync,
   openSync,
   closeSync,
   mkdirSync,
   existsSync,
+  utimesSync,
   constants as fsConstants,
-  statSync,
 } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { REDACTION_PATTERNS } from '../redaction-patterns.js';
 import { resolveRecordContent } from '../record-content-gate.js';
-
-import type { RawTranscriptEntry, RawAssistantMessage } from './transcript-types.js';
+import { CLAUDE_CODE_ENV_SIGNALS } from '../platforms/claude-code-adapter.js';
+import { hookEventFromArg } from '../hook-subcommands.js';
 
 // ---------------------------------------------------------------------------
 // Lightweight config (env vars only — no file reads)
@@ -97,6 +97,19 @@ function getMaxContentLength(): number {
   return Number.isNaN(parsed) ? 10_240 : parsed;
 }
 
+/**
+ * Ambient stamping is deliberately limited to Claude Code, the only platform
+ * whose hook-process env signal is verified; other platforms stamp via
+ * explicit MCP_CLIENT in their generated hook commands.
+ */
+function detectStampPlatform(): string | undefined {
+  const explicit = process.env.MCP_CLIENT ?? process.env.NEW_RELIC_AI_PLATFORM;
+  if (explicit) return explicit;
+  return CLAUDE_CODE_ENV_SIGNALS.some((key) => process.env[key] !== undefined)
+    ? 'claude-code'
+    : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Inline redaction (patterns shared with config.ts via ../redaction-patterns.js)
 // ---------------------------------------------------------------------------
@@ -147,21 +160,6 @@ function countLines(text: string): number {
   return (text.match(/\n/g) || []).length + 1;
 }
 
-// ---------------------------------------------------------------------------
-// Transcript token collection
-// ---------------------------------------------------------------------------
-
-const TRANSCRIPT_TAIL_BYTES = 16_384;
-const DEFAULT_MODEL = 'claude-opus-4-6';
-
-interface TranscriptUsage {
-  input_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-  output_tokens?: number;
-  model?: string;
-}
-
 /** A content block carrying a `text` field — narrows before reading `.text`. */
 function hasStringText(block: unknown): block is { text: string } {
   return (
@@ -172,193 +170,23 @@ function hasStringText(block: unknown): block is { text: string } {
   );
 }
 
-function getClaudeHome(): string {
-  return process.env.NR_AI_OBSERVE_CLAUDE_HOME ?? resolve(homedir(), '.claude');
-}
-
-function getTranscriptPath(cwd: string | undefined, sessionId: string | undefined): string | null {
-  if (!sessionId) return null;
-  const projectDir = cwd ? cwd.replace(/[\\/]/g, '-') : process.env.PWD?.replace(/[\\/]/g, '-');
-  if (!projectDir) return null;
-  return resolve(getClaudeHome(), 'projects', projectDir, `${sessionId}.jsonl`);
-}
-
-const WINDOWS_DRIVE_PATH_RE = /^([A-Za-z]):[\\/](.*)$/;
-
-// Windows Claude Code sends Windows-style paths (C:\Users\...) even when this
-// collector runs inside WSL; translate to the WSL mount so statSync can read it.
-function translateWslPath(path: string): string {
-  if (process.platform !== 'linux') return path;
-  const match = WINDOWS_DRIVE_PATH_RE.exec(path);
-  if (!match) return path;
-  const [, drive, rest] = match;
-  return `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, '/')}`;
-}
-
-function readLastAssistantUsage(transcriptPath: string): TranscriptUsage | null {
-  try {
-    const stat = statSync(transcriptPath);
-    if (stat.size === 0) return null;
-
-    const fd = openSync(transcriptPath, fsConstants.O_RDONLY);
-    try {
-      const readSize = Math.min(stat.size, TRANSCRIPT_TAIL_BYTES);
-      const buffer = Buffer.alloc(readSize);
-      const bytesRead = readSync(fd, buffer, 0, readSize, stat.size - readSize);
-      const tail = buffer.toString('utf-8', 0, bytesRead);
-
-      const lines = tail.split('\n').filter(Boolean);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const entry = JSON.parse(lines[i]) as RawTranscriptEntry;
-          if (entry.type === 'assistant' && entry.message && typeof entry.message === 'object') {
-            const msg = entry.message as RawAssistantMessage;
-            // Skip synthetic entries (Claude Code's internal injections —
-            // compaction summaries, system messages). They carry model:
-            // '<synthetic>' which doesn't match any pricing table entry.
-            if (msg.model === '<synthetic>') continue;
-            if (msg.usage && typeof msg.usage === 'object') {
-              const usage = { ...(msg.usage as TranscriptUsage) };
-              if (typeof msg.model === 'string' && msg.model.length > 0) {
-                usage.model = msg.model;
-              }
-              return usage;
-            }
-          }
-        } catch {
-          continue;
-        }
-      }
-    } finally {
-      closeSync(fd);
-    }
-  } catch {
-    // Silently ignore — transcript may not exist yet
-  }
-  return null;
-}
-
-function getLastTranscriptSize(sessionId: string): number {
-  if (!SESSION_ID_RE.test(sessionId)) return 0;
-  try {
-    const bufferDir = dirname(getBufferPath(sessionId));
-    const statePath = resolve(bufferDir, `.transcript-pos-${sessionId}`);
-    if (existsSync(statePath)) {
-      return parseInt(readFileSync(statePath, 'utf-8').trim(), 10) || 0;
-    }
-  } catch {
-    // Ignore
-  }
-  return 0;
-}
-
-let _transcriptSizeWriteFailed = false;
-
-function setLastTranscriptSize(sessionId: string, size: number): void {
-  if (!SESSION_ID_RE.test(sessionId)) return;
-  try {
-    const bufferDir = dirname(getBufferPath(sessionId));
-    if (!existsSync(bufferDir)) {
-      mkdirSync(bufferDir, { recursive: true, mode: 0o700 });
-    }
-    const statePath = resolve(bufferDir, `.transcript-pos-${sessionId}`);
-    writeFileSync(statePath, String(size), { mode: 0o600 });
-    _transcriptSizeWriteFailed = false;
-  } catch (err) {
-    if (!_transcriptSizeWriteFailed) {
-      process.stderr.write(
-        `[preflight-collector] Warning: cannot persist transcript size: ${String(err)}\n`,
-      );
-      _transcriptSizeWriteFailed = true;
-    }
-  }
-}
-
-function collectTranscriptTokens(data: {
-  cwd?: string;
-  session_id?: string;
-  transcript_path?: string;
-}): void {
-  const sessionId = data.session_id;
-  // Prefer Claude Code's own transcript_path field — it's authoritative and
-  // works under git worktrees, where deriving the path from cwd produces a
-  // dashed directory that doesn't match the parent project's transcript dir.
-  const rawTranscriptPath =
-    typeof data.transcript_path === 'string' && data.transcript_path.length > 0
-      ? data.transcript_path
-      : getTranscriptPath(data.cwd, sessionId);
-  const transcriptPath = rawTranscriptPath ? translateWslPath(rawTranscriptPath) : null;
-  if (!transcriptPath || !sessionId) return;
-
-  let currentSize: number;
-  try {
-    currentSize = statSync(transcriptPath).size;
-  } catch {
-    return;
-  }
-
-  let lastSize = getLastTranscriptSize(sessionId);
-  if (currentSize < lastSize) {
-    // Transcript file was rotated — reset tracking so we read from offset 0
-    setLastTranscriptSize(sessionId, 0);
-    lastSize = 0;
-  }
-  if (currentSize <= lastSize) return;
-
-  const usage = readLastAssistantUsage(transcriptPath);
-  if (!usage) return;
-
-  const inputTokens = usage.input_tokens ?? 0;
-  const outputTokens = usage.output_tokens ?? 0;
-  if (inputTokens === 0 && outputTokens === 0) return;
-
-  const tokenEvent: Record<string, unknown> = {
-    mode: 'token',
-    timestamp: Date.now(),
-    inputTokens,
-    outputTokens,
-    cacheReadTokens: usage.cache_read_input_tokens ?? 0,
-    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
-    model: usage.model ?? DEFAULT_MODEL,
-  };
-  tokenEvent.sessionId = sessionId;
-
-  try {
-    const bufferPath = getBufferPath(sessionId);
-    const bufferDir = dirname(bufferPath);
-    if (!existsSync(bufferDir)) {
-      mkdirSync(bufferDir, { recursive: true, mode: 0o700 });
-    }
-
-    const line = JSON.stringify(tokenEvent) + '\n';
-    const fd = openSync(
-      bufferPath,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND,
-      0o600,
-    );
-    try {
-      writeFileSync(fd, line);
-    } finally {
-      closeSync(fd);
-    }
-    // Persist the new size only after a successful buffer write so that a
-    // write failure doesn't silently drop the token event on the next invocation.
-    setLastTranscriptSize(sessionId, currentSize);
-  } catch {
-    // Silent failure — never block Claude Code
-  }
-}
-
 // ---------------------------------------------------------------------------
-// PPID breadcrumb — lets the MCP server learn the Claude Code session_id
+// PPID + cwd breadcrumbs — let the MCP server learn the Claude Code session_id
 //
 // Claude Code spawns its MCP server and hook collector scripts as children of
 // the same process; they share a PPID. The MCP can read its own process.ppid
 // (= Claude Code's PID) and look up the matching session_id here.
 //
+// Some platforms interpose a shell between Claude Code and the hook collector
+// that the ancestor-PID walk below doesn't reach (native Windows via Git
+// Bash, for one) — there, the collector's ppid never matches the MCP's own
+// process.ppid. writeCwdBreadcrumb() writes a second breadcrumb keyed by the
+// sanitized project cwd instead, which the MCP server falls back to (via
+// resolveFromCwd() in session-resolver.ts) only when the PPID lookup misses.
+//
 // Hot-path: every PreToolUse / PostToolUse hook runs this. The
 // existsSync + content-equality short-circuit makes the steady state a single
-// stat() and one read — well under the <5ms budget.
+// stat() and one read per breadcrumb — well under the <5ms budget.
 // ---------------------------------------------------------------------------
 
 /**
@@ -431,10 +259,25 @@ function writePpidBreadcrumb(sessionId: string): void {
     let wroteAny = false;
     for (const pid of pids) {
       const breadcrumbPath = resolve(breadcrumbDir, `${pid}.txt`);
-      // Short-circuit: no write needed if content already matches.
+      // Short-circuit: no content rewrite needed if it already matches, but
+      // still touch mtime — resolveFromBreadcrumb() (session-resolver.ts)
+      // rejects a breadcrumb older than the reading process's own start
+      // time, so an actively-hooked session's breadcrumb must keep looking
+      // fresh across an MCP server restart (same ppid, same session_id,
+      // content genuinely unchanged) or that restart would permanently lose
+      // ppid-based resolution for the rest of the session. A breadcrumb from
+      // a session that's actually over stops getting touched here (nothing
+      // calls this with its old ppid+session_id again), so it still goes
+      // stale and gets rejected exactly as intended.
       if (existsSync(breadcrumbPath)) {
         try {
           if (readFileSync(breadcrumbPath, 'utf-8').trim() === sessionId) {
+            const now = new Date();
+            try {
+              utimesSync(breadcrumbPath, now, now);
+            } catch {
+              // Best-effort — an unwritable mtime doesn't block the session.
+            }
             wroteAny = true;
             continue;
           }
@@ -457,6 +300,49 @@ function writePpidBreadcrumb(sessionId: string): void {
   }
 }
 
+let _cwdBreadcrumbWriteFailed = false;
+
+function writeCwdBreadcrumb(sessionId: string, cwd: string | undefined): void {
+  if (!SESSION_ID_RE.test(sessionId)) return;
+  if (typeof cwd !== 'string' || cwd.length === 0) return;
+
+  try {
+    const storageDir = process.env.NEW_RELIC_AI_MCP_STORAGE_PATH ?? DEFAULT_STORAGE_DIR;
+    const breadcrumbDir = resolve(storageDir, 'session-by-cwd');
+    mkdirSync(breadcrumbDir, { recursive: true, mode: 0o700 });
+
+    // Same sanitization scheme as getTranscriptPath() above, so the MCP
+    // server's resolveFromCwd() can derive an identical filename from its
+    // own process.cwd() without any shared state beyond this convention.
+    // Colons are also stripped (unlike getTranscriptPath) — a Windows drive
+    // letter like "C:" left in the filename gets misinterpreted by
+    // path.resolve() on win32 as a drive-relative path component rather than
+    // a literal character, which can write/read outside this storage dir.
+    const sanitizedCwd = cwd.replace(/[\\/:]/g, '-');
+    const breadcrumbPath = resolve(breadcrumbDir, `${sanitizedCwd}.txt`);
+
+    if (existsSync(breadcrumbPath)) {
+      try {
+        if (readFileSync(breadcrumbPath, 'utf-8').trim() === sessionId) {
+          _cwdBreadcrumbWriteFailed = false;
+          return;
+        }
+      } catch {
+        // Fall through to rewrite if the read failed.
+      }
+    }
+    writeFileSync(breadcrumbPath, sessionId, { mode: 0o600 });
+    _cwdBreadcrumbWriteFailed = false;
+  } catch (err) {
+    if (!_cwdBreadcrumbWriteFailed) {
+      process.stderr.write(
+        `[preflight-collector] Warning: cannot write cwd breadcrumb: ${String(err)}\n`,
+      );
+      _cwdBreadcrumbWriteFailed = true;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -466,12 +352,83 @@ interface HookInput {
   tool_name?: string;
   tool_input?: unknown;
   tool_response?: unknown;
+  tool_result?: unknown;
   tool_use_id?: string;
   session_id?: string;
   cwd?: string;
   transcript_path?: string;
   error?: string;
   is_interrupt?: boolean;
+  // Claude Code's docs (code.claude.com/docs/en/hooks.md) document agent_id
+  // as present on every hook event fired inside a subagent call, and
+  // agent_type there too plus on parent calls when the session runs with
+  // --agent. A live dogfooding check on Claude Code v2.1.236 with a real
+  // subagent spawn found neither; later installs do send agent_type.
+  // Whichever is absent is backfilled downstream (backfillAgentId /
+  // backfillAgentType in agent-partition.ts), which never overwrites a value
+  // parsed here.
+  agent_id?: string;
+  agent_type?: string;
+  // PostToolUse/PostToolUseFailure (code.claude.com/docs/en/hooks.md): tool
+  // execution time in milliseconds, excluding permission-prompt wait time and
+  // PreToolUse hook execution — the number this collector's own pre/post
+  // wall-clock delta (event-processor.ts's durationMs computation) can't
+  // separate out on its own. Read below and preferred over that delta when
+  // present and valid.
+  //
+  // The posttooluse/posttoolusefailure branches below are shared by every
+  // platform using this uniform hook envelope (Kiro, Amazon Q, Droid, Codex,
+  // VS Code Copilot — see ADAPTERS.md), so this field is read the same way
+  // regardless of sender. Confirmed against Factory Droid's own hooks
+  // reference that its PostToolUse payload carries no duration_ms at all, so
+  // the wall-clock fallback applies cleanly there; not independently
+  // confirmed for the others. If a platform other than Claude Code is later
+  // found to send duration_ms with different semantics (e.g. including
+  // permission-prompt wait), this generic read would need to become
+  // platform-aware.
+  duration_ms?: number;
+  // StopFailure (code.claude.com/docs/en/hooks.md) reuses `error` above for its
+  // closed error-type enum and adds these two free-text fields: error_details
+  // ("when available", no strict type — string or an object to JSON.stringify)
+  // and last_assistant_message (the raw API error text shown to the user, NOT
+  // Claude's conversational output as it is for Stop/SubagentStop).
+  error_details?: unknown;
+  last_assistant_message?: string;
+  denied_reason?: string;
+  // InstructionsLoaded (code.claude.com/docs/en/hooks.md): fires each time a
+  // CLAUDE.md or .claude/rules/*.md file is loaded into context, including
+  // at session start (load_reason: 'session_start') — a moment no tool-call
+  // heuristic can see, since eager loads happen with no visible Read call.
+  // Reuses file_path (declared below for Cursor) for the loaded file's
+  // absolute path.
+  memory_type?: string;
+  load_reason?: string;
+  // PostModelSwitch (code.claude.com/docs/en/hooks.md): fires after the
+  // session's model changes. requested_model is null for an automatic
+  // change (source: 'auto') or absent entirely on older payload shapes.
+  // Deliberately not capturing the cost-estimate fields (context_tokens,
+  // prompt_cache_warm, cache_ttl, estimated_cache_write_usd, pricing) —
+  // that's a richer cache-cost-forecast feature, out of scope here.
+  from_model?: string;
+  to_model?: string;
+  requested_model?: string | null;
+  // SessionStart (code.claude.com/docs/en/hooks.md): fires on every session.
+  // `source` is always present (shared with PostModelSwitch's own `source`
+  // above — same field name, same string type, distinguished by which hook
+  // sent the payload); the four resume-cost fields only appear when source
+  // is 'resume'/'fork' and the transcript already has a response (Claude
+  // Code v2.1.251+). Not gated behind recordContent — source is a closed
+  // enum and the rest are numbers/booleans, none of it free text.
+  source?: string;
+  seconds_since_last_response?: number;
+  context_tokens?: number;
+  prompt_cache_likely_expired?: boolean;
+  estimated_cache_write_usd?: number;
+  // UserPromptSubmit (code.claude.com/docs/en/hooks.md): the prompt text
+  // submitted by the user. Only the leading slash token is captured as a
+  // skill identifier (the same class as tool_input.skill on Skill calls);
+  // no other prompt content is read.
+  prompt?: string;
   // Cursor (https://cursor.com/docs/agent/hooks) sends a different field
   // vocabulary per hook type instead of the uniform tool_name/tool_input
   // Claude Code and Kiro use. conversation_id is Cursor's closest analog to
@@ -494,6 +451,16 @@ interface HookInput {
   agent_action_name?: string;
   trajectory_id?: string;
   tool_info?: Record<string, unknown>;
+  // Antigravity (https://antigravity.google/docs/hooks, identical on
+  // /docs/ide/hooks) sends no field naming which event fired at all — per
+  // its Input/Output Contract both PreToolUse and PostToolUse payloads carry
+  // `toolCall`/`stepIdx`; PostToolUse adds only an optional `error`
+  // ("Empty if successful"). `conversationId` is Antigravity's closest
+  // analog to session_id (never sends session_id, same situation as
+  // Cursor's conversation_id and Windsurf's trajectory_id).
+  toolCall?: { name?: string; args?: Record<string, unknown> };
+  stepIdx?: number;
+  conversationId?: string;
   [key: string]: unknown;
 }
 
@@ -507,8 +474,11 @@ function extractInputMeta(toolName: string, input: unknown): Record<string, unkn
   const obj = input as Record<string, unknown>;
   const meta: Record<string, unknown> = {};
 
-  // Common field: file_path (Read, Write, Edit)
+  // Common field: file_path (Read, Write, Edit). VS Code Copilot hooks send
+  // camelCase tool_input keys (filePath) per the hooks FAQ
+  // (https://code.visualstudio.com/docs/copilot/customization/hooks).
   if (typeof obj.file_path === 'string') meta.file_path = obj.file_path;
+  else if (typeof obj.filePath === 'string') meta.file_path = obj.filePath;
 
   switch (toolName) {
     case 'Read':
@@ -516,10 +486,36 @@ function extractInputMeta(toolName: string, input: unknown): Record<string, unkn
       if (typeof obj.limit === 'number') meta.limit = obj.limit;
       break;
     case 'Write':
+    case 'create_file': // VS Code Copilot — same `content` field shape
       if (typeof obj.content === 'string') {
         meta.contentLength = obj.content.length;
         meta.lineCount = obj.content.length > 0 ? countLines(obj.content) : 0;
       }
+      break;
+    // VS Code Copilot's find-and-replace edit tools. Field names are camelCase
+    // (oldString/newString) per the hooks FAQ; tool names from toolNames.ts in
+    // microsoft/vscode (extensions/copilot/src/extension/tools/common/).
+    case 'replace_string_in_file': {
+      const oldStr = obj.oldString;
+      const newStr = obj.newString;
+      if (typeof oldStr === 'string') {
+        meta.oldStringLength = oldStr.length;
+        meta.oldLineCount = oldStr.length > 0 ? countLines(oldStr) : 0;
+      }
+      if (typeof newStr === 'string') {
+        meta.newStringLength = newStr.length;
+        meta.newLineCount = newStr.length > 0 ? countLines(newStr) : 0;
+        meta.isDelete = newStr.length === 0;
+      }
+      break;
+    }
+    case 'multi_replace_string_in_file':
+      if (Array.isArray(obj.replacements)) meta.replacementsCount = obj.replacements.length;
+      break;
+    case 'run_in_terminal':
+      if (typeof obj.command === 'string') meta.command = redact(obj.command);
+      if (typeof obj.explanation === 'string') meta.description = redact(obj.explanation);
+      if (typeof obj.isBackground === 'boolean') meta.run_in_background = obj.isBackground;
       break;
     case 'Edit':
       if (typeof obj.old_string === 'string') {
@@ -533,7 +529,47 @@ function extractInputMeta(toolName: string, input: unknown): Record<string, unkn
       }
       if (typeof obj.replace_all === 'boolean') meta.replace_all = obj.replace_all;
       break;
+    // Amazon Kiro. Tool names and tool_input field names captured from a live
+    // Kiro install (42.08, macOS) — `read_file` sends {path, offset, limit} and
+    // `str_replace` sends {path, oldStr, newStr, replace_all}. Two deltas from
+    // Claude Code worth noting: the file key is `path`, not `file_path`, and the
+    // edit strings are `oldStr`/`newStr`, not `old_string`/`new_string`.
+    //
+    // These are explicit cases rather than hoisting `path` into the
+    // name-independent file_path block above, because Grep/Glob also send `path`
+    // — there it means a search root, not a file, and promoting it to file_path
+    // would misreport searches as file access for every platform.
+    //
+    // The path Kiro sends is workspace-relative ("cloudformation/export-env.sh"),
+    // unlike Claude Code's absolute paths. That's fine for the unique-file
+    // counting these fields feed, but don't assume absolute downstream.
+    case 'read_file':
+      if (typeof obj.path === 'string') meta.file_path = obj.path;
+      if (typeof obj.offset === 'number') meta.offset = obj.offset;
+      if (typeof obj.limit === 'number') meta.limit = obj.limit;
+      break;
+    case 'str_replace': {
+      if (typeof obj.path === 'string') meta.file_path = obj.path;
+      const kiroOld = obj.oldStr;
+      const kiroNew = obj.newStr;
+      if (typeof kiroOld === 'string') {
+        meta.oldStringLength = kiroOld.length;
+        meta.oldLineCount = kiroOld.length > 0 ? countLines(kiroOld) : 0;
+      }
+      if (typeof kiroNew === 'string') {
+        meta.newStringLength = kiroNew.length;
+        meta.newLineCount = kiroNew.length > 0 ? countLines(kiroNew) : 0;
+        meta.isDelete = kiroNew.length === 0;
+      }
+      if (typeof obj.replace_all === 'boolean') meta.replace_all = obj.replace_all;
+      break;
+    }
+    // PowerShell is a real, first-party Claude Code tool on native Windows,
+    // auto-enabled without Git Bash (code.claude.com/docs/en/tools-reference,
+    // /setup, /env-vars) — same command/description/timeout/run_in_background
+    // input shape as Bash.
     case 'Bash':
+    case 'PowerShell':
       if (typeof obj.command === 'string') meta.command = redact(obj.command);
       if (typeof obj.description === 'string') meta.description = redact(obj.description);
       if (typeof obj.timeout === 'number') meta.timeout = obj.timeout;
@@ -571,27 +607,73 @@ function extractInputMeta(toolName: string, input: unknown): Record<string, unkn
       if (typeof obj.status === 'string') meta.status = obj.status;
       if (typeof obj.subject === 'string') meta.subject = obj.subject;
       break;
+    case 'Skill':
+      // Capped because it becomes a per-skill map key and an NR facet downstream.
+      if (typeof obj.skill === 'string') meta.skill = obj.skill.slice(0, 128);
+      if (typeof obj.args === 'string') meta.argsLength = obj.args.length;
+      break;
   }
 
   return Object.keys(meta).length > 0 ? meta : undefined;
+}
+
+// `https://<host>/<owner>/<repo>/pull/<N>`: what `gh pr create` prints on
+// success and what an MCP create_pull_request result carries as html_url.
+const PR_URL_RE = /https?:\/\/[^\s"'/]+\/[^\s"'/]+\/[^\s"'/]+\/pull\/(\d{1,9})\b/g;
+const GH_PR_CREATE_RE = /(?:^|[\s;&|(])gh\s+pr\s+create\b/;
+
+/** The PR number named by the PR URLs in a tool's output text, or undefined
+ *  when they name none or several, since then the created one is unknown (a
+ *  second create, or a `gh pr comment` URL on another PR). Only the digits
+ *  leave this function; the output itself is never kept. */
+function findCreatedPrNumber(output: Record<string, unknown> | unknown[]): string | undefined {
+  const texts: string[] = [];
+  const blocks = Array.isArray(output) ? output : output.content;
+  if (!Array.isArray(output) && typeof output.stdout === 'string') texts.push(output.stdout);
+  if (Array.isArray(blocks)) {
+    for (const block of blocks) if (hasStringText(block)) texts.push(block.text);
+  }
+  const prNumbers = new Set<string>();
+  for (const text of texts) {
+    for (const match of text.matchAll(PR_URL_RE)) prNumbers.add(match[1]);
+  }
+  return prNumbers.size === 1 ? [...prNumbers][0] : undefined;
 }
 
 /**
  * Extract only the metadata fields from tool_response that the tool-specific
  * parsers need.
  */
-function extractOutputMeta(toolName: string, output: unknown): Record<string, unknown> | undefined {
+function extractOutputMeta(
+  toolName: string,
+  output: unknown,
+  input?: unknown,
+): Record<string, unknown> | undefined {
   if (output === null || output === undefined || typeof output !== 'object') return undefined;
   const obj = output as Record<string, unknown>;
 
+  if (toolName.endsWith('create_pull_request')) {
+    const createdPrNumber = findCreatedPrNumber(output as Record<string, unknown> | unknown[]);
+    return createdPrNumber === undefined ? undefined : { createdPrNumber };
+  }
+
   if (toolName === 'Bash') {
+    const meta: Record<string, unknown> = {};
     if (typeof obj.exitCode === 'number') {
-      return { exitCode: obj.exitCode };
-    }
-    if (typeof obj.exitCode === 'string') {
+      meta.exitCode = obj.exitCode;
+    } else if (typeof obj.exitCode === 'string') {
       const parsed = Number(obj.exitCode);
-      if (!Number.isNaN(parsed)) return { exitCode: parsed };
+      if (!Number.isNaN(parsed)) meta.exitCode = parsed;
     }
+    const command =
+      input !== null && typeof input === 'object'
+        ? (input as Record<string, unknown>).command
+        : undefined;
+    if (typeof command === 'string' && GH_PR_CREATE_RE.test(command)) {
+      const createdPrNumber = findCreatedPrNumber(obj);
+      if (createdPrNumber !== undefined) meta.createdPrNumber = createdPrNumber;
+    }
+    if (Object.keys(meta).length > 0) return meta;
   }
 
   if (toolName === 'Edit') {
@@ -634,6 +716,7 @@ function extractOutputMeta(toolName: string, output: unknown): Record<string, un
       }
       if (totalLen > 0) meta.agentResultLength = totalLen;
     }
+    if (typeof obj.agentId === 'string') meta.spawnedAgentId = obj.agentId;
     return Object.keys(meta).length > 0 ? meta : undefined;
   }
 
@@ -650,7 +733,13 @@ function getWindsurfToolInfo(data: HookInput): Record<string, unknown> {
   return data.tool_info !== null && typeof data.tool_info === 'object' ? data.tool_info : {};
 }
 
-function processHook(raw: string): void {
+/**
+ * @param cliEvent The hook command's first argument (`process.argv[2]`), if
+ *   any. Only consulted for Antigravity, whose payloads never name their own
+ *   event — see isAntigravityPre below. Every other platform's payload names
+ *   its event, and this argument is ignored for them.
+ */
+function processHook(raw: string, cliEvent?: string): void {
   let data: HookInput;
   try {
     data = JSON.parse(raw) as HookInput;
@@ -665,7 +754,11 @@ function processHook(raw: string): void {
   // Windsurf (https://docs.windsurf.com/windsurf/cascade/hooks) never sends
   // session_id either — trajectory_id is its closest analog, the same role
   // conversation_id plays for Cursor.
-  const sessionId = data.session_id ?? data.conversation_id ?? data.trajectory_id;
+  // Antigravity (https://antigravity.google/docs/hooks) never sends
+  // session_id either — conversationId (camelCase, Antigravity's own field
+  // name) is its closest analog, same role trajectory_id plays for Windsurf.
+  const sessionId =
+    data.session_id ?? data.conversation_id ?? data.trajectory_id ?? data.conversationId;
 
   // Drop a PPID breadcrumb at the very top so the MCP server can resolve its
   // Claude Code session_id without an env-var or initialize-payload extension.
@@ -677,6 +770,7 @@ function processHook(raw: string): void {
   // conversation_id would be a guess, not a fix.
   if (typeof data.session_id === 'string' && data.session_id.length > 0) {
     writePpidBreadcrumb(data.session_id);
+    writeCwdBreadcrumb(data.session_id, data.cwd);
   }
 
   // Claude Code sends PascalCase hook names ('PreToolUse'); Kiro sends
@@ -702,6 +796,34 @@ function processHook(raw: string): void {
   // stdout, so this check is scoped to Gemini CLI only.
   const isGeminiCli =
     process.env.MCP_CLIENT === 'gemini-cli' || process.env.NEW_RELIC_AI_PLATFORM === 'gemini-cli';
+
+  // Antigravity (https://antigravity.google/docs/hooks#inputoutput-contract)
+  // sends no field naming which event fired, and both PreToolUse and
+  // PostToolUse carry `toolCall` and `stepIdx`, so payload shape cannot tell
+  // them apart (#793). hooks.json registers a separate `command` per event,
+  // so the documented setup (docs/ADAPTERS.md) passes the event name as the
+  // command's argument: `preflight-collector PreToolUse` / `PostToolUse`.
+  // Without that argument (a hooks.json written before #793), the only
+  // PostToolUse-specific key is the optional `error`, so its presence is the
+  // fallback. A successful PostToolUse that omits `error` is then misread as
+  // PreToolUse — the reason the argument is required in the setup docs.
+  // Hoisted once so the dispatch branch below and the required-stdout-reply
+  // block further down can never diverge on which event they think this is,
+  // same precedent as isGeminiCli above.
+  const isAntigravityShape =
+    data.hook_event_name === undefined &&
+    data.agent_action_name === undefined &&
+    (data.toolCall !== undefined || typeof data.stepIdx === 'number');
+  const agyCliEvent = hookEventFromArg(cliEvent);
+  const isAntigravityPost =
+    isAntigravityShape &&
+    (agyCliEvent === 'PostToolUse' ||
+      (agyCliEvent !== 'PreToolUse' && (data.error !== undefined || data.toolCall === undefined)));
+  const isAntigravityPre = isAntigravityShape && !isAntigravityPost;
+  // Both Antigravity branches spread this, so a pre and its post agree on
+  // whether they carry a toolUseId: HookEventProcessor pairs a post by its
+  // toolUseId whenever it has one, and a pre without one is keyed by a UUID.
+  const agyToolUseId = typeof data.stepIdx === 'number' ? { toolUseId: String(data.stepIdx) } : {};
 
   let event: Record<string, unknown>;
 
@@ -741,32 +863,53 @@ function processHook(raw: string): void {
     // — a no-match edit is a genuine failure worth surfacing to
     // anti-pattern/task-completion metrics, not a behavior to special-case
     // away.
-    const toolResponse = data.tool_response;
-    const responseSuccess =
+    // GitHub Copilot CLI sends the tool's result under `tool_result`, not
+    // `tool_response`, and signals outcome with `result_type: 'success' |
+    // 'failure'` rather than a `success` boolean (confirmed against the CLI's
+    // own runtime, which serializes `toolResult`/`resultType`/
+    // `text_result_for_llm` and fires a matching `postToolUseFailure` event).
+    // Without this alias every Copilot CLI tool call recorded outputSize 0,
+    // no output metadata, and success: true unconditionally.
+    const toolResponse = data.tool_response ?? data.tool_result;
+    const responseObj =
       toolResponse !== null && typeof toolResponse === 'object' && !Array.isArray(toolResponse)
-        ? (toolResponse as Record<string, unknown>).success
+        ? (toolResponse as Record<string, unknown>)
         : undefined;
+    const responseSuccess =
+      responseObj === undefined
+        ? undefined
+        : responseObj.success !== undefined
+          ? responseObj.success
+          : responseObj.result_type !== undefined
+            ? responseObj.result_type !== 'failure'
+            : undefined;
     event = {
       mode: 'post' as const,
       tool: toolName,
       timestamp,
-      outputSize: sizeOf(data.tool_response),
+      outputSize: sizeOf(toolResponse),
       success: typeof responseSuccess === 'boolean' ? responseSuccess : true,
     };
+
+    if (
+      typeof data.duration_ms === 'number' &&
+      Number.isFinite(data.duration_ms) &&
+      data.duration_ms >= 0
+    ) {
+      event.nativeDurationMs = data.duration_ms;
+    }
 
     // Store input metadata as fallback for orphaned-post pairing (pre-event may be missing)
     const postInputMeta = extractInputMeta(toolName, data.tool_input);
     if (postInputMeta !== undefined) event.toolInput = postInputMeta;
 
     // Store only the metadata fields needed for tool-specific parsing
-    const outputMeta = extractOutputMeta(toolName, data.tool_response);
+    const outputMeta = extractOutputMeta(toolName, toolResponse, data.tool_input);
     if (outputMeta !== undefined) event.toolOutput = outputMeta;
 
-    if (recordContent && data.tool_response !== undefined) {
+    if (recordContent && toolResponse !== undefined) {
       const content =
-        typeof data.tool_response === 'string'
-          ? data.tool_response
-          : JSON.stringify(data.tool_response);
+        typeof toolResponse === 'string' ? toolResponse : JSON.stringify(toolResponse);
       event.outputContent = redact(truncate(content, maxContentLen));
     }
   } else if (eventName === 'posttoolusefailure') {
@@ -778,6 +921,32 @@ function processHook(raw: string): void {
       error: redact(data.error ?? 'unknown error'),
       isInterrupt: data.is_interrupt ?? false,
     };
+
+    if (
+      typeof data.duration_ms === 'number' &&
+      Number.isFinite(data.duration_ms) &&
+      data.duration_ms >= 0
+    ) {
+      event.nativeDurationMs = data.duration_ms;
+    }
+  } else if (eventName === 'permissionrequest' || eventName === 'permissiondenied') {
+    // A user rejection produces no hook event of its own — the processor
+    // infers it from a permission-requested pre that never completes, and can
+    // only pair these by tool_use_id. Without one the event is unusable.
+    if (typeof data.tool_use_id !== 'string' || data.tool_use_id === '') {
+      process.stderr.write(`[preflight-collector] Dropping ${eventName} without tool_use_id\n`);
+      return;
+    }
+    event =
+      eventName === 'permissionrequest'
+        ? { mode: 'permission_request' as const, tool: toolName, timestamp }
+        : {
+            mode: 'permission_denied' as const,
+            tool: toolName,
+            timestamp,
+            ...(typeof data.denied_reason === 'string' &&
+              data.denied_reason !== '' && { deniedReason: redact(data.denied_reason) }),
+          };
   } else if (eventName === 'beforetool') {
     // Gemini CLI (https://github.com/google-gemini/gemini-cli/blob/main/docs/hooks/reference.md)
     // sends BeforeTool/AfterTool instead of PreToolUse/PostToolUse, but the
@@ -823,7 +992,7 @@ function processHook(raw: string): void {
     const postInputMeta = extractInputMeta(toolName, data.tool_input);
     if (postInputMeta !== undefined) event.toolInput = postInputMeta;
 
-    const outputMeta = extractOutputMeta(toolName, data.tool_response);
+    const outputMeta = extractOutputMeta(toolName, data.tool_response, data.tool_input);
     if (outputMeta !== undefined) event.toolOutput = outputMeta;
 
     if (recordContent && data.tool_response !== undefined) {
@@ -999,6 +1168,153 @@ function processHook(raw: string): void {
       timestamp,
       success: true,
     };
+  } else if (isAntigravityPre) {
+    // Antigravity PreToolUse — see isAntigravityPre above for how it is told
+    // apart from PostToolUse.
+    const agyToolName = data.toolCall?.name ?? 'unknown';
+    event = {
+      mode: 'pre' as const,
+      tool: agyToolName,
+      timestamp,
+      inputSize: sizeOf(data.toolCall?.args),
+      inputHash: hashInput(data.toolCall?.args),
+      ...agyToolUseId,
+    };
+
+    // Raw Antigravity argument names (CommandLine, TargetFile, etc.) don't
+    // match any canonical-name case in extractInputMeta()'s switch, so this
+    // currently always returns undefined — a known, documented gap (see
+    // docs/ADAPTERS.md's Antigravity section), not a guess at field names.
+    const inputMeta = extractInputMeta(agyToolName, data.toolCall?.args);
+    if (inputMeta !== undefined) event.toolInput = inputMeta;
+
+    if (recordContent && data.toolCall?.args !== undefined) {
+      event.inputContent = redact(truncate(JSON.stringify(data.toolCall.args), maxContentLen));
+    }
+  } else if (isAntigravityPost) {
+    // Antigravity PostToolUse — carries the same `toolCall` as PreToolUse
+    // plus an optional `error`. A paired call takes its toolName from the
+    // pre-event (HookEventProcessor.handlePostEvent()), but this post's own
+    // tool name still matters: it is the FIFO pairing key when there is no
+    // stepIdx, and the record's toolName when the post is orphaned.
+    const hasError = typeof data.error === 'string' && data.error !== '';
+    event = {
+      mode: 'post' as const,
+      tool: data.toolCall?.name ?? 'unknown',
+      timestamp,
+      success: !hasError,
+      ...agyToolUseId,
+      ...(typeof data.error === 'string' && data.error !== '' && { error: redact(data.error) }),
+    };
+  } else if (eventName === 'stopfailure') {
+    // Fires once per turn when a model-API call ultimately fails after
+    // Claude Code's own internal retries are exhausted
+    // (code.claude.com/docs/en/hooks.md). Pure notification — no decision
+    // control. `data.error` here is the 10-value closed error-type enum
+    // (rate_limit | overloaded | authentication_failed | ... | unknown),
+    // mapped downstream to ApiErrorType by
+    // metrics/api-failure-tracker.ts#mapClaudeCodeErrorType — never mapped
+    // here, since storage/types.ts must not depend on that module.
+    event = {
+      mode: 'api_failure' as const,
+      errorType: data.error ?? 'unknown',
+      timestamp,
+    };
+
+    // error_details/last_assistant_message are free-text "content" — same
+    // sensitivity class as tool input/output content — unlike errorType
+    // (a safe closed enum), so both are gated behind recordContent.
+    if (recordContent) {
+      if (data.error_details !== undefined) {
+        const details =
+          typeof data.error_details === 'string'
+            ? data.error_details
+            : JSON.stringify(data.error_details);
+        event.errorDetails = redact(truncate(details, maxContentLen));
+      }
+      if (typeof data.last_assistant_message === 'string') {
+        event.lastAssistantMessage = redact(truncate(data.last_assistant_message, maxContentLen));
+      }
+    }
+  } else if (eventName === 'sessionstart') {
+    // Fires on every session — startup/resume/clear/compact/fork, per
+    // data.source (code.claude.com/docs/en/hooks.md). Pure notification —
+    // no decision control used here. The four resume-cost fields are only
+    // ever present for source 'resume'/'fork'; SessionResumeTracker (the
+    // consumer) treats their absence as "nothing to report", not an error.
+    event = {
+      mode: 'session_start' as const,
+      timestamp,
+      ...(typeof data.source === 'string' && { source: data.source }),
+      ...(typeof data.seconds_since_last_response === 'number' && {
+        secondsSinceLastResponse: data.seconds_since_last_response,
+      }),
+      ...(typeof data.context_tokens === 'number' && { contextTokens: data.context_tokens }),
+      ...(typeof data.prompt_cache_likely_expired === 'boolean' && {
+        promptCacheLikelyExpired: data.prompt_cache_likely_expired,
+      }),
+      ...(typeof data.estimated_cache_write_usd === 'number' && {
+        estimatedCacheWriteUsd: data.estimated_cache_write_usd,
+      }),
+    };
+  } else if (eventName === 'instructionsloaded') {
+    // Fires each time a CLAUDE.md or .claude/rules/*.md file is loaded into
+    // context (code.claude.com/docs/en/hooks.md), including at session start
+    // — a moment no tool-call heuristic can see. Pure notification — no
+    // decision control. file_path is a path, not file content, so it's
+    // unconditional like transcript_path/cwd above, not gated on recordContent.
+    event = {
+      mode: 'instructions_loaded' as const,
+      filePath: data.file_path ?? 'unknown',
+      timestamp,
+      ...(typeof data.memory_type === 'string' && { memoryType: data.memory_type }),
+      ...(typeof data.load_reason === 'string' && { loadReason: data.load_reason }),
+    };
+  } else if (eventName === 'postmodelswitch') {
+    // Fires after the session's model changes (code.claude.com/docs/en/hooks.md).
+    // Pure notification — no decision control (PreModelSwitch has that; not
+    // installed here). Model IDs are a closed-ish identifier vocabulary
+    // (e.g. 'claude-opus-5'), not free-text content, so unlike
+    // error_details/last_assistant_message above these aren't gated behind
+    // recordContent.
+    event = {
+      mode: 'model_switch' as const,
+      fromModel: data.from_model ?? 'unknown',
+      toModel: data.to_model ?? 'unknown',
+      timestamp,
+      ...(data.requested_model !== undefined && { requestedModel: data.requested_model }),
+      ...(typeof data.source === 'string' && { source: data.source }),
+    };
+  } else if (eventName === 'userpromptsubmit') {
+    // Fires when the user submits a prompt, before Claude processes it
+    // (code.claude.com/docs/en/hooks.md). Pure notification — no decision
+    // control used here (this hook CAN block/modify the prompt via a JSON
+    // decision, but this collector never emits one). Only the leading slash
+    // token is captured because it is a skill identifier, the same class as
+    // tool_input.skill already captured by parseSkill() — no other prompt
+    // content is read. Not gated behind recordContent, matching skillName on
+    // Skill tool calls.
+    const slashCommand =
+      typeof data.prompt === 'string' ? /^\/([A-Za-z0-9_:.\-]+)/.exec(data.prompt)?.[1] : undefined;
+    event = {
+      mode: 'user_prompt_submit' as const,
+      timestamp,
+      ...(slashCommand !== undefined && { slashCommand }),
+    };
+  } else if (eventName === 'stop') {
+    // Fires when the main agent has finished responding
+    // (code.claude.com/docs/en/hooks.md) — NOT on a user interrupt, so this
+    // is a corroborating precise signal for TurnTracker/TaskDetector, not a
+    // full replacement for their idle-gap heuristics. Pure notification —
+    // no decision control used here (Stop CAN block Claude from stopping
+    // via a JSON decision, but this collector never emits one).
+    // Deliberately no content captured — last_assistant_message/
+    // background_tasks/session_crons are all real fields on this hook's
+    // input, but none are needed just to mark "a turn/task ended here".
+    event = {
+      mode: 'stop' as const,
+      timestamp,
+    };
   } else {
     // Unknown hook event — ignore silently
     return;
@@ -1009,7 +1325,20 @@ function processHook(raw: string): void {
   if (data.transcript_path) event.transcriptPath = data.transcript_path;
   if (data.permission_mode) event.permissionMode = data.permission_mode;
   if (sessionId) event.sessionId = sessionId;
+  // Stamp the true originating platform at write time, using this hook
+  // invocation's own environment — this is the only point in the pipeline
+  // that reliably reflects the real host, since whichever process later
+  // drains the buffer (e.g. --local's unscoped drain of an unowned session,
+  // see LocalSessionAggregator) may have detected a completely different
+  // platform for itself. Deliberately reads env vars directly (and imports
+  // only the light claude-code-adapter const, not the full registry) instead
+  // of going through PlatformRegistry — registry-based detection adds
+  // measurable overhead on this hot, pre+post-per-tool-call path.
+  const stampedPlatform = detectStampPlatform();
+  if (stampedPlatform) event.platform = stampedPlatform;
   if (data.tool_use_id) event.toolUseId = data.tool_use_id;
+  if (data.agent_id) event.agentId = data.agent_id;
+  if (data.agent_type) event.agentType = data.agent_type;
 
   // Write to buffer — wrapped in try/catch for resilience.
   try {
@@ -1046,16 +1375,23 @@ function processHook(raw: string): void {
     }
   }
 
-  // After writing the tool event, collect token usage from the transcript.
-  // Only on PostToolUse/AfterTool — each assistant turn produces exactly one
-  // usage object. This is a no-op for Gemini CLI's transcript format (not
-  // Claude Code's Anthropic-shaped JSONL) — same accepted behavior as
-  // Droid/Kiro/Amazon Q, whose transcripts aren't in this format either.
-  if (eventName === 'posttooluse' || eventName === 'aftertool') {
+  // Antigravity requires a stdout reply on every PreToolUse/PostToolUse hook
+  // invocation (https://antigravity.google/docs/hooks#inputoutput-contract) —
+  // a required `decision` field for PreToolUse, an empty object for
+  // PostToolUse. PostToolUse's schema has no `decision` field, so sending one
+  // fails protojson unmarshaling and the host's tool call with it (#793).
+  // Preflight is observation-only, so PreToolUse always allows.
+  if (isAntigravityPre) {
     try {
-      collectTranscriptTokens(data);
+      process.stdout.write('{"decision":"allow"}\n');
     } catch {
-      // Silent failure — transcript reading is best-effort
+      // Silent failure — never block Antigravity
+    }
+  } else if (isAntigravityPost) {
+    try {
+      process.stdout.write('{}\n');
+    } catch {
+      // Silent failure — never block Antigravity
     }
   }
 }
@@ -1068,12 +1404,9 @@ export {
   sizeOf,
   truncate,
   getRecordContent,
-  collectTranscriptTokens,
-  readLastAssistantUsage,
-  getTranscriptPath,
-  translateWslPath,
   getBufferPath,
   writePpidBreadcrumb,
+  writeCwdBreadcrumb,
   readStdinSync,
 };
 
@@ -1123,9 +1456,18 @@ export const _stdinFs = {
  * Code runs on a Windows host and spawns this script inside WSL via
  * `wsl.exe`: the piped stdin crossing that boundary is created by WSL's
  * root-owned init/relay (root:root, mode 0600), so re-opening `/dev/stdin`
- * fails with EACCES for the non-root user even though fd 0 is readable. Fall
- * back to the fd only on that specific error so the common case keeps
- * avoiding the EAGAIN risk above.
+ * fails with EACCES for the non-root user even though fd 0 is readable.
+ *
+ * A second case where the path fails but the fd works: when the spawning
+ * process is itself Node/Electron (VS Code's Copilot Chat runs hooks this
+ * way), libuv backs a `stdio: 'pipe'` child with a *socketpair* rather than
+ * a FIFO. `open()` on a unix socket via /proc/self/fd fails with ENXIO, so
+ * `/dev/stdin` is unusable there even though fd 0 reads fine.
+ *
+ * Rather than enumerate errnos, fall back to the fd on any /dev/stdin
+ * failure — the fd read is the more universally correct source, and the path
+ * is only preferred to dodge the EAGAIN risk noted above. If the fallback
+ * fails too, that error propagates.
  */
 function readStdinSync(): string {
   if (process.platform === 'win32') {
@@ -1133,11 +1475,8 @@ function readStdinSync(): string {
   }
   try {
     return _stdinFs.readFileSync('/dev/stdin');
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EACCES') {
-      return _stdinFs.readFileSync(process.stdin.fd);
-    }
-    throw err;
+  } catch {
+    return _stdinFs.readFileSync(process.stdin.fd);
   }
 }
 
@@ -1145,7 +1484,7 @@ if (_isDirectExecution) {
   try {
     const stdin = readStdinSync();
     if (stdin.trim()) {
-      processHook(stdin);
+      processHook(stdin, process.argv[2]);
     }
   } catch {
     // Silent failure — never block Claude Code

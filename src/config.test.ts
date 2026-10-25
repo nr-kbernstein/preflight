@@ -1,14 +1,18 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import { execSync } from 'node:child_process';
 import {
   loadMcpConfig,
+  MissingCloudCredentialError,
   redactSensitive,
   sanitizeDeveloper,
   normalizeDeveloperName,
   validateConfigFile,
+  resolveCompanionMode,
 } from './config.js';
+import type { CompanionModeSource } from './config.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let savedEnv: NodeJS.ProcessEnv;
@@ -17,8 +21,9 @@ let tmpDir: string;
 beforeEach(() => {
   stderrSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
   savedEnv = { ...process.env };
-  tmpDir = resolve(tmpdir(), `nr-mcp-test-${Date.now()}`);
-  mkdirSync(tmpDir, { recursive: true });
+  // mkdtempSync, not a `Date.now()` name: two jest processes starting a test
+  // in the same millisecond would otherwise share (and delete) one directory.
+  tmpDir = mkdtempSync(resolve(tmpdir(), 'nr-mcp-test-'));
 
   // Clear all relevant env vars to isolate tests
   delete process.env.NEW_RELIC_LICENSE_KEY;
@@ -36,6 +41,7 @@ beforeEach(() => {
   delete process.env.NEW_RELIC_HOST;
   delete process.env.NEW_RELIC_AI_MCP_PROXY_UPSTREAMS;
   delete process.env.NEW_RELIC_AI_HIGH_SECURITY;
+  delete process.env.NEW_RELIC_AI_PRICING_REFRESH;
   delete process.env.NEW_RELIC_AI_MODEL;
   delete process.env.NEW_RELIC_AI_SESSION_BUDGET_USD;
   delete process.env.NEW_RELIC_AI_DAILY_BUDGET_USD;
@@ -43,12 +49,23 @@ beforeEach(() => {
   delete process.env.NEW_RELIC_AI_TEAM_ID;
   delete process.env.NEW_RELIC_AI_PROJECT_ID;
   delete process.env.NEW_RELIC_AI_ORG_ID;
+  delete process.env.NEW_RELIC_AI_REPO_URL;
+  delete process.env.NEW_RELIC_AI_REPO_URL_ENABLED;
   delete process.env.NEW_RELIC_API_KEY;
   delete process.env.NR_AI_MODE;
+  // Most fixtures below set credentials without asserting on mode; an explicit
+  // 'cloud' here keeps them exercising that behavior as before mode became
+  // fail-closed. Tests of mode resolution itself override or delete this.
+  process.env.NR_AI_MODE = 'cloud';
   delete process.env.NR_AI_DASHBOARD_PORT;
   delete process.env.NR_AI_DASHBOARD_HOST;
   delete process.env.NR_AI_DASHBOARD_OPEN;
   delete process.env.NEW_RELIC_AI_RETAIN_SESSIONS_DAYS;
+  delete process.env.NR_AI_COMPANION_MODE;
+  delete process.env.NEW_RELIC_AI_HOMELAB_URL;
+  delete process.env.NEW_RELIC_AI_HOMELAB_TOKEN;
+  delete process.env.NEW_RELIC_AI_HOMELAB_SERVER_PORT;
+  delete process.env.NEW_RELIC_AI_HOMELAB_BIND_ADDRESS;
 });
 
 afterEach(() => {
@@ -394,6 +411,20 @@ describe('loadMcpConfig()', () => {
     expect(stderrOutput).not.toMatch(/Unknown keys in config file/);
   });
 
+  it('does not warn about repoUrl as an unknown config-file key (regression: was missing from ConfigFileSchema)', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const path = resolve(tmpDir, 'repo-url.json');
+    writeFileSync(
+      path,
+      JSON.stringify({ projectId: 'myorg/myrepo', repoUrl: 'https://example.test/x' }),
+    );
+    const config = loadMcpConfig({ config: path });
+    expect(config.repoUrl).toBe('https://example.test/x');
+    const stderrOutput = stderrSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(stderrOutput).not.toMatch(/Unknown keys in config file/);
+  });
+
   it('does not warn for recognized keys in config file (task #22)', () => {
     process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
     process.env.NEW_RELIC_ACCOUNT_ID = '12345';
@@ -538,6 +569,37 @@ describe('loadMcpConfig()', () => {
     expect(config.highSecurity).toBe(false);
   });
 
+  it('pricingRefresh defaults to true', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const config = loadMcpConfig({ config: writeConfigFile({}) });
+    expect(config.pricingRefresh).toBe(true);
+  });
+
+  it('pricingRefresh env var false disables it', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_PRICING_REFRESH = 'false';
+    const config = loadMcpConfig({ config: writeConfigFile({}) });
+    expect(config.pricingRefresh).toBe(false);
+  });
+
+  it('pricingRefresh config-file key is honoured', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const config = loadMcpConfig({ config: writeConfigFile({ pricingRefresh: false }) });
+    expect(config.pricingRefresh).toBe(false);
+  });
+
+  it('highSecurity forces pricingRefresh off even when env var says true', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_HIGH_SECURITY = 'true';
+    process.env.NEW_RELIC_AI_PRICING_REFRESH = 'true';
+    const config = loadMcpConfig({ config: writeConfigFile({ pricingRefresh: true }) });
+    expect(config.pricingRefresh).toBe(false);
+  });
+
   it('highSecurity=true set via env var', () => {
     process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
     process.env.NEW_RELIC_ACCOUNT_ID = '12345';
@@ -584,6 +646,42 @@ describe('loadMcpConfig()', () => {
     const config = loadMcpConfig({ config: configPath });
     expect(config.highSecurity).toBe(false);
     expect(config.recordContent).toBe(true);
+  });
+});
+
+describe('companionMode', () => {
+  it('defaults to false when unset', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({});
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.companionMode).toBe(false);
+  });
+
+  it('reads true from the config file', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({ companionMode: true });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.companionMode).toBe(true);
+  });
+
+  it('NR_AI_COMPANION_MODE=true overrides an absent file value', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NR_AI_COMPANION_MODE = 'true';
+    const configPath = writeConfigFile({});
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.companionMode).toBe(true);
+  });
+
+  it('NR_AI_COMPANION_MODE=false overrides a true file value (env > file > default)', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NR_AI_COMPANION_MODE = 'false';
+    const configPath = writeConfigFile({ companionMode: true });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.companionMode).toBe(false);
   });
 });
 
@@ -1013,6 +1111,78 @@ describe('budget fields', () => {
   });
 });
 
+describe('costRateMultiplier / dataResidencyPremium', () => {
+  it('default to null / false when not configured', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({});
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.costRateMultiplier).toBeNull();
+    expect(config.dataResidencyPremium).toBe(false);
+  });
+
+  it('loads costRateMultiplier from the config file', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({ costRateMultiplier: 0.85 });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.costRateMultiplier).toBe(0.85);
+  });
+
+  it('loads costRateMultiplier from the env var, overriding the config file', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_COST_RATE_MULTIPLIER = '0.5';
+    const configPath = writeConfigFile({ costRateMultiplier: 0.85 });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.costRateMultiplier).toBe(0.5);
+  });
+
+  it('rejects a costRateMultiplier above 1 from the config file and logs a warning', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({ costRateMultiplier: 1.5 });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.costRateMultiplier).toBeNull();
+    const stderrOutput = stderrSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(stderrOutput).toMatch(/costRateMultiplier/);
+  });
+
+  it('rejects a zero or negative costRateMultiplier from the config file', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({ costRateMultiplier: 0 });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.costRateMultiplier).toBeNull();
+  });
+
+  it('treats an out-of-range costRateMultiplier env var as unset (falls back to the config file)', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_COST_RATE_MULTIPLIER = '2';
+    const configPath = writeConfigFile({ costRateMultiplier: 0.9 });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.costRateMultiplier).toBe(0.9);
+  });
+
+  it('loads dataResidencyPremium from the config file', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({ dataResidencyPremium: true });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.dataResidencyPremium).toBe(true);
+  });
+
+  it('loads dataResidencyPremium from the env var, overriding the config file', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_DATA_RESIDENCY_PREMIUM = 'false';
+    const configPath = writeConfigFile({ dataResidencyPremium: true });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.dataResidencyPremium).toBe(false);
+  });
+});
+
 describe('retainSessionsDays', () => {
   it('defaults to 90 when neither env var nor config file key is set', () => {
     process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
@@ -1208,6 +1378,179 @@ describe('developer sanitization via loadMcpConfig()', () => {
     }
   });
 
+  it('repoUrl uses config file value when no env var set', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({
+      projectId: 'myorg/myrepo',
+      repoUrl: 'https://example.test/x',
+    });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.repoUrl).toBe('https://example.test/x');
+  });
+
+  it('repoUrl opt-out is independent of projectId — an explicit projectId: null does not disable it', () => {
+    const origDir = process.cwd();
+    try {
+      // Non-git cwd → projectId inference returns null. Prior behavior coupled
+      // repoUrl's opt-out to that resolved value; it's now a dedicated toggle
+      // (repoUrlEnabled), so an explicit repoUrl value still comes through.
+      process.chdir(tmpDir);
+      delete process.env.GIT_DIR;
+      delete process.env.GIT_WORK_TREE;
+      process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+      process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+      const configPath = writeConfigFile({ projectId: null, repoUrl: 'https://example.test/x' });
+      const config = loadMcpConfig({ config: configPath });
+      expect(config.projectId).toBeNull();
+      expect(config.repoUrl).toBe('https://example.test/x');
+      expect(config.repoUrlEnabled).toBe(true);
+    } finally {
+      process.chdir(origDir);
+    }
+  });
+
+  it('repoUrlEnabled: false disables repoUrl independent of projectId', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({
+      projectId: 'myorg/myrepo',
+      repoUrl: 'https://example.test/x',
+      repoUrlEnabled: false,
+    });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.projectId).toBe('myorg/myrepo');
+    expect(config.repoUrlEnabled).toBe(false);
+    expect(config.repoUrl).toBeNull();
+  });
+
+  it('NEW_RELIC_AI_REPO_URL_ENABLED=false disables repoUrl via env var', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_REPO_URL_ENABLED = 'false';
+    const configPath = writeConfigFile({ repoUrl: 'https://example.test/x' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.repoUrlEnabled).toBe(false);
+    expect(config.repoUrl).toBeNull();
+  });
+
+  it('strips embedded credentials from an explicit repoUrl config-file value', () => {
+    // Redaction must not be limited to the git-remote-inferred path — a value
+    // pasted straight from an authenticated `git remote -v` is just as
+    // sensitive when set explicitly.
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({
+      repoUrl: 'https://someuser:ghp_faketoken1234567890abcd@github.com/org/repo.git',
+    });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.repoUrl).not.toBeNull();
+    expect(config.repoUrl).not.toContain('ghp_faketoken1234567890abcd');
+    expect(config.repoUrl).not.toContain('someuser:');
+    expect(config.repoUrl).toBe('https://github.com/org/repo.git');
+  });
+
+  it('strips embedded credentials from an explicit NEW_RELIC_AI_REPO_URL env var', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_REPO_URL =
+      'https://someuser:ghp_faketoken1234567890abcd@github.com/org/repo.git';
+    const configPath = writeConfigFile({});
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.repoUrl).not.toBeNull();
+    expect(config.repoUrl).not.toContain('ghp_faketoken1234567890abcd');
+    expect(config.repoUrl).not.toContain('someuser:');
+    expect(config.repoUrl).toBe('https://github.com/org/repo.git');
+  });
+
+  it('strips a username-only token that no redaction pattern recognizes', () => {
+    // A GitLab/Bitbucket token used as the https username has no `user:pass`
+    // shape and no known prefix, so redactSensitive alone let it through.
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_REPO_URL = 'https://opaquetoken123@gitlab.example.com/org/repo.git';
+    const config = loadMcpConfig({ config: writeConfigFile({}) });
+    expect(config.repoUrl).toBe('https://gitlab.example.com/org/repo.git');
+  });
+
+  it('strips a token from a git+https remote', () => {
+    // The `repository.url` shape in package.json. Only ssh-family schemes keep
+    // a userinfo login name; every other scheme loses the whole userinfo.
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_REPO_URL =
+      'git+https://opaquetoken123@gitlab.example.com/org/repo.git';
+    const config = loadMcpConfig({ config: writeConfigFile({}) });
+    expect(config.repoUrl).toBe('git+https://gitlab.example.com/org/repo.git');
+  });
+
+  it('strips a password containing an unencoded slash', () => {
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_AI_REPO_URL = 'https://user:pa/ss@github.com/acme/widgets.git';
+    const config = loadMcpConfig({ config: writeConfigFile({}) });
+    expect(config.repoUrl).toBe('https://github.com/acme/widgets.git');
+  });
+
+  it('repoUrl strips embedded credentials from an inferred git remote', () => {
+    const origDir = process.cwd();
+    // A dedicated mkdtemp dir, not the shared per-test `tmpDir`, since this
+    // test mutates real git state (init + remote add).
+    const gitDir = mkdtempSync(resolve(tmpdir(), 'nr-mcp-test-repo-'));
+    // GIT_DIR/GIT_WORK_TREE (set by git for hook subprocesses, e.g. this
+    // process running under husky's pre-push) override `cwd`, silently
+    // redirecting `git init`/`git remote add` to the real repo instead of
+    // gitDir — which is exactly what made this test flake only when run via
+    // `git push`, never via a direct `npm test`. See config.ts's
+    // getGitRemoteUrl() and local-session-aggregator.ts's GIT_OPTS for the
+    // same guard.
+    const gitEnv = { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined };
+    try {
+      execSync('git init', { cwd: gitDir, env: gitEnv });
+      execSync(
+        'git remote add origin https://someuser:ghp_faketoken1234567890abcd@github.com/org/repo.git',
+        { cwd: gitDir, env: gitEnv },
+      );
+      process.chdir(gitDir);
+      process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+      process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+      const configPath = writeConfigFile({});
+      const config = loadMcpConfig({ config: configPath });
+      expect(config.repoUrl).not.toBeNull();
+      expect(config.repoUrl).not.toContain('ghp_faketoken1234567890abcd');
+      expect(config.repoUrl).not.toContain('someuser:');
+      expect(config.repoUrl).toBe('https://github.com/org/repo.git');
+      expect(config.projectId).toBe('org/repo');
+    } finally {
+      process.chdir(origDir);
+      rmSync(gitDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['git@git.corp.internal:widgets.git', 'ssh://git@git.corp.internal:29418/widgets'])(
+    'keeps the git host of the one-segment remote %s out of projectId when repoUrl is off',
+    (remote) => {
+      const origDir = process.cwd();
+      const gitDir = mkdtempSync(resolve(tmpdir(), 'nr-mcp-test-repo-'));
+      // See the previous test for why GIT_DIR/GIT_WORK_TREE are cleared.
+      const gitEnv = { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined };
+      try {
+        execSync('git init', { cwd: gitDir, env: gitEnv });
+        execSync(`git remote add origin ${remote}`, { cwd: gitDir, env: gitEnv });
+        process.chdir(gitDir);
+        process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
+        process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+        const config = loadMcpConfig({ config: writeConfigFile({ repoUrlEnabled: false }) });
+        expect(config.repoUrl).toBeNull();
+        expect(config.projectId).toBe('widgets');
+        expect(JSON.stringify(config)).not.toContain('corp.internal');
+      } finally {
+        process.chdir(origDir);
+        rmSync(gitDir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('orgId loaded from NEW_RELIC_AI_ORG_ID env var', () => {
     process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
     process.env.NEW_RELIC_ACCOUNT_ID = '12345';
@@ -1244,12 +1587,11 @@ describe('developer sanitization via loadMcpConfig()', () => {
 });
 
 describe('mode field', () => {
-  it("defaults to 'cloud' when unset", () => {
-    process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
-    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+  it("defaults to 'local' when unset and no credentials are configured", () => {
+    delete process.env.NR_AI_MODE;
     const configPath = writeConfigFile({});
     const config = loadMcpConfig({ config: configPath });
-    expect(config.mode).toBe('cloud');
+    expect(config.mode).toBe('local');
   });
 
   it('reads mode from NR_AI_MODE env var', () => {
@@ -1271,6 +1613,7 @@ describe('mode field', () => {
   });
 
   it('file value wins when env var unset', () => {
+    delete process.env.NR_AI_MODE;
     process.env.NEW_RELIC_LICENSE_KEY = 'test-key';
     process.env.NEW_RELIC_ACCOUNT_ID = '12345';
     const configPath = writeConfigFile({ mode: 'both' });
@@ -1324,6 +1667,29 @@ describe('licenseKey gating', () => {
     );
   });
 
+  // --local falls back to local mode on this type, not on the message (#479).
+  it('throws a MissingCloudCredentialError naming the missing field and the mode', () => {
+    const thrown = (fn: () => unknown): unknown => {
+      try {
+        fn();
+      } catch (err) {
+        return err;
+      }
+      throw new Error('expected loadMcpConfig to throw');
+    };
+
+    process.env.NR_AI_MODE = 'both';
+    const noKey = thrown(() => loadMcpConfig({ config: writeConfigFile({ accountId: '12345' }) }));
+    expect(noKey).toBeInstanceOf(MissingCloudCredentialError);
+    expect(noKey).toMatchObject({ missingField: 'licenseKey', mode: 'both' });
+
+    process.env.NR_AI_MODE = 'cloud';
+    process.env.NEW_RELIC_LICENSE_KEY = 'test-key-1234567890';
+    const noAccount = thrown(() => loadMcpConfig({ config: writeConfigFile({}) }));
+    expect(noAccount).toBeInstanceOf(MissingCloudCredentialError);
+    expect(noAccount).toMatchObject({ missingField: 'accountId', mode: 'cloud' });
+  });
+
   it('throws when NR_AI_MODE is set to an invalid value', () => {
     process.env.NR_AI_MODE = 'offline';
     process.env.NEW_RELIC_LICENSE_KEY = 'test-key-1234567890';
@@ -1346,6 +1712,37 @@ describe('licenseKey gating', () => {
     expect(() => loadMcpConfig({ config: configPath })).toThrow(
       /Config file validation failed.*mode.*Invalid option: expected one of "cloud"\|"local"\|"both"/,
     );
+  });
+});
+
+describe('mode fail-closed: licenseKey without explicit mode', () => {
+  it('throws when licenseKey is in the config file and mode is unset', () => {
+    delete process.env.NR_AI_MODE;
+    const configPath = writeConfigFile({ licenseKey: 'file-key-123' });
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(/no explicit mode/);
+  });
+
+  it('throws when NEW_RELIC_LICENSE_KEY env is set and mode is unset', () => {
+    delete process.env.NR_AI_MODE;
+    process.env.NEW_RELIC_LICENSE_KEY = 'env-key-1234567890';
+    const configPath = writeConfigFile({});
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(/no explicit mode/);
+  });
+
+  it("still resolves 'cloud' when the file sets mode explicitly alongside licenseKey", () => {
+    delete process.env.NR_AI_MODE;
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    const configPath = writeConfigFile({ mode: 'cloud', licenseKey: 'file-key-123' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.mode).toBe('cloud');
+  });
+
+  it("resolves 'local' without throwing when NR_AI_MODE=local and licenseKey is present", () => {
+    process.env.NR_AI_MODE = 'local';
+    process.env.NEW_RELIC_LICENSE_KEY = 'env-key-1234567890';
+    const configPath = writeConfigFile({});
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.mode).toBe('local');
   });
 });
 
@@ -1991,5 +2388,385 @@ describe('validateConfigFile()', () => {
     writeFileSync(resolve(tmpDir, 'nostorage.json'), JSON.stringify({ mode: 'local' }));
     const result = validateConfigFile(resolve(tmpDir, 'nostorage.json'));
     expect(result.storagePath).toBeUndefined();
+  });
+});
+
+describe('homelab config fields', () => {
+  beforeEach(() => {
+    // The shared beforeEach above forces NR_AI_MODE='cloud' to preserve older
+    // fixtures that predate mode becoming fail-closed. Every test here sets
+    // an explicit file mode ('local') instead — env wins over file, so it
+    // must be cleared for the file value to take effect as these tests intend.
+    delete process.env.NR_AI_MODE;
+  });
+
+  it('defaults homelabServerUrl and homelabToken to null', () => {
+    const configPath = writeConfigFile({ mode: 'local' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabServerUrl).toBeNull();
+    expect(config.homelabToken).toBeNull();
+  });
+
+  it('reads homelabServerUrl from env var', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_URL = 'http://homelab:7777';
+    process.env.NEW_RELIC_AI_HOMELAB_TOKEN = 'test-token';
+    const configPath = writeConfigFile({ mode: 'local' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabServerUrl).toBe('http://homelab:7777');
+  });
+
+  it('reads homelabToken from env var', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_TOKEN = 'my-secret';
+    const configPath = writeConfigFile({ mode: 'local' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabToken).toBe('my-secret');
+  });
+
+  it('reads homelabServerUrl and homelabToken from config file', () => {
+    const configPath = writeConfigFile({
+      mode: 'local',
+      homelabServerUrl: 'http://mybox:7777',
+      homelabToken: 'file-secret',
+    });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabServerUrl).toBe('http://mybox:7777');
+    expect(config.homelabToken).toBe('file-secret');
+  });
+
+  it('env var overrides config file for homelabServerUrl', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_URL = 'http://env-box:7777';
+    process.env.NEW_RELIC_AI_HOMELAB_TOKEN = 'test-token';
+    const configPath = writeConfigFile({
+      mode: 'local',
+      homelabServerUrl: 'http://file-box:7777',
+      homelabToken: 'file-token',
+    });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabServerUrl).toBe('http://env-box:7777');
+  });
+
+  it('throws when homelabServerUrl is set without homelabToken', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_URL = 'http://homelab:7777';
+    const configPath = writeConfigFile({ mode: 'local' });
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(
+      'homelabServerUrl is set but homelabToken is missing. Set NEW_RELIC_AI_HOMELAB_TOKEN.',
+    );
+  });
+
+  it('throws when homelabServerUrl has invalid scheme', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_URL = 'file:///etc/passwd';
+    process.env.NEW_RELIC_AI_HOMELAB_TOKEN = 'some-token';
+    const configPath = writeConfigFile({ mode: 'local' });
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(
+      /homelabServerUrl must use http: or https:/,
+    );
+  });
+
+  it('throws when homelabServerUrl is not a valid URL', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_URL = 'not-a-url';
+    process.env.NEW_RELIC_AI_HOMELAB_TOKEN = 'some-token';
+    const configPath = writeConfigFile({ mode: 'local' });
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(
+      /homelabServerUrl is not a valid URL/,
+    );
+  });
+
+  it('defaults homelabServer.port to 7777 and bindAddress to 0.0.0.0', () => {
+    const configPath = writeConfigFile({ mode: 'local' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabServer.port).toBe(7777);
+    expect(config.homelabServer.bindAddress).toBe('0.0.0.0');
+  });
+
+  it('reads homelabServer.port from env var', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_SERVER_PORT = '8080';
+    const configPath = writeConfigFile({ mode: 'local' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabServer.port).toBe(8080);
+  });
+
+  it('reads homelabServer.bindAddress from env var', () => {
+    process.env.NEW_RELIC_AI_HOMELAB_BIND_ADDRESS = '192.168.1.100';
+    const configPath = writeConfigFile({ mode: 'local' });
+    const config = loadMcpConfig({ config: configPath });
+    expect(config.homelabServer.bindAddress).toBe('192.168.1.100');
+  });
+});
+
+describe('loadMcpConfig() — tiers', () => {
+  it('synthesizes one implicit default tier when no tiers array is configured', () => {
+    const configPath = writeConfigFile({
+      licenseKey: 'test-key-1234567890',
+      accountId: '12345',
+    });
+    const config = loadMcpConfig({ config: configPath });
+
+    expect(config.tiers).toHaveLength(1);
+    expect(config.tiers[0].name).toBe('default');
+    expect(config.tiers[0].eventTypes).toEqual(['*']);
+    expect(config.tiers[0].destination).toEqual({
+      type: 'nr',
+      licenseKey: 'test-key-1234567890',
+      accountId: '12345',
+    });
+  });
+
+  it('resolves an explicit tiers array under mode=cloud', () => {
+    const configPath = writeConfigFile({
+      mode: 'cloud',
+      licenseKey: 'test-key-1234567890',
+      accountId: '12345',
+      tiers: [
+        {
+          name: 'personal',
+          destination: { type: 'nr', licenseKey: 'lk-personal', accountId: '12345' },
+          eventTypes: ['*'],
+        },
+        {
+          name: 'team',
+          destination: { type: 'nr', licenseKey: 'lk-team', accountId: '67890' },
+          eventTypes: ['AiCodingTask', 'AiSubagentTurn'],
+        },
+      ],
+    });
+    const config = loadMcpConfig({ config: configPath });
+
+    expect(config.tiers.map((t) => t.name)).toEqual(['personal', 'team']);
+    expect(config.tiers[1].eventTypes).toEqual(['AiCodingTask', 'AiSubagentTurn']);
+  });
+
+  it('resolves an explicit tiers array under mode=both', () => {
+    process.env.NR_AI_MODE = 'both';
+    const configPath = writeConfigFile({
+      licenseKey: 'test-key-1234567890',
+      accountId: '12345',
+      tiers: [
+        {
+          name: 'personal',
+          destination: { type: 'nr', licenseKey: 'lk-personal', accountId: '12345' },
+          eventTypes: ['*'],
+        },
+      ],
+    });
+    const config = loadMcpConfig({ config: configPath });
+
+    expect(config.mode).toBe('both');
+    expect(config.tiers).toHaveLength(1);
+  });
+
+  it("throws when an explicit tiers array is present under mode='local'", () => {
+    process.env.NR_AI_MODE = 'local';
+    const configPath = writeConfigFile({
+      tiers: [
+        {
+          name: 'personal',
+          destination: { type: 'nr', licenseKey: 'lk-personal', accountId: '12345' },
+          eventTypes: ['*'],
+        },
+      ],
+    });
+
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(
+      /tiers.*mode='local'.*mode='cloud' or mode='both'/s,
+    );
+  });
+
+  it("throws on a tiers array under mode='local' even when the tiers themselves are malformed", () => {
+    process.env.NR_AI_MODE = 'local';
+    const configPath = writeConfigFile({ tiers: [{ name: '' }] });
+
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(/mode='local'/);
+  });
+
+  it("resolves tiers to an empty array under mode='local' when no tiers key is present", () => {
+    process.env.NR_AI_MODE = 'local';
+    const configPath = writeConfigFile({});
+    const config = loadMcpConfig({ config: configPath });
+
+    expect(config.tiers).toEqual([]);
+  });
+
+  it('propagates validateTiers() errors at config load (duplicate name)', () => {
+    const configPath = writeConfigFile({
+      mode: 'cloud',
+      licenseKey: 'test-key-1234567890',
+      accountId: '12345',
+      tiers: [
+        {
+          name: 'personal',
+          destination: { type: 'nr', licenseKey: 'lk-a', accountId: '12345' },
+          eventTypes: ['*'],
+        },
+        {
+          name: 'personal',
+          destination: { type: 'nr', licenseKey: 'lk-b', accountId: '67890' },
+          eventTypes: ['*'],
+        },
+      ],
+    });
+
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(/Duplicate tier name "personal"/);
+  });
+
+  it('propagates validateTiers() errors at config load (unknown event type)', () => {
+    const configPath = writeConfigFile({
+      mode: 'cloud',
+      licenseKey: 'test-key-1234567890',
+      accountId: '12345',
+      tiers: [
+        {
+          name: 'personal',
+          destination: { type: 'nr', licenseKey: 'lk-a', accountId: '12345' },
+          eventTypes: ['AiNotARealEvent'],
+        },
+      ],
+    });
+
+    expect(() => loadMcpConfig({ config: configPath })).toThrow(/unknown event type/);
+  });
+
+  it('does not warn about "tiers" as an unknown config key', () => {
+    const warnSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const configPath = writeConfigFile({
+      mode: 'cloud',
+      licenseKey: 'test-key-1234567890',
+      accountId: '12345',
+      tiers: [
+        {
+          name: 'personal',
+          destination: { type: 'nr', licenseKey: 'lk-a', accountId: '12345' },
+          eventTypes: ['*'],
+        },
+      ],
+    });
+    loadMcpConfig({ config: configPath });
+
+    const written = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    warnSpy.mockRestore();
+    expect(written).not.toContain('Unknown keys in config file');
+  });
+});
+
+describe('resolveCompanionMode()', () => {
+  const NR_EXPORT = {
+    CLAUDE_CODE_ENABLE_TELEMETRY: '1',
+    OTEL_METRICS_EXPORTER: 'otlp',
+    OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otlp.nr-data.net:4317',
+  };
+
+  it.each<[string, NodeJS.ProcessEnv, boolean | undefined, boolean, CompanionModeSource]>([
+    ['env true', { NR_AI_COMPANION_MODE: 'true' }, undefined, true, 'env NR_AI_COMPANION_MODE'],
+    ['env "yes"', { NR_AI_COMPANION_MODE: 'yes' }, undefined, true, 'env NR_AI_COMPANION_MODE'],
+    ['env "0"', { NR_AI_COMPANION_MODE: '0' }, undefined, false, 'env NR_AI_COMPANION_MODE'],
+    [
+      'env false beats file true',
+      { NR_AI_COMPANION_MODE: 'false' },
+      true,
+      false,
+      'env NR_AI_COMPANION_MODE',
+    ],
+    [
+      'env true beats file false',
+      { NR_AI_COMPANION_MODE: 'true' },
+      false,
+      true,
+      'env NR_AI_COMPANION_MODE',
+    ],
+    [
+      'env false beats detection',
+      { ...NR_EXPORT, NR_AI_COMPANION_MODE: 'false' },
+      undefined,
+      false,
+      'env NR_AI_COMPANION_MODE',
+    ],
+    ['unparseable env falls through', { NR_AI_COMPANION_MODE: 'maybe' }, true, true, 'config file'],
+    ['file true', {}, true, true, 'config file'],
+    ['file false beats detection', NR_EXPORT, false, false, 'config file'],
+    ['export to New Relic', NR_EXPORT, undefined, true, 'detected Claude Code OTel export'],
+    [
+      'telemetry "true"',
+      { ...NR_EXPORT, CLAUDE_CODE_ENABLE_TELEMETRY: 'true' },
+      undefined,
+      true,
+      'detected Claude Code OTel export',
+    ],
+    [
+      'exporter list',
+      { ...NR_EXPORT, OTEL_METRICS_EXPORTER: 'console,otlp' },
+      undefined,
+      true,
+      'detected Claude Code OTel export',
+    ],
+    [
+      'EU endpoint without scheme',
+      { ...NR_EXPORT, OTEL_EXPORTER_OTLP_ENDPOINT: 'otlp.eu01.nr-data.net:4317' },
+      undefined,
+      true,
+      'detected Claude Code OTel export',
+    ],
+    [
+      'metrics-specific endpoint',
+      {
+        ...NR_EXPORT,
+        OTEL_EXPORTER_OTLP_ENDPOINT: undefined,
+        OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: 'https://gov-otlp.nr-data.net/v1/metrics',
+      },
+      undefined,
+      true,
+      'detected Claude Code OTel export',
+    ],
+    [
+      'export to another backend',
+      { ...NR_EXPORT, OTEL_EXPORTER_OTLP_ENDPOINT: 'https://api.honeycomb.io' },
+      undefined,
+      false,
+      'default',
+    ],
+    [
+      'look-alike host',
+      { ...NR_EXPORT, OTEL_EXPORTER_OTLP_ENDPOINT: 'https://evil-nr-data.net' },
+      undefined,
+      false,
+      'default',
+    ],
+    [
+      'no endpoint',
+      { ...NR_EXPORT, OTEL_EXPORTER_OTLP_ENDPOINT: undefined },
+      undefined,
+      false,
+      'default',
+    ],
+    ['exporter none', { ...NR_EXPORT, OTEL_METRICS_EXPORTER: 'none' }, undefined, false, 'default'],
+    [
+      'prometheus exporter',
+      { ...NR_EXPORT, OTEL_METRICS_EXPORTER: 'prometheus' },
+      undefined,
+      false,
+      'default',
+    ],
+    [
+      'exporter unset',
+      { ...NR_EXPORT, OTEL_METRICS_EXPORTER: undefined },
+      undefined,
+      false,
+      'default',
+    ],
+    [
+      'telemetry off',
+      { ...NR_EXPORT, CLAUDE_CODE_ENABLE_TELEMETRY: '0' },
+      undefined,
+      false,
+      'default',
+    ],
+    [
+      'telemetry unset',
+      { ...NR_EXPORT, CLAUDE_CODE_ENABLE_TELEMETRY: undefined },
+      undefined,
+      false,
+      'default',
+    ],
+    ['nothing set', {}, undefined, false, 'default'],
+  ])('%s', (_name, env, fileValue, value, source) => {
+    expect(resolveCompanionMode(env, fileValue)).toEqual({ value, source });
   });
 });

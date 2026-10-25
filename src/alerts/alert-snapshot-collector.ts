@@ -19,12 +19,17 @@ const logger = createLogger('alert-snapshot-collector');
  * - `toolFailures` is one entry per (tool, windowMs) tuple, same matching
  *   rule.
  *
- * Cost is currently session-cumulative (not a rolling window). A true
- * rolling-hour cost window is not yet implemented.
+ * Cost buckets are period-cumulative (session, today, week), not a
+ * rolling N-second window.
  */
 export interface AlertSnapshot {
   readonly timestamp: number;
-  readonly cost: { sessionUsd: number; todayUsd: number; weekUsd: number };
+  /**
+   * `null` when the cost trackers could not be read. Rules that need cost skip
+   * the cycle instead of reading a zero that looks like spend dropping to
+   * nothing (#813).
+   */
+  readonly cost: { sessionUsd: number; todayUsd: number; weekUsd: number } | null;
   readonly efficiency: { score: number | null };
   readonly antiPatterns: ReadonlyArray<{
     type: string;
@@ -63,9 +68,8 @@ export interface AlertSnapshotCollectorDeps {
    * snapshot's `cost.todayUsd` and `cost.weekUsd` reflect prior-session +
    * current-session today/weekly totals (the same numbers fed to
    * BudgetTracker.updateCost), enabling cost.window rules with `today`/
-   * `week` periods to fire. Without this, today/week fall back to 0 — the
-   * pre-fix behavior — so cost.window rules with non-session periods
-   * effectively become no-ops.
+   * `week` periods to fire. Without this, today/week always read 0, so an
+   * `above` rule never fires and a `below` rule fires immediately.
    */
   readonly budgetTracker?: {
     getStatus(): {
@@ -276,7 +280,7 @@ export class AlertSnapshotCollector {
   // Internal — tracker reads (defensive: missing deps yield neutral values)
   // ---------------------------------------------------------------------------
 
-  private readCost(): { sessionUsd: number; todayUsd: number; weekUsd: number } {
+  private readCost(): AlertSnapshot['cost'] {
     try {
       const m = this.deps.costTracker?.getMetrics();
       const sessionUsd = m?.sessionTotalCostUsd ?? 0;
@@ -284,7 +288,7 @@ export class AlertSnapshotCollector {
       // spent — same numbers that feed budget alerts, computed in index.ts
       // from costTracker.getCostForDay() + cross-midnight-aware prior session
       // baseline. Falls back to 0 when no budgetTracker is wired (older
-      // configs / tests), matching the pre-fix placeholder behavior.
+      // configs / tests).
       const status = this.deps.budgetTracker?.getStatus();
       return {
         sessionUsd: sessionUsd ?? 0,
@@ -292,10 +296,10 @@ export class AlertSnapshotCollector {
         weekUsd: status?.weekly.spentUsd ?? 0,
       };
     } catch (err) {
-      logger.warn('costTracker.getMetrics() threw — defaulting to 0', {
+      logger.warn('Cost tracker read threw — cost unavailable this snapshot', {
         error: String(err),
       });
-      return { sessionUsd: 0, todayUsd: 0, weekUsd: 0 };
+      return null;
     }
   }
 

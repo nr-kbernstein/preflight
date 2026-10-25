@@ -1,26 +1,25 @@
-import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
-import { resolve, dirname } from 'node:path';
-import { tmpdir } from 'node:os';
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, utimesSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, resolve } from 'node:path';
 import {
-  processHook,
-  redact,
+  _procFs,
+  _stdinFs,
+  getBufferPath,
+  getLinuxAncestorPids,
+  getRecordContent,
   hashInput,
+  processHook,
+  readStdinSync,
+  redact,
   sizeOf,
   truncate,
-  getRecordContent,
-  collectTranscriptTokens,
-  readLastAssistantUsage,
-  getTranscriptPath,
-  translateWslPath,
-  getBufferPath,
+  writeCwdBreadcrumb,
   writePpidBreadcrumb,
-  getLinuxAncestorPids,
-  _procFs,
-  readStdinSync,
-  _stdinFs,
 } from './collector-script.js';
+import { CLAUDE_CODE_ENV_SIGNALS } from '../platforms/claude-code-adapter.js';
+import { parseToolSpecificFields } from './tool-parsers.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let stdoutSpy: ReturnType<typeof jest.spyOn>;
@@ -90,6 +89,83 @@ function makePostToolUseFailure(overrides?: Record<string, unknown>): string {
   });
 }
 
+function makeStopFailure(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    session_id: 'abc123',
+    transcript_path: '/Users/test/.claude/projects/test/abc123.jsonl',
+    cwd: '/Users/test/project',
+    hook_event_name: 'StopFailure',
+    error: 'rate_limit',
+    error_details: '429 Too Many Requests',
+    last_assistant_message: 'API Error: Rate limit reached',
+    ...overrides,
+  });
+}
+
+function makeSessionStartResume(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    session_id: 'abc123',
+    transcript_path: '/Users/test/.claude/projects/test/abc123.jsonl',
+    cwd: '/Users/test/project',
+    hook_event_name: 'SessionStart',
+    source: 'resume',
+    seconds_since_last_response: 5400,
+    context_tokens: 182340,
+    prompt_cache_likely_expired: true,
+    estimated_cache_write_usd: 1.1396,
+    ...overrides,
+  });
+}
+
+function makeInstructionsLoaded(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    session_id: 'abc123',
+    transcript_path: '/Users/test/.claude/projects/test/abc123.jsonl',
+    cwd: '/Users/test/project',
+    hook_event_name: 'InstructionsLoaded',
+    file_path: '/Users/test/project/CLAUDE.md',
+    memory_type: 'Project',
+    load_reason: 'session_start',
+    ...overrides,
+  });
+}
+
+function makePostModelSwitch(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    session_id: 'abc123',
+    transcript_path: '/Users/test/.claude/projects/test/abc123.jsonl',
+    cwd: '/Users/test/project',
+    hook_event_name: 'PostModelSwitch',
+    from_model: 'claude-sonnet-5',
+    to_model: 'claude-opus-5',
+    requested_model: 'opus',
+    source: 'command',
+    ...overrides,
+  });
+}
+
+function makeUserPromptSubmit(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    session_id: 'sess-001',
+    transcript_path: '/Users/test/.claude/projects/test/sess-001.jsonl',
+    cwd: '/projects/test',
+    hook_event_name: 'UserPromptSubmit',
+    prompt: 'fix the bug in foo.ts',
+    ...overrides,
+  });
+}
+
+function makeStop(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    session_id: 'sess-001',
+    transcript_path: '/Users/test/.claude/projects/test/sess-001.jsonl',
+    cwd: '/projects/test',
+    hook_event_name: 'Stop',
+    last_assistant_message: 'Done, all tests pass.',
+    ...overrides,
+  });
+}
+
 function makeGeminiBeforeTool(overrides?: Record<string, unknown>): string {
   return JSON.stringify({
     hook_event_name: 'BeforeTool',
@@ -113,6 +189,33 @@ function makeGeminiAfterTool(overrides?: Record<string, unknown>): string {
     tool_name: 'write_file',
     tool_input: { file_path: '/tmp/out.ts', content: 'hello' },
     tool_response: { llmContent: 'Wrote file.', returnDisplay: 'Wrote file.' },
+    ...overrides,
+  });
+}
+
+function makeAntigravityPreToolUse(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    toolCall: { name: 'run_command', args: { CommandLine: 'npm test', Cwd: '/workspace/project' } },
+    stepIdx: 19,
+    conversationId: 'agy-conv-001',
+    workspacePaths: ['/workspace/project'],
+    transcriptPath: '/tmp/agy-transcript.jsonl',
+    artifactDirectoryPath: '/tmp/agy-artifacts',
+    ...overrides,
+  });
+}
+
+// Per https://antigravity.google/docs/hooks#posttooluse, PostToolUse carries
+// the same `toolCall` object as PreToolUse — only the optional `error` differs.
+function makeAntigravityPostToolUse(overrides?: Record<string, unknown>): string {
+  return JSON.stringify({
+    toolCall: { name: 'run_command', args: { CommandLine: 'npm test', Cwd: '/workspace/project' } },
+    stepIdx: 19,
+    error: '',
+    conversationId: 'agy-conv-001',
+    workspacePaths: ['/workspace/project'],
+    transcriptPath: '/tmp/agy-transcript.jsonl',
+    artifactDirectoryPath: '/tmp/agy-artifacts',
     ...overrides,
   });
 }
@@ -165,11 +268,60 @@ describe('collector-script', () => {
       expect(event.toolUseId).toBe('toolu_abc123');
     });
 
+    it('stamps event.platform from MCP_CLIENT when explicitly set', () => {
+      process.env.MCP_CLIENT = 'copilot-sdk';
+      processHook(makePreToolUse());
+
+      expect(readBufferEvents()[0]!.platform).toBe('copilot-sdk');
+    });
+
+    it('stamps event.platform from NEW_RELIC_AI_PLATFORM when MCP_CLIENT is absent', () => {
+      process.env.NEW_RELIC_AI_PLATFORM = 'cursor';
+      processHook(makePreToolUse());
+
+      expect(readBufferEvents()[0]!.platform).toBe('cursor');
+    });
+
+    it('stamps event.platform "claude-code" when only CLAUDECODE is set', () => {
+      // jest itself runs under Claude Code, so CLAUDECODE is already set in
+      // this process env — set it explicitly for clarity and to survive a
+      // future test environment that doesn't carry it ambiently.
+      process.env.CLAUDECODE = '1';
+      processHook(makePreToolUse());
+
+      expect(readBufferEvents()[0]!.platform).toBe('claude-code');
+    });
+
+    it('leaves event.platform unset when no platform signal is present', () => {
+      for (const key of CLAUDE_CODE_ENV_SIGNALS) delete process.env[key];
+      delete process.env.MCP_CLIENT;
+      delete process.env.NEW_RELIC_AI_PLATFORM;
+      processHook(makePreToolUse());
+
+      expect(readBufferEvents()[0]!.platform).toBeUndefined();
+    });
+
     it('captures transcript_path as transcriptPath', () => {
       processHook(makePreToolUse({ transcript_path: '/tmp/fake-session.jsonl' }));
 
       const event = readBufferEvents()[0]!;
       expect(event.transcriptPath).toBe('/tmp/fake-session.jsonl');
+    });
+
+    it('captures agent_id/agent_type as agentId/agentType', () => {
+      processHook(makePreToolUse({ agent_id: 'agent-abc123', agent_type: 'general-purpose' }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.agentId).toBe('agent-abc123');
+      expect(event.agentType).toBe('general-purpose');
+    });
+
+    it('omits agentId/agentType for the parent session (no agent_id sent)', () => {
+      processHook(makePreToolUse());
+
+      const event = readBufferEvents()[0]!;
+      expect(event.agentId).toBeUndefined();
+      expect(event.agentType).toBeUndefined();
     });
 
     it('does not include content fields by default', () => {
@@ -203,6 +355,40 @@ describe('collector-script', () => {
     });
   });
 
+  describe('processHook() — PowerShell (native Windows tool, no Git Bash)', () => {
+    // PowerShell is a real, first-party Claude Code tool (see
+    // code.claude.com/docs/en/tools-reference) — extractInputMeta() had no
+    // case for it, so toolInput stayed undefined and every PowerShell call
+    // serialized identically downstream.
+    it('stores command/description/timeout/run_in_background metadata, same as Bash', () => {
+      const input = {
+        command: 'Get-Process',
+        description: 'List processes',
+        timeout: 30000,
+        run_in_background: false,
+      };
+      processHook(makePreToolUse({ tool_name: 'PowerShell', tool_input: input }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.toolInput).toEqual({
+        command: 'Get-Process',
+        description: 'List processes',
+        timeout: 30000,
+        run_in_background: false,
+      });
+    });
+
+    it('redacts sensitive content in the command, same as Bash', () => {
+      const input = { command: '$env:API_KEY = "sk-1234567890abcdef"' };
+      processHook(makePreToolUse({ tool_name: 'PowerShell', tool_input: input }));
+
+      const event = readBufferEvents()[0]!;
+      const toolInput = event.toolInput as Record<string, unknown>;
+      expect(toolInput.command).not.toContain('sk-1234567890abcdef');
+      expect(toolInput.command).toContain('[REDACTED]');
+    });
+  });
+
   describe('processHook() — PostToolUse (toolOutput)', () => {
     it('stores output metadata fields when available', () => {
       const response = { exitCode: 0, stdout: 'lots of output here' };
@@ -211,6 +397,93 @@ describe('collector-script', () => {
       const event = readBufferEvents()[0]!;
       // Only exitCode is extracted, not raw stdout
       expect(event.toolOutput).toEqual({ exitCode: 0 });
+    });
+
+    it('keeps only the PR number from a gh pr create URL, never the output text', () => {
+      const response = {
+        stdout: 'Creating pull request for fix into main\n\nhttps://github.com/acme/app/pull/42\n',
+        stderr: '',
+      };
+      processHook(
+        makePostToolUse({
+          tool_name: 'Bash',
+          tool_input: { command: 'gh pr create --fill' },
+          tool_response: response,
+        }),
+      );
+
+      const event = readBufferEvents()[0]!;
+      expect(event.toolOutput).toEqual({ createdPrNumber: '42' });
+    });
+
+    it.each([
+      [
+        'two creates',
+        'gh pr create --base main --fill && gh pr create --base part-1 --fill',
+        'https://github.com/acme/app/pull/41\nhttps://github.com/acme/app/pull/42\n',
+      ],
+      [
+        'a comment on another PR',
+        'gh pr create --fill && gh pr comment 40 --body "supersedes #40"',
+        'https://github.com/acme/app/pull/41\nhttps://github.com/acme/app/pull/40#issuecomment-9\n',
+      ],
+    ])(
+      'keeps no PR number when the output names more than one PR (%s)',
+      (_label, command, stdout) => {
+        processHook(
+          makePostToolUse({
+            tool_name: 'Bash',
+            tool_input: { command },
+            tool_response: { stdout },
+          }),
+        );
+
+        expect(readBufferEvents()[0]!.toolOutput).toBeUndefined();
+      },
+    );
+
+    it('keeps the PR number when every PR URL in the output names the same PR', () => {
+      processHook(
+        makePostToolUse({
+          tool_name: 'Bash',
+          tool_input: { command: 'gh pr create --fill && gh pr comment --body "ready"' },
+          tool_response: {
+            stdout:
+              'https://github.com/acme/app/pull/41\nhttps://github.com/acme/app/pull/41#issuecomment-9\n',
+          },
+        }),
+      );
+
+      expect(readBufferEvents()[0]!.toolOutput).toEqual({ createdPrNumber: '41' });
+    });
+
+    it('ignores a PR URL in the output of a command that is not gh pr create', () => {
+      processHook(
+        makePostToolUse({
+          tool_name: 'Bash',
+          tool_input: { command: 'gh pr view 7' },
+          tool_response: { stdout: 'https://github.com/acme/app/pull/7\n' },
+        }),
+      );
+
+      expect(readBufferEvents()[0]!.toolOutput).toBeUndefined();
+    });
+
+    it('keeps the PR number from an MCP create_pull_request result', () => {
+      processHook(
+        makePostToolUse({
+          tool_name: 'mcp__github__create_pull_request',
+          tool_input: { owner: 'acme', repo: 'app', title: 't', head: 'b', base: 'main' },
+          tool_response: [
+            {
+              type: 'text',
+              text: '{"number":57,"html_url":"https://github.com/acme/app/pull/57"}',
+            },
+          ],
+        }),
+      );
+
+      expect(readBufferEvents()[0]!.toolOutput).toEqual({ createdPrNumber: '57' });
     });
 
     it('omits toolOutput when no parseable output fields exist', () => {
@@ -268,6 +541,17 @@ describe('collector-script', () => {
       });
     });
 
+    it('extracts Agent spawnedAgentId from tool_response', () => {
+      const response = { agentId: 'a4d2c8f1e0b3a297', completed: true };
+      processHook(makePostToolUse({ tool_name: 'Agent', tool_response: response }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.toolOutput).toEqual({
+        agentCompleted: true,
+        spawnedAgentId: 'a4d2c8f1e0b3a297',
+      });
+    });
+
     it('extracts Agent interrupted flag', () => {
       const response = { interrupted: true };
       processHook(makePostToolUse({ tool_name: 'Agent', tool_response: response }));
@@ -276,12 +560,249 @@ describe('collector-script', () => {
       expect(event.toolOutput).toEqual({ agentInterrupted: true });
     });
 
+    it('chains extractOutputMeta output into parseToolSpecificFields (production boundary)', () => {
+      const response = { agentId: 'a4d2c8f1e0b3a297', completed: true };
+      processHook(makePostToolUse({ tool_name: 'Agent', tool_response: response }));
+
+      const event = readBufferEvents()[0]!;
+      const fields = parseToolSpecificFields('Agent', undefined, event.toolOutput);
+
+      expect(fields.spawnedAgentId).toBe('a4d2c8f1e0b3a297');
+    });
+
     it('extracts Agent resultLength from content blocks', () => {
       const response = { content: [{ type: 'text', text: 'hello world' }] };
       processHook(makePostToolUse({ tool_name: 'Agent', tool_response: response }));
 
       const event = readBufferEvents()[0]!;
       expect(event.toolOutput).toEqual({ agentResultLength: 11 });
+    });
+
+    it('extracts Skill name and args length', () => {
+      const input = { skill: 'code-review', args: 'Check the error handling' };
+      processHook(makePreToolUse({ tool_name: 'Skill', tool_input: input }));
+
+      const event = readBufferEvents()[0]!;
+      const toolInput = event.toolInput as Record<string, unknown>;
+      expect(toolInput.skill).toBe('code-review');
+      expect(toolInput.argsLength).toBe('Check the error handling'.length);
+    });
+
+    it('caps Skill name to 128 characters', () => {
+      const longName = 'a'.repeat(200);
+      const input = { skill: longName };
+      processHook(makePreToolUse({ tool_name: 'Skill', tool_input: input }));
+
+      const event = readBufferEvents()[0]!;
+      const toolInput = event.toolInput as Record<string, unknown>;
+      expect((toolInput.skill as string).length).toBe(128);
+    });
+
+    it('omits toolInput when Skill has no parseable data', () => {
+      processHook(makePreToolUse({ tool_name: 'Skill', tool_input: {} }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.toolInput).toBeUndefined();
+    });
+  });
+
+  // VS Code Copilot agent hooks send the uniform PreToolUse/PostToolUse envelope
+  // but with VS Code's own tool names and camelCase tool_input keys — both deltas
+  // documented in the hooks FAQ (code.visualstudio.com/docs/copilot/customization/hooks).
+  // Note: Copilot CLI's own native lowerCamelCase hook config (preToolUse) is a
+  // DIFFERENT, incompatible payload shape with no hook_event_name field at all
+  // (confirmed against GitHub's hooks reference) — it is not what's exercised
+  // below. The Copilot CLI/SDK adapter (copilot-sdk) instead requires the
+  // PascalCase PreToolUse/PostToolUse config, which sends this same envelope.
+  describe('processHook() — VS Code Copilot hooks', () => {
+    function makeCopilotPreToolUse(overrides?: Record<string, unknown>): string {
+      return JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        tool_name: 'create_file',
+        tool_input: { filePath: '/src/new.ts', content: 'line1\nline2' },
+        tool_use_id: 'toolu_copilot_1',
+        session_id: 'copilot-sess-001',
+        cwd: '/projects/test',
+        timestamp: '2026-08-07T00:00:00.000Z',
+        ...overrides,
+      });
+    }
+
+    it('captures camelCase filePath as the common file_path meta field', () => {
+      processHook(makeCopilotPreToolUse());
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+      const toolInput = events[0]!.toolInput as Record<string, unknown>;
+      expect(toolInput.file_path).toBe('/src/new.ts');
+    });
+
+    it('extracts Write-style content metadata for create_file', () => {
+      processHook(makeCopilotPreToolUse());
+
+      const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+      expect(toolInput.content).toBeUndefined();
+      expect(toolInput.contentLength).toBe(11);
+      expect(toolInput.lineCount).toBe(2);
+    });
+
+    it('extracts Edit-style metadata from replace_string_in_file camelCase fields', () => {
+      processHook(
+        makeCopilotPreToolUse({
+          tool_name: 'replace_string_in_file',
+          tool_input: { filePath: '/src/a.ts', oldString: 'aaa\nbbb', newString: '' },
+        }),
+      );
+
+      const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+      expect(toolInput.oldStringLength).toBe(7);
+      expect(toolInput.oldLineCount).toBe(2);
+      expect(toolInput.newStringLength).toBe(0);
+      expect(toolInput.isDelete).toBe(true);
+    });
+
+    it('counts replacements for multi_replace_string_in_file', () => {
+      processHook(
+        makeCopilotPreToolUse({
+          tool_name: 'multi_replace_string_in_file',
+          tool_input: {
+            replacements: [
+              { filePath: '/a.ts', oldString: 'x', newString: 'y' },
+              { filePath: '/b.ts', oldString: 'p', newString: 'q' },
+            ],
+          },
+        }),
+      );
+
+      const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+      expect(toolInput.replacementsCount).toBe(2);
+    });
+
+    it('extracts Bash-style command metadata for run_in_terminal', () => {
+      processHook(
+        makeCopilotPreToolUse({
+          tool_name: 'run_in_terminal',
+          tool_input: { command: 'npm test', explanation: 'Run tests', isBackground: false },
+        }),
+      );
+
+      const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+      expect(toolInput.command).toBe('npm test');
+      expect(toolInput.description).toBe('Run tests');
+      expect(toolInput.run_in_background).toBe(false);
+    });
+
+    it('handles a plain-string tool_response on PostToolUse', () => {
+      processHook(
+        makeCopilotPreToolUse({
+          hook_event_name: 'PostToolUse',
+          tool_response: 'File edited successfully',
+        }),
+      );
+
+      const event = readBufferEvents()[0]!;
+      expect(event.mode).toBe('post');
+      expect(event.success).toBe(true);
+      expect(event.outputSize).toBeGreaterThan(0);
+    });
+
+    it('accepts a lowerCamelCase hook_event_name value (case-insensitive dispatch, e.g. for Kiro)', () => {
+      processHook(makeCopilotPreToolUse({ hook_event_name: 'preToolUse' }));
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0]!.mode).toBe('pre');
+      expect(events[0]!.tool).toBe('create_file');
+    });
+
+    // Payloads below are verbatim captures from a live Kiro install (42.08,
+    // macOS) — Kiro keys the file on `path` (not `file_path`) and edit strings on
+    // `oldStr`/`newStr`, so without these cases file_path was never extracted and
+    // unique_files_read / unique_files_modified reported zero.
+    describe('Kiro tool_input extraction', () => {
+      function makeKiroPreToolUse(overrides: Record<string, unknown> = {}): string {
+        return JSON.stringify({
+          session_id: 'sess_kiro_test',
+          hook_event_name: 'PreToolUse',
+          cwd: '/Users/dev/project',
+          tool_name: 'read_file',
+          tool_input: { path: 'cloudformation/export-env.sh', offset: null, limit: null },
+          ...overrides,
+        });
+      }
+
+      it('extracts file_path from read_file’s `path` key', () => {
+        processHook(makeKiroPreToolUse());
+
+        const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+        expect(toolInput.file_path).toBe('cloudformation/export-env.sh');
+      });
+
+      it('tolerates read_file’s null offset/limit without emitting them', () => {
+        processHook(makeKiroPreToolUse());
+
+        const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+        expect(toolInput.offset).toBeUndefined();
+        expect(toolInput.limit).toBeUndefined();
+      });
+
+      it('extracts read_file’s offset/limit when Kiro sends real numbers', () => {
+        processHook(makeKiroPreToolUse({ tool_input: { path: 'a.ts', offset: 10, limit: 50 } }));
+
+        const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+        expect(toolInput.offset).toBe(10);
+        expect(toolInput.limit).toBe(50);
+      });
+
+      it('extracts Edit-style metadata from str_replace’s oldStr/newStr', () => {
+        processHook(
+          makeKiroPreToolUse({
+            tool_name: 'str_replace',
+            tool_input: {
+              path: 'cloudformation/export-env.sh',
+              oldStr: '# CrowdStrike (empty)\nexport TF_VAR_CROWDSTRIKE_CID=""',
+              newStr: '# CrowdStrike (empty)\nexport TF_VAR_CROWDSTRIKE_CID="123"',
+              replace_all: false,
+            },
+          }),
+        );
+
+        const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+        expect(toolInput.file_path).toBe('cloudformation/export-env.sh');
+        expect(toolInput.oldLineCount).toBe(2);
+        expect(toolInput.newLineCount).toBe(2);
+        expect(toolInput.isDelete).toBe(false);
+        expect(toolInput.replace_all).toBe(false);
+      });
+
+      it('flags a str_replace that empties the target as a delete', () => {
+        processHook(
+          makeKiroPreToolUse({
+            tool_name: 'str_replace',
+            tool_input: { path: 'a.ts', oldStr: 'gone', newStr: '' },
+          }),
+        );
+
+        const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+        expect(toolInput.newStringLength).toBe(0);
+        expect(toolInput.isDelete).toBe(true);
+      });
+
+      // Guards the reason these are explicit cases: Grep/Glob also send `path`,
+      // where it is a search root. Promoting that to file_path would misreport
+      // searches as file access.
+      it('does not treat a Grep search root as a file path', () => {
+        processHook(
+          makeKiroPreToolUse({
+            tool_name: 'Grep',
+            tool_input: { pattern: 'TODO', path: '/Users/dev/project/src' },
+          }),
+        );
+
+        const toolInput = readBufferEvents()[0]!.toolInput as Record<string, unknown>;
+        expect(toolInput.file_path).toBeUndefined();
+        expect(toolInput.path).toBe('/Users/dev/project/src');
+      });
     });
   });
 
@@ -300,12 +821,42 @@ describe('collector-script', () => {
       expect(event.outputSize).toBeGreaterThan(0);
     });
 
+    it('captures agent_id/agent_type as agentId/agentType', () => {
+      processHook(makePostToolUse({ agent_id: 'agent-def456', agent_type: 'Explore' }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.agentId).toBe('agent-def456');
+      expect(event.agentType).toBe('Explore');
+    });
+
     it('captures session metadata', () => {
       processHook(makePostToolUse());
 
       const event = readBufferEvents()[0]!;
       expect(event.sessionId).toBe('sess-001');
       expect(event.toolUseId).toBe('toolu_def456');
+    });
+
+    it('captures native duration_ms as nativeDurationMs', () => {
+      processHook(makePostToolUse({ duration_ms: 842 }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.nativeDurationMs).toBe(842);
+    });
+
+    it('omits nativeDurationMs when duration_ms is absent', () => {
+      processHook(makePostToolUse());
+
+      const event = readBufferEvents()[0]!;
+      expect(event.nativeDurationMs).toBeUndefined();
+    });
+
+    it('ignores an invalid duration_ms (negative, NaN, or non-number)', () => {
+      processHook(makePostToolUse({ duration_ms: -5 }));
+      expect(readBufferEvents()[0]!.nativeDurationMs).toBeUndefined();
+
+      processHook(makePostToolUse({ duration_ms: 'not-a-number' }));
+      expect(readBufferEvents()[1]!.nativeDurationMs).toBeUndefined();
     });
   });
 
@@ -322,6 +873,13 @@ describe('collector-script', () => {
       expect(event.success).toBe(false);
       expect(event.error).toBe('Command exited with non-zero status code 1');
       expect(event.isInterrupt).toBe(false);
+    });
+
+    it('captures native duration_ms as nativeDurationMs', () => {
+      processHook(makePostToolUseFailure({ duration_ms: 1337 }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.nativeDurationMs).toBe(1337);
     });
 
     it('captures is_interrupt flag when true', () => {
@@ -348,6 +906,360 @@ describe('collector-script', () => {
       const event = readBufferEvents()[0]!;
       expect(event.error).not.toContain('sk-1234567890abcdef');
       expect(event.error).toContain('[REDACTED]');
+    });
+  });
+
+  describe('processHook() — StopFailure', () => {
+    it('writes an api_failure event with the raw errorType', () => {
+      processHook(makeStopFailure());
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+
+      const event = events[0]!;
+      expect(event.mode).toBe('api_failure');
+      expect(event.errorType).toBe('rate_limit');
+      expect(event.sessionId).toBe('abc123');
+    });
+
+    it('includes redacted error_details and last_assistant_message when recordContent=true', () => {
+      process.env.NEW_RELIC_AI_MCP_RECORD_CONTENT = 'true';
+
+      processHook(makeStopFailure());
+
+      const event = readBufferEvents()[0]!;
+      expect(event.errorDetails).toBe('429 Too Many Requests');
+      expect(event.lastAssistantMessage).toBe('API Error: Rate limit reached');
+    });
+
+    it('omits error_details and last_assistant_message when recordContent=false', () => {
+      processHook(makeStopFailure());
+
+      const event = readBufferEvents()[0]!;
+      expect(event.errorDetails).toBeUndefined();
+      expect(event.lastAssistantMessage).toBeUndefined();
+    });
+
+    it('redacts sensitive information in error_details and last_assistant_message', () => {
+      process.env.NEW_RELIC_AI_MCP_RECORD_CONTENT = 'true';
+
+      processHook(
+        makeStopFailure({
+          error_details: 'Authorization failed: Bearer eyJhbGciOiJIUzI1NiJ9.token.signature',
+          last_assistant_message: 'Failed: API_KEY = sk-1234567890abcdef',
+        }),
+      );
+
+      const event = readBufferEvents()[0]!;
+      expect(event.errorDetails).toContain('[REDACTED]');
+      expect(event.errorDetails).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+      expect(event.lastAssistantMessage).toContain('[REDACTED]');
+      expect(event.lastAssistantMessage).not.toContain('sk-1234567890abcdef');
+    });
+
+    it('JSON.stringifies a non-string error_details', () => {
+      process.env.NEW_RELIC_AI_MCP_RECORD_CONTENT = 'true';
+
+      processHook(makeStopFailure({ error_details: { code: 429, message: 'Too Many Requests' } }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.errorDetails).toBe('{"code":429,"message":"Too Many Requests"}');
+    });
+
+    it('defaults errorType to "unknown" when error is missing', () => {
+      processHook(makeStopFailure({ error: undefined }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.errorType).toBe('unknown');
+    });
+  });
+
+  describe('processHook() — SessionStart', () => {
+    it('writes a session_start event with all resume-cost fields', () => {
+      processHook(makeSessionStartResume());
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+
+      const event = events[0]!;
+      expect(event.mode).toBe('session_start');
+      expect(event.source).toBe('resume');
+      expect(event.secondsSinceLastResponse).toBe(5400);
+      expect(event.contextTokens).toBe(182340);
+      expect(event.promptCacheLikelyExpired).toBe(true);
+      expect(event.estimatedCacheWriteUsd).toBeCloseTo(1.1396);
+    });
+
+    it('omits the resume-cost fields for a plain startup (no resume fields sent)', () => {
+      processHook(
+        makeSessionStartResume({
+          source: 'startup',
+          seconds_since_last_response: undefined,
+          context_tokens: undefined,
+          prompt_cache_likely_expired: undefined,
+          estimated_cache_write_usd: undefined,
+        }),
+      );
+
+      const event = readBufferEvents()[0]!;
+      expect(event.source).toBe('startup');
+      expect(event.secondsSinceLastResponse).toBeUndefined();
+      expect(event.contextTokens).toBeUndefined();
+      expect(event.promptCacheLikelyExpired).toBeUndefined();
+      expect(event.estimatedCacheWriteUsd).toBeUndefined();
+    });
+
+    it('does not gate resume fields on recordContent', () => {
+      // source is a closed enum and the rest are numbers/booleans, not free text.
+      processHook(makeSessionStartResume());
+
+      const event = readBufferEvents()[0]!;
+      expect(event.source).toBe('resume');
+      expect(event.estimatedCacheWriteUsd).toBeCloseTo(1.1396);
+    });
+  });
+
+  describe('processHook() — InstructionsLoaded', () => {
+    it('writes an instructions_loaded event with filePath/memoryType/loadReason', () => {
+      processHook(makeInstructionsLoaded());
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+
+      const event = events[0]!;
+      expect(event.mode).toBe('instructions_loaded');
+      expect(event.filePath).toBe('/Users/test/project/CLAUDE.md');
+      expect(event.memoryType).toBe('Project');
+      expect(event.loadReason).toBe('session_start');
+    });
+
+    it('captures a lazy nested_traversal load for a subdirectory CLAUDE.md', () => {
+      processHook(
+        makeInstructionsLoaded({
+          file_path: '/Users/test/project/packages/api/CLAUDE.md',
+          memory_type: 'Project',
+          load_reason: 'nested_traversal',
+        }),
+      );
+
+      const event = readBufferEvents()[0]!;
+      expect(event.filePath).toBe('/Users/test/project/packages/api/CLAUDE.md');
+      expect(event.loadReason).toBe('nested_traversal');
+    });
+
+    it('defaults filePath to "unknown" when file_path is missing', () => {
+      processHook(makeInstructionsLoaded({ file_path: undefined }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.filePath).toBe('unknown');
+    });
+
+    it('does not gate filePath/memoryType/loadReason on recordContent', () => {
+      // Unlike StopFailure's error_details/last_assistant_message, these are
+      // path/enum metadata, not free-text content.
+      processHook(makeInstructionsLoaded());
+
+      const event = readBufferEvents()[0]!;
+      expect(event.filePath).toBe('/Users/test/project/CLAUDE.md');
+      expect(event.memoryType).toBe('Project');
+    });
+  });
+
+  describe('processHook() — PostModelSwitch', () => {
+    it('writes a model_switch event with fromModel/toModel/requestedModel/source', () => {
+      processHook(makePostModelSwitch());
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+
+      const event = events[0]!;
+      expect(event.mode).toBe('model_switch');
+      expect(event.fromModel).toBe('claude-sonnet-5');
+      expect(event.toModel).toBe('claude-opus-5');
+      expect(event.requestedModel).toBe('opus');
+      expect(event.source).toBe('command');
+    });
+
+    it('captures an automatic switch with requestedModel null', () => {
+      processHook(
+        makePostModelSwitch({
+          source: 'auto',
+          requested_model: null,
+        }),
+      );
+
+      const event = readBufferEvents()[0]!;
+      expect(event.source).toBe('auto');
+      expect(event.requestedModel).toBeNull();
+    });
+
+    it('defaults fromModel/toModel to "unknown" when absent', () => {
+      processHook(makePostModelSwitch({ from_model: undefined, to_model: undefined }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.fromModel).toBe('unknown');
+      expect(event.toModel).toBe('unknown');
+    });
+
+    it('does not gate fromModel/toModel/source on recordContent', () => {
+      // Model IDs are a closed-ish identifier vocabulary, not free-text content.
+      processHook(makePostModelSwitch());
+
+      const event = readBufferEvents()[0]!;
+      expect(event.fromModel).toBe('claude-sonnet-5');
+      expect(event.source).toBe('command');
+    });
+  });
+
+  describe('processHook() — PermissionRequest / PermissionDenied', () => {
+    it('writes a permission_request event with toolUseId and sessionId', () => {
+      processHook(
+        JSON.stringify({
+          hook_event_name: 'PermissionRequest',
+          tool_name: 'Bash',
+          tool_input: { command: 'rm -rf build' },
+          tool_use_id: 'toolu_perm1',
+          session_id: 'sess-001',
+          prompt_id: 'prompt-001',
+          cwd: '/projects/test',
+          permission_mode: 'default',
+        }),
+      );
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+      const event = events[0]!;
+      expect(event.mode).toBe('permission_request');
+      expect(event.tool).toBe('Bash');
+      expect(event.toolUseId).toBe('toolu_perm1');
+      expect(event.sessionId).toBe('sess-001');
+      expect(event.timestamp).toEqual(expect.any(Number));
+    });
+
+    it('writes a permission_denied event carrying a redacted deniedReason', () => {
+      processHook(
+        JSON.stringify({
+          hook_event_name: 'PermissionDenied',
+          tool_name: 'Bash',
+          tool_use_id: 'toolu_perm2',
+          session_id: 'sess-001',
+          denied_reason: 'Blocked by policy: Bearer eyJhbGciOiJIUzI1NiJ9.token.signature',
+        }),
+      );
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+      const event = events[0]!;
+      expect(event.mode).toBe('permission_denied');
+      expect(event.tool).toBe('Bash');
+      expect(event.toolUseId).toBe('toolu_perm2');
+      expect(event.deniedReason).toContain('Blocked by policy');
+      expect(event.deniedReason).toContain('[REDACTED]');
+      expect(event.deniedReason).not.toContain('eyJhbGciOiJIUzI1NiJ9');
+    });
+
+    it('drops a permission event with no tool_use_id without crashing', () => {
+      const stderrWriteSpy = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      processHook(
+        JSON.stringify({
+          hook_event_name: 'PermissionRequest',
+          tool_name: 'Bash',
+          session_id: 'sess-001',
+        }),
+      );
+      processHook(
+        JSON.stringify({
+          hook_event_name: 'PermissionDenied',
+          tool_name: 'Bash',
+          tool_use_id: '',
+          session_id: 'sess-001',
+        }),
+      );
+
+      expect(readBufferEvents()).toHaveLength(0);
+      expect(stderrWriteSpy).toHaveBeenCalledTimes(2);
+      stderrWriteSpy.mockRestore();
+    });
+
+    it('never writes hook decision output to stdout', () => {
+      processHook(
+        JSON.stringify({
+          hook_event_name: 'PermissionRequest',
+          tool_name: 'Bash',
+          tool_use_id: 'toolu_perm3',
+          session_id: 'sess-001',
+        }),
+      );
+
+      expect(stdoutSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('processHook() — UserPromptSubmit', () => {
+    it('writes a user_prompt_submit event with session metadata', () => {
+      processHook(makeUserPromptSubmit());
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+
+      const event = events[0]!;
+      expect(event.mode).toBe('user_prompt_submit');
+      expect(event.sessionId).toBe('sess-001');
+    });
+
+    it('never captures the prompt text, even with recordContent=true', () => {
+      process.env.NEW_RELIC_AI_MCP_RECORD_CONTENT = 'true';
+
+      processHook(makeUserPromptSubmit({ prompt: 'API_KEY = sk-1234567890abcdef' }));
+
+      const event = readBufferEvents()[0]!;
+      expect(JSON.stringify(event)).not.toContain('sk-1234567890abcdef');
+      expect(event.prompt).toBeUndefined();
+    });
+
+    it('captures leading slash token as slashCommand', () => {
+      processHook(makeUserPromptSubmit({ prompt: '/pstack:poteto-mode what model am I' }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.slashCommand).toBe('pstack:poteto-mode');
+      expect(JSON.stringify(event)).not.toContain('what model');
+    });
+
+    it('captures simple slash command without colon', () => {
+      processHook(makeUserPromptSubmit({ prompt: '/simplify this code' }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.slashCommand).toBe('simplify');
+    });
+
+    it('omits slashCommand when prompt does not start with slash', () => {
+      processHook(makeUserPromptSubmit({ prompt: 'hello /not-a-command' }));
+
+      const event = readBufferEvents()[0]!;
+      expect(event.slashCommand).toBeUndefined();
+    });
+  });
+
+  describe('processHook() — Stop', () => {
+    it('writes a stop event with session metadata', () => {
+      processHook(makeStop());
+
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+
+      const event = events[0]!;
+      expect(event.mode).toBe('stop');
+      expect(event.sessionId).toBe('sess-001');
+    });
+
+    it('never captures last_assistant_message, even with recordContent=true', () => {
+      process.env.NEW_RELIC_AI_MCP_RECORD_CONTENT = 'true';
+
+      processHook(makeStop({ last_assistant_message: 'API_KEY = sk-1234567890abcdef' }));
+
+      const event = readBufferEvents()[0]!;
+      expect(JSON.stringify(event)).not.toContain('sk-1234567890abcdef');
+      expect(event.lastAssistantMessage).toBeUndefined();
     });
   });
 
@@ -440,7 +1352,7 @@ describe('collector-script', () => {
     it('silently ignores unknown hook event names', () => {
       processHook(
         JSON.stringify({
-          hook_event_name: 'SessionStart',
+          hook_event_name: 'PreCompact',
           session_id: 'sess-001',
         }),
       );
@@ -1135,294 +2047,6 @@ describe('collector-script', () => {
     });
   });
 
-  describe('transcript token collection', () => {
-    it('getTranscriptPath builds correct path from cwd and sessionId', () => {
-      const path = getTranscriptPath('/Users/test/myproject', 'abc-123');
-      expect(path).toContain('.claude/projects/-Users-test-myproject/abc-123.jsonl');
-    });
-
-    it('getTranscriptPath returns null when sessionId is missing', () => {
-      expect(getTranscriptPath('/some/path', undefined)).toBeNull();
-    });
-
-    describe('WSL Windows path translation', () => {
-      const originalPlatform = process.platform;
-
-      afterEach(() => {
-        Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
-      });
-
-      it('translateWslPath converts a Windows drive path to its WSL mount on Linux', () => {
-        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
-        expect(translateWslPath('C:\\Users\\test\\.claude\\projects\\proj\\abc.jsonl')).toBe(
-          '/mnt/c/Users/test/.claude/projects/proj/abc.jsonl',
-        );
-      });
-
-      it('translateWslPath leaves POSIX paths unchanged on Linux', () => {
-        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
-        expect(translateWslPath('/home/test/.claude/projects/proj/abc.jsonl')).toBe(
-          '/home/test/.claude/projects/proj/abc.jsonl',
-        );
-      });
-
-      it('translateWslPath leaves Windows drive paths unchanged outside Linux', () => {
-        Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-        expect(translateWslPath('C:\\Users\\test\\abc.jsonl')).toBe('C:\\Users\\test\\abc.jsonl');
-      });
-
-      it('getTranscriptPath sanitizes a backslash-separated (Windows) cwd into the project dir name', () => {
-        const path = getTranscriptPath('C:\\Users\\test\\myproject', 'abc-123');
-        expect(path).toContain('.claude/projects/C:-Users-test-myproject/abc-123.jsonl');
-      });
-    });
-
-    it('readLastAssistantUsage extracts usage from transcript', () => {
-      const transcriptPath = resolve(tmpDir, 'test-transcript.jsonl');
-      const lines = [
-        JSON.stringify({ type: 'human', message: { content: 'hello' } }),
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            content: [{ type: 'text', text: 'hi' }],
-            usage: {
-              input_tokens: 100,
-              output_tokens: 50,
-              cache_creation_input_tokens: 200,
-              cache_read_input_tokens: 5000,
-            },
-          },
-        }),
-      ];
-      writeFileSync(transcriptPath, lines.join('\n') + '\n');
-
-      const usage = readLastAssistantUsage(transcriptPath);
-      expect(usage).toEqual({
-        input_tokens: 100,
-        output_tokens: 50,
-        cache_creation_input_tokens: 200,
-        cache_read_input_tokens: 5000,
-      });
-    });
-
-    it('readLastAssistantUsage returns null for non-existent file', () => {
-      expect(readLastAssistantUsage('/does/not/exist.jsonl')).toBeNull();
-    });
-
-    it('readLastAssistantUsage returns null for empty file', () => {
-      const transcriptPath = resolve(tmpDir, 'empty-transcript.jsonl');
-      writeFileSync(transcriptPath, '');
-      expect(readLastAssistantUsage(transcriptPath)).toBeNull();
-    });
-
-    it('readLastAssistantUsage picks the last assistant entry', () => {
-      const transcriptPath = resolve(tmpDir, 'multi-assistant.jsonl');
-      const lines = [
-        JSON.stringify({
-          type: 'assistant',
-          message: { usage: { input_tokens: 10, output_tokens: 5 } },
-        }),
-        JSON.stringify({ type: 'human', message: { content: 'more' } }),
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            usage: { input_tokens: 200, output_tokens: 80, cache_read_input_tokens: 9000 },
-          },
-        }),
-      ];
-      writeFileSync(transcriptPath, lines.join('\n') + '\n');
-
-      const usage = readLastAssistantUsage(transcriptPath);
-      expect(usage!.input_tokens).toBe(200);
-      expect(usage!.output_tokens).toBe(80);
-      expect(usage!.cache_read_input_tokens).toBe(9000);
-    });
-
-    it('collectTranscriptTokens writes a token event to buffer', () => {
-      const sessionId = 'test-session-abc';
-      const projectDir = tmpDir.replace(/\//g, '-');
-      const claudeHome = resolve(tmpDir, 'claude-home');
-      const claudeDir = resolve(claudeHome, 'projects', projectDir);
-      mkdirSync(claudeDir, { recursive: true });
-
-      const transcriptPath = resolve(claudeDir, `${sessionId}.jsonl`);
-      const transcriptLine = JSON.stringify({
-        type: 'assistant',
-        message: {
-          usage: { input_tokens: 500, output_tokens: 100, cache_read_input_tokens: 10000 },
-        },
-      });
-      writeFileSync(transcriptPath, transcriptLine + '\n');
-
-      process.env.NR_AI_OBSERVE_CLAUDE_HOME = claudeHome;
-
-      try {
-        collectTranscriptTokens({ cwd: tmpDir, session_id: sessionId });
-
-        const events = readBufferEvents();
-        const tokenEvents = events.filter((e) => e.mode === 'token');
-        expect(tokenEvents).toHaveLength(1);
-        expect(tokenEvents[0]).toMatchObject({
-          mode: 'token',
-          inputTokens: 500,
-          outputTokens: 100,
-          cacheReadTokens: 10000,
-          cacheCreationTokens: 0,
-          sessionId: sessionId,
-        });
-      } finally {
-        delete process.env.NR_AI_OBSERVE_CLAUDE_HOME;
-      }
-    });
-
-    it('readLastAssistantUsage skips synthetic assistant entries and walks back to a real one', () => {
-      const transcriptPath = resolve(tmpDir, 'with-synthetic.jsonl');
-      const lines = [
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            model: 'claude-opus-4-7',
-            usage: { input_tokens: 100, output_tokens: 50 },
-          },
-        }),
-        // Synthetic entry — Claude Code internal injection. Has usage but
-        // a fake model. Should be skipped so we keep the real model.
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            model: '<synthetic>',
-            usage: { input_tokens: 1, output_tokens: 1 },
-          },
-        }),
-      ];
-      writeFileSync(transcriptPath, lines.join('\n') + '\n');
-
-      const usage = readLastAssistantUsage(transcriptPath);
-      expect(usage?.model).toBe('claude-opus-4-7');
-      expect(usage?.input_tokens).toBe(100);
-    });
-
-    it('readLastAssistantUsage extracts the model from the assistant entry', () => {
-      const transcriptPath = resolve(tmpDir, 'with-model.jsonl');
-      const lines = [
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            model: 'claude-opus-4-7',
-            usage: { input_tokens: 100, output_tokens: 50 },
-          },
-        }),
-      ];
-      writeFileSync(transcriptPath, lines.join('\n') + '\n');
-
-      const usage = readLastAssistantUsage(transcriptPath);
-      expect(usage?.model).toBe('claude-opus-4-7');
-      expect(usage?.input_tokens).toBe(100);
-    });
-
-    it('collectTranscriptTokens uses the model from the transcript when present', () => {
-      const sessionId = 'test-session-model';
-      const projectDir = tmpDir.replace(/\//g, '-');
-      const claudeHome = resolve(tmpDir, 'claude-home-model');
-      const claudeDir = resolve(claudeHome, 'projects', projectDir);
-      mkdirSync(claudeDir, { recursive: true });
-
-      const transcriptPath = resolve(claudeDir, `${sessionId}.jsonl`);
-      const transcriptLine = JSON.stringify({
-        type: 'assistant',
-        message: {
-          model: 'claude-opus-4-7',
-          usage: { input_tokens: 200, output_tokens: 40 },
-        },
-      });
-      writeFileSync(transcriptPath, transcriptLine + '\n');
-
-      process.env.NR_AI_OBSERVE_CLAUDE_HOME = claudeHome;
-
-      try {
-        collectTranscriptTokens({ cwd: tmpDir, session_id: sessionId });
-
-        const events = readBufferEvents();
-        const tokenEvents = events.filter((e) => e.mode === 'token');
-        expect(tokenEvents).toHaveLength(1);
-        expect(tokenEvents[0].model).toBe('claude-opus-4-7');
-      } finally {
-        delete process.env.NR_AI_OBSERVE_CLAUDE_HOME;
-      }
-    });
-
-    it('collectTranscriptTokens uses transcript_path from hook payload over cwd-derived path', () => {
-      // Simulates a git worktree: cwd points at the worktree dir, but the real
-      // transcript lives under the parent project's dashed directory. The hook
-      // payload provides transcript_path directly, which must win.
-      const sessionId = 'test-session-worktree';
-      const claudeHome = resolve(tmpDir, 'claude-home-worktree');
-      const realTranscriptDir = resolve(claudeHome, 'projects', 'real-parent-project');
-      mkdirSync(realTranscriptDir, { recursive: true });
-
-      const realTranscriptPath = resolve(realTranscriptDir, `${sessionId}.jsonl`);
-      writeFileSync(
-        realTranscriptPath,
-        JSON.stringify({
-          type: 'assistant',
-          message: {
-            model: 'claude-opus-4-7',
-            usage: { input_tokens: 75, output_tokens: 25 },
-          },
-        }) + '\n',
-      );
-
-      // cwd would derive a path that does NOT exist on disk
-      const fakeWorktreeCwd = resolve(tmpDir, 'some-worktree-path');
-
-      process.env.NR_AI_OBSERVE_CLAUDE_HOME = claudeHome;
-
-      try {
-        collectTranscriptTokens({
-          cwd: fakeWorktreeCwd,
-          session_id: sessionId,
-          transcript_path: realTranscriptPath,
-        });
-
-        const events = readBufferEvents();
-        const tokenEvents = events.filter((e) => e.mode === 'token');
-        expect(tokenEvents).toHaveLength(1);
-        expect(tokenEvents[0].model).toBe('claude-opus-4-7');
-        expect(tokenEvents[0].inputTokens).toBe(75);
-      } finally {
-        delete process.env.NR_AI_OBSERVE_CLAUDE_HOME;
-      }
-    });
-
-    it('collectTranscriptTokens deduplicates when transcript size has not changed', () => {
-      const sessionId = 'test-session-dedup';
-      const projectDir = tmpDir.replace(/\//g, '-');
-      const claudeHome = resolve(tmpDir, 'claude-home2');
-      const claudeDir = resolve(claudeHome, 'projects', projectDir);
-      mkdirSync(claudeDir, { recursive: true });
-
-      const transcriptPath = resolve(claudeDir, `${sessionId}.jsonl`);
-      const transcriptLine = JSON.stringify({
-        type: 'assistant',
-        message: { usage: { input_tokens: 300, output_tokens: 60 } },
-      });
-      writeFileSync(transcriptPath, transcriptLine + '\n');
-
-      process.env.NR_AI_OBSERVE_CLAUDE_HOME = claudeHome;
-
-      try {
-        collectTranscriptTokens({ cwd: tmpDir, session_id: sessionId });
-        collectTranscriptTokens({ cwd: tmpDir, session_id: sessionId });
-
-        const events = readBufferEvents();
-        const tokenEvents = events.filter((e) => e.mode === 'token');
-        expect(tokenEvents).toHaveLength(1);
-      } finally {
-        delete process.env.NR_AI_OBSERVE_CLAUDE_HOME;
-      }
-    });
-  });
-
   // ---------------------------------------------------------------------------
   // Per-session buffer paths + PPID breadcrumb
   // ---------------------------------------------------------------------------
@@ -1517,6 +2141,27 @@ describe('collector-script', () => {
       expect(typeof firstStat).toBe('number');
     });
 
+    it('refreshes mtime on the short-circuit path so an active session never goes stale', () => {
+      writePpidBreadcrumb('sess-active');
+      const ppid = process.ppid;
+      const breadcrumbPath = resolve(tmpDir, 'session-by-ppid', `${ppid}.txt`);
+
+      // Simulate this breadcrumb having gone quiet for a while (e.g. no hook
+      // fired since before an MCP server restart) by backdating its mtime.
+      const oldMs = Date.now() - 60_000;
+      utimesSync(breadcrumbPath, oldMs / 1000, oldMs / 1000);
+      expect(statSync(breadcrumbPath).mtimeMs).toBeLessThan(Date.now() - 30_000);
+
+      // A subsequent hook call with the SAME session_id (content unchanged,
+      // short-circuit path) must still bump mtime — otherwise
+      // resolveFromBreadcrumb()'s staleness check (session-resolver.ts)
+      // would reject this breadcrumb forever after any MCP restart that
+      // keeps the same ppid and session_id.
+      writePpidBreadcrumb('sess-active');
+      expect(readFileSync(breadcrumbPath, 'utf-8')).toBe('sess-active');
+      expect(statSync(breadcrumbPath).mtimeMs).toBeGreaterThan(Date.now() - 5_000);
+    });
+
     it('processHook() drops the breadcrumb on every fire (idempotent overwrite)', () => {
       delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
       process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
@@ -1552,6 +2197,64 @@ describe('collector-script', () => {
       const ancestorCrumb = resolve(breadcrumbDir, `${fakeGrandpid}.txt`);
       expect(existsSync(ancestorCrumb)).toBe(true);
       expect(readFileSync(ancestorCrumb, 'utf-8')).toBe('sess-ancestor');
+    });
+  });
+
+  describe('writeCwdBreadcrumb()', () => {
+    beforeEach(() => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+    });
+
+    it('writes <storage>/session-by-cwd/<sanitized-cwd>.txt with the sessionId', () => {
+      writeCwdBreadcrumb('sess-bread', '/projects/test');
+      const breadcrumbPath = resolve(tmpDir, 'session-by-cwd', '-projects-test.txt');
+      expect(existsSync(breadcrumbPath)).toBe(true);
+      expect(readFileSync(breadcrumbPath, 'utf-8')).toBe('sess-bread');
+    });
+
+    it('sanitizes a backslash-separated (Windows) cwd, stripping the drive-letter colon too', () => {
+      writeCwdBreadcrumb('sess-win', 'C:\\Users\\test\\myproject');
+      const breadcrumbPath = resolve(tmpDir, 'session-by-cwd', 'C--Users-test-myproject.txt');
+      expect(existsSync(breadcrumbPath)).toBe(true);
+      expect(readFileSync(breadcrumbPath, 'utf-8')).toBe('sess-win');
+    });
+
+    it('strips the drive-letter colon so the breadcrumb filename has no embedded colon', () => {
+      writeCwdBreadcrumb('sess-colon', 'C:\\Users\\test\\myproject');
+      expect(existsSync(resolve(tmpDir, 'session-by-cwd', 'C--Users-test-myproject.txt'))).toBe(
+        true,
+      );
+      expect(existsSync(resolve(tmpDir, 'session-by-cwd', 'C:-Users-test-myproject.txt'))).toBe(
+        false,
+      );
+    });
+
+    it('no-ops when cwd is missing or empty', () => {
+      writeCwdBreadcrumb('sess-nocwd', undefined);
+      writeCwdBreadcrumb('sess-nocwd', '');
+      expect(existsSync(resolve(tmpDir, 'session-by-cwd'))).toBe(false);
+    });
+
+    it('rejects malformed sessionIds without writing', () => {
+      writeCwdBreadcrumb('../../escape', '/projects/test');
+      expect(existsSync(resolve(tmpDir, 'session-by-cwd', '-projects-test.txt'))).toBe(false);
+    });
+
+    it('short-circuits when content already matches', () => {
+      writeCwdBreadcrumb('sess-stable', '/projects/test');
+      const breadcrumbPath = resolve(tmpDir, 'session-by-cwd', '-projects-test.txt');
+      for (let i = 0; i < 50; i++) writeCwdBreadcrumb('sess-stable', '/projects/test');
+      expect(readFileSync(breadcrumbPath, 'utf-8')).toBe('sess-stable');
+    });
+
+    it('processHook() drops the cwd breadcrumb on every fire', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+
+      processHook(makePreToolUse({ session_id: 'sess-bc', cwd: '/projects/test' }));
+      const breadcrumbPath = resolve(tmpDir, 'session-by-cwd', '-projects-test.txt');
+      expect(readFileSync(breadcrumbPath, 'utf-8')).toBe('sess-bc');
     });
   });
 
@@ -1714,17 +2417,90 @@ describe('collector-script', () => {
       expect(calls).toEqual(['/dev/stdin', process.stdin.fd]);
     });
 
-    it('re-throws non-EACCES /dev/stdin errors without falling back to the fd', () => {
+    it('falls back to the inherited stdin fd when /dev/stdin is a socket (ENXIO)', () => {
+      // Reproduces VS Code Copilot Chat's hook spawn: an Electron/Node parent
+      // backs a `stdio: 'pipe'` child with a socketpair rather than a FIFO,
+      // and open() on a unix socket via /proc/self/fd fails with ENXIO even
+      // though the inherited fd 0 reads normally.
       Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
       const calls: Array<string | number> = [];
       _stdinFs.readFileSync = (pathOrFd) => {
         calls.push(pathOrFd);
-        const err = new Error("ENOENT: no such file or directory, open '/dev/stdin'");
-        (err as NodeJS.ErrnoException).code = 'ENOENT';
+        if (pathOrFd === '/dev/stdin') {
+          const err = new Error("ENXIO: no such device or address, open '/dev/stdin'");
+          (err as NodeJS.ErrnoException).code = 'ENXIO';
+          throw err;
+        }
+        return '{"hook_event_name":"PreToolUse"}';
+      };
+      expect(readStdinSync()).toBe('{"hook_event_name":"PreToolUse"}');
+      expect(calls).toEqual(['/dev/stdin', process.stdin.fd]);
+    });
+
+    it('propagates the error when the fd fallback also fails', () => {
+      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+      const calls: Array<string | number> = [];
+      _stdinFs.readFileSync = (pathOrFd) => {
+        calls.push(pathOrFd);
+        const err = new Error('EBADF: bad file descriptor, read');
+        (err as NodeJS.ErrnoException).code = 'EBADF';
         throw err;
       };
-      expect(() => readStdinSync()).toThrow('ENOENT');
-      expect(calls).toEqual(['/dev/stdin']);
+      expect(() => readStdinSync()).toThrow('EBADF');
+      expect(calls).toEqual(['/dev/stdin', process.stdin.fd]);
+    });
+  });
+
+  describe('collector-script — GitHub Copilot CLI tool_result payloads', () => {
+    // The Copilot CLI puts the tool outcome under `tool_result` with a
+    // `result_type` string, not under `tool_response` with a `success` boolean.
+    // Verified against real CLI hook payloads captured on v1.0.78.
+    const makeCopilotCliPost = (overrides: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        hook_event_name: 'PostToolUse',
+        session_id: 'cc25c3e5-5475-4c5b-861b-dc5637fd04da',
+        cwd: '/home/dev/project',
+        tool_name: 'Bash',
+        tool_input: { command: 'echo hi', description: 'Echo' },
+        tool_result: { result_type: 'success', text_result_for_llm: 'hi\n' },
+        ...overrides,
+      });
+
+    it('records a non-zero outputSize from tool_result', () => {
+      processHook(makeCopilotCliPost());
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0].mode).toBe('post');
+      expect(events[0].outputSize).toBeGreaterThan(0);
+    });
+
+    it('treats result_type "success" as a successful call', () => {
+      processHook(makeCopilotCliPost());
+      expect(readBufferEvents()[0].success).toBe(true);
+    });
+
+    it('treats result_type "failure" as a failed call', () => {
+      processHook(
+        makeCopilotCliPost({
+          tool_result: { result_type: 'failure', text_result_for_llm: 'boom' },
+        }),
+      );
+      expect(readBufferEvents()[0].success).toBe(false);
+    });
+
+    it('still prefers tool_response when both fields are present', () => {
+      processHook(
+        makeCopilotCliPost({
+          tool_response: { success: false },
+          tool_result: { result_type: 'success' },
+        }),
+      );
+      expect(readBufferEvents()[0].success).toBe(false);
+    });
+
+    it('defaults to success when neither field carries an outcome', () => {
+      processHook(makeCopilotCliPost({ tool_result: { text_result_for_llm: 'hi' } }));
+      expect(readBufferEvents()[0].success).toBe(true);
     });
   });
 
@@ -1768,7 +2544,7 @@ describe('collector-script', () => {
     });
 
     it('still ignores a genuinely unknown hook_event_name', () => {
-      processHook(makeGeminiBeforeTool({ hook_event_name: 'SessionStart' }));
+      processHook(makeGeminiBeforeTool({ hook_event_name: 'PreCompact' }));
       expect(readBufferEvents()).toHaveLength(0);
     });
   });
@@ -1794,6 +2570,131 @@ describe('collector-script', () => {
     it('does not write to stdout for a Gemini CLI-shaped event when neither env var is set', () => {
       processHook(makeGeminiBeforeTool());
       expect(stdoutSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('collector-script — Antigravity hook events (https://antigravity.google/docs/hooks)', () => {
+    it('writes a pre event with tool from toolCall.name and toolUseId from stepIdx', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      processHook(makeAntigravityPreToolUse(), 'PreToolUse');
+
+      const events = readBufferLines('agy-conv-001');
+      expect(events).toHaveLength(1);
+      const event = events[0]!;
+      expect(event.mode).toBe('pre');
+      expect(event.tool).toBe('run_command');
+      expect(event.toolUseId).toBe('19');
+      expect(event.sessionId).toBe('agy-conv-001');
+    });
+
+    it('replies with {"decision":"allow"} on stdout for PreToolUse', () => {
+      processHook(makeAntigravityPreToolUse(), 'PreToolUse');
+      expect(stdoutSpy).toHaveBeenCalledWith('{"decision":"allow"}\n');
+    });
+
+    it('writes a post event with tool from toolCall.name and toolUseId from stepIdx', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      processHook(makeAntigravityPostToolUse(), 'PostToolUse');
+
+      const events = readBufferLines('agy-conv-001');
+      expect(events).toHaveLength(1);
+      const event = events[0]!;
+      expect(event.mode).toBe('post');
+      expect(event.tool).toBe('run_command');
+      expect(event.toolUseId).toBe('19');
+      expect(event.success).toBe(true);
+    });
+
+    it('reports success: false when PostToolUse carries a non-empty error', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      processHook(makeAntigravityPostToolUse({ error: 'exit status 1' }), 'PostToolUse');
+
+      const events = readBufferLines('agy-conv-001');
+      const event = events[0]!;
+      expect(event.success).toBe(false);
+      expect(event.error).toBe('exit status 1');
+    });
+
+    it('omits toolUseId from both events when stepIdx is not a number', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      processHook(makeAntigravityPreToolUse({ stepIdx: undefined }), 'PreToolUse');
+      processHook(makeAntigravityPostToolUse({ stepIdx: undefined }), 'PostToolUse');
+
+      const events = readBufferLines('agy-conv-001');
+      expect(events.map((e) => e.mode)).toEqual(['pre', 'post']);
+      for (const event of events) expect(event).not.toHaveProperty('toolUseId');
+    });
+
+    it('replies with only {} on stdout for PostToolUse, never a decision field (#793)', () => {
+      processHook(makeAntigravityPostToolUse(), 'PostToolUse');
+      expect(stdoutSpy).toHaveBeenCalledTimes(1);
+      expect(stdoutSpy).toHaveBeenCalledWith('{}\n');
+    });
+
+    it('matches the event-name argument case-insensitively', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      processHook(makeAntigravityPostToolUse(), 'posttooluse');
+
+      expect(readBufferLines('agy-conv-001')[0]!.mode).toBe('post');
+      expect(stdoutSpy).toHaveBeenCalledWith('{}\n');
+    });
+
+    it("accepts the post-tool / pre-tool markers other platforms' hook commands use", () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      // No error key, so only the argument can mark this one as PostToolUse.
+      processHook(makeAntigravityPostToolUse({ error: undefined }), 'post-tool');
+      processHook(makeAntigravityPostToolUse(), 'pre-tool');
+
+      expect(readBufferLines('agy-conv-001').map((e) => e.mode)).toEqual(['post', 'pre']);
+      expect(stdoutSpy).toHaveBeenNthCalledWith(1, '{}\n');
+      expect(stdoutSpy).toHaveBeenNthCalledWith(2, '{"decision":"allow"}\n');
+    });
+
+    it('the PreToolUse argument wins over a payload carrying an error key', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      processHook(makeAntigravityPostToolUse(), 'PreToolUse');
+
+      expect(readBufferLines('agy-conv-001')[0]!.mode).toBe('pre');
+      expect(stdoutSpy).toHaveBeenCalledWith('{"decision":"allow"}\n');
+    });
+
+    it('without an event-name argument, treats a payload carrying an error key as PostToolUse', () => {
+      delete process.env.NEW_RELIC_AI_MCP_BUFFER_PATH;
+      process.env.NEW_RELIC_AI_MCP_STORAGE_PATH = tmpDir;
+      processHook(makeAntigravityPostToolUse());
+
+      expect(readBufferLines('agy-conv-001')[0]!.mode).toBe('post');
+      expect(stdoutSpy).toHaveBeenCalledTimes(1);
+      expect(stdoutSpy).toHaveBeenCalledWith('{}\n');
+    });
+
+    it('without an event-name argument, still treats a toolCall payload with no error key as PreToolUse', () => {
+      processHook(makeAntigravityPreToolUse());
+      expect(stdoutSpy).toHaveBeenCalledWith('{"decision":"allow"}\n');
+    });
+
+    it('ignores the event-name argument for payloads that name their own event', () => {
+      processHook(makePreToolUse(), 'PostToolUse');
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0]!.mode).toBe('pre');
+      expect(stdoutSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not misfire on a Claude Code PreToolUse payload (no toolCall key)', () => {
+      processHook(makePreToolUse());
+      // Claude Code's own pretooluse branch should still handle this, not the
+      // Antigravity one — same buffer file (no conversationId), tool preserved.
+      const events = readBufferEvents();
+      expect(events).toHaveLength(1);
+      expect(events[0]!.tool).toBe('Read');
     });
   });
 });

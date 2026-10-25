@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "newrelic-preflight": {
+      "command": "npx",
+      "args": ["-y", "@newrelic/preflight@${NEW_RELIC_AI_PREFLIGHT_VERSION:-latest}", "--stdio"]
+    }
+  }
+}

@@ -36,16 +36,7 @@ function resetStore(): void {
 }
 
 function renderSidebar(overrides: Partial<SidebarProps> = {}): void {
-  render(
-    <Sidebar
-      currentPath="/"
-      onNavigate={() => {}}
-      connected={true}
-      theme="dark"
-      onToggleTheme={() => {}}
-      {...overrides}
-    />,
-  );
+  render(<Sidebar currentPath="/" onNavigate={() => {}} {...overrides} />);
 }
 
 describe('Sidebar', () => {
@@ -58,15 +49,7 @@ describe('Sidebar', () => {
   });
 
   it('renders all four nav items', () => {
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     expect(screen.getByText('Today')).toBeInTheDocument();
     expect(screen.getByText('Sessions')).toBeInTheDocument();
     expect(screen.getByText('History')).toBeInTheDocument();
@@ -74,55 +57,13 @@ describe('Sidebar', () => {
   });
 
   it('highlights the active item', () => {
-    render(
-      <Sidebar
-        currentPath="/audit"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/audit" onNavigate={() => {}} />);
     const audit = screen.getByText('Audit').closest('button');
     expect(audit).toHaveAttribute('aria-current', 'page');
   });
 
-  it('shows ● live when connected=true', () => {
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
-    expect(screen.getByText(/live/i)).toBeInTheDocument();
-  });
-
-  it('shows ● reconnecting when connected=false', () => {
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={false}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
-    expect(screen.getByText(/reconnecting/i)).toBeInTheDocument();
-  });
-
   it('does not set aria-current on inactive items', () => {
-    render(
-      <Sidebar
-        currentPath="/audit"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/audit" onNavigate={() => {}} />);
     for (const label of ['Today', 'Sessions', 'History']) {
       const btn = screen.getByText(label).closest('button')!;
       expect(btn.hasAttribute('aria-current')).toBe(false);
@@ -130,15 +71,7 @@ describe('Sidebar', () => {
   });
 
   it('marks decorative icons aria-hidden inside nav buttons', () => {
-    const { container } = render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    const { container } = render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     const icons = container.querySelectorAll('nav button svg');
     expect(icons.length).toBe(7);
     for (const svg of Array.from(icons)) {
@@ -147,44 +80,20 @@ describe('Sidebar', () => {
   });
 
   it('labels the nav landmarks as "Observe" and "Analyze"', () => {
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     expect(screen.getByRole('navigation', { name: 'Observe' })).toBeInTheDocument();
     expect(screen.getByRole('navigation', { name: 'Analyze' })).toBeInTheDocument();
   });
 
   it('does not render an alert badge when no alerts are firing', () => {
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     expect(screen.queryByTestId('alert-badge')).toBeNull();
   });
 
   it('shows a numeric badge on Today when alerts are firing', () => {
     fireOne({ id: 'a', severity: 'warning' });
     fireOne({ id: 'b', severity: 'warning' });
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     const badge = screen.getByTestId('alert-badge');
     expect(badge.textContent).toBe('2');
     expect(badge).toHaveAttribute('aria-label', '2 firing alerts');
@@ -192,30 +101,14 @@ describe('Sidebar', () => {
 
   it('uses a singular aria-label when there is one alert', () => {
     fireOne({ id: 'a', severity: 'warning' });
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     expect(screen.getByTestId('alert-badge')).toHaveAttribute('aria-label', '1 firing alert');
   });
 
   it('tones the badge with the highest severity present', () => {
     fireOne({ id: 'a', severity: 'warning' });
     fireOne({ id: 'b', severity: 'critical' });
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     const badge = screen.getByTestId('alert-badge');
     expect(badge.getAttribute('data-severity')).toBe('critical');
     expect(badge.className).toContain('text-accent-red');
@@ -225,15 +118,7 @@ describe('Sidebar', () => {
     for (let i = 0; i < 100; i += 1) {
       fireOne({ id: `alert-${i}`, severity: 'warning' });
     }
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     const badge = screen.getByTestId('alert-badge');
     expect(badge.textContent).toBe('99+');
     expect(badge).toHaveAttribute('aria-label', '99+ firing alerts');
@@ -243,29 +128,13 @@ describe('Sidebar', () => {
     for (let i = 0; i < 99; i += 1) {
       fireOne({ id: `alert-${i}`, severity: 'warning' });
     }
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     expect(screen.getByTestId('alert-badge').textContent).toBe('99');
   });
 
   it('only shows the badge on the Today nav item, not on others', () => {
     fireOne({ id: 'a', severity: 'warning' });
-    render(
-      <Sidebar
-        currentPath="/"
-        onNavigate={() => {}}
-        connected={true}
-        theme="dark"
-        onToggleTheme={() => {}}
-      />,
-    );
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
     const todayBtn = screen.getByText('Today').closest('button')!;
     expect(todayBtn.querySelector('[data-testid="alert-badge"]')).not.toBeNull();
     for (const label of ['Sessions', 'History', 'Audit']) {

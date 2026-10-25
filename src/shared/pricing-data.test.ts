@@ -1,4 +1,5 @@
 import { DEFAULT_PRICING_TABLE } from './pricing-data.js';
+import { resolveModelPricing } from './pricing.js';
 
 describe('DEFAULT_PRICING_TABLE', () => {
   describe('Anthropic models', () => {
@@ -35,6 +36,34 @@ describe('DEFAULT_PRICING_TABLE', () => {
       expect(p.contextWindow).toBe(200_000);
     });
 
+    it('has claude-haiku-5-5 with prompt-length tiered rates', () => {
+      expect(DEFAULT_PRICING_TABLE['claude-haiku-5-5']).toEqual({
+        inputPerMTok: 0.1,
+        outputPerMTok: 0.5,
+        thinkingPerMTok: 0.5,
+        cacheReadPerMTok: 0.01,
+        cacheCreationPerMTok: 0.125,
+        contextWindow: 1_000_000,
+        tierThreshold: 100_000,
+        tierInputPerMTok: 0.5,
+        tierOutputPerMTok: 2.5,
+        tierThinkingPerMTok: 2.5,
+        tierCacheReadPerMTok: 0.05,
+      });
+    });
+
+    it('prices Bedrock claude-haiku-5-5 with the same 100k flat tier as first-party', () => {
+      const first = DEFAULT_PRICING_TABLE['claude-haiku-5-5'];
+      const global = DEFAULT_PRICING_TABLE['global.anthropic.claude-haiku-5-5'];
+      const geo = DEFAULT_PRICING_TABLE['anthropic.claude-haiku-5-5'];
+      expect(global).toEqual({ ...first });
+      expect(geo.tierThreshold).toBe(100_000);
+      expect(geo.tierInputPerMTok).toBeCloseTo(first.tierInputPerMTok! * 1.1, 5);
+      expect(geo.tierOutputPerMTok).toBeCloseTo(first.tierOutputPerMTok! * 1.1, 5);
+      expect(geo.tierThinkingPerMTok).toBeCloseTo(first.tierThinkingPerMTok! * 1.1, 5);
+      expect(geo.tierCacheReadPerMTok).toBeCloseTo(first.tierCacheReadPerMTok! * 1.1, 5);
+    });
+
     it('has claude-sonnet-4-20250514 with correct rates', () => {
       const p = DEFAULT_PRICING_TABLE['claude-sonnet-4-20250514'];
       expect(p).toBeDefined();
@@ -59,6 +88,21 @@ describe('DEFAULT_PRICING_TABLE', () => {
   });
 
   describe('Google Gemini models', () => {
+    it('has gemini-robotics-er-2-preview with introductory rates', () => {
+      expect(DEFAULT_PRICING_TABLE['gemini-robotics-er-2-preview']).toEqual({
+        inputPerMTok: 1,
+        outputPerMTok: 5,
+        thinkingPerMTok: 5,
+        contextWindow: 131_072,
+      });
+    });
+
+    it('resolves gemini-3.1-pro-preview-customtools to the 3.1 Pro Preview rates', () => {
+      expect(resolveModelPricing('gemini-3.1-pro-preview-customtools')).toEqual(
+        DEFAULT_PRICING_TABLE['gemini-3.1-pro-preview'],
+      );
+    });
+
     it('has gemini-2.5-pro with tiered pricing', () => {
       const p = DEFAULT_PRICING_TABLE['gemini-2.5-pro'];
       expect(p).toBeDefined();
@@ -101,31 +145,54 @@ describe('DEFAULT_PRICING_TABLE', () => {
   });
 
   describe('OpenAI models', () => {
-    it('has gpt-5.5 with correct rates and long-context tier', () => {
+    it('has gpt-5.5 with correct rates and flat long-context tier', () => {
       const p = DEFAULT_PRICING_TABLE['gpt-5.5'];
       expect(p).toBeDefined();
       expect(p.inputPerMTok).toBe(5);
       expect(p.outputPerMTok).toBe(30);
       expect(p.cacheReadPerMTok).toBe(0.5);
-      expect(p.contextWindow).toBe(1_000_000);
-      expect(p.tierThreshold).toBe(270_000);
-      expect(p.tierMode).toBe('marginal');
+      expect(p.contextWindow).toBe(1_050_000);
+      expect(p.tierThreshold).toBe(272_000);
+      // 'flat' is the default (tierMode omitted) — OpenAI bills the entire
+      // request at tier rates once inputTokens > threshold, output included.
+      expect(p.tierMode).toBeUndefined();
       expect(p.tierInputPerMTok).toBe(10);
-      // marginal mode ignores tierOutputPerMTok — must not be set (dead data).
-      expect(p.tierOutputPerMTok).toBeUndefined();
+      expect(p.tierOutputPerMTok).toBe(45);
     });
 
-    it('has gpt-5.4 with correct rates and long-context tier', () => {
+    it('has gpt-5.4 with correct rates and flat long-context tier', () => {
       const p = DEFAULT_PRICING_TABLE['gpt-5.4'];
       expect(p).toBeDefined();
       expect(p.inputPerMTok).toBe(2.5);
       expect(p.outputPerMTok).toBe(15);
       expect(p.cacheReadPerMTok).toBe(0.25);
-      expect(p.tierThreshold).toBe(270_000);
-      expect(p.tierMode).toBe('marginal');
+      expect(p.contextWindow).toBe(1_050_000);
+      expect(p.tierThreshold).toBe(272_000);
+      expect(p.tierMode).toBeUndefined();
       expect(p.tierInputPerMTok).toBe(5);
-      // marginal mode ignores tierOutputPerMTok — must not be set (dead data).
-      expect(p.tierOutputPerMTok).toBeUndefined();
+      expect(p.tierOutputPerMTok).toBe(22.5);
+    });
+
+    it('has gpt-5 as its own real entry, not aliased to gpt-5.5/5.6', () => {
+      const p = DEFAULT_PRICING_TABLE['gpt-5'];
+      expect(p).toBeDefined();
+      expect(p.inputPerMTok).toBe(1.25);
+      expect(p.outputPerMTok).toBe(10);
+      expect(p.contextWindow).toBe(400_000);
+    });
+
+    it('has the gpt-5.6 family (Sol/Terra/Luna) with correct rates and flat long-context tier', () => {
+      const sol = DEFAULT_PRICING_TABLE['gpt-5.6-sol'];
+      expect(sol).toBeDefined();
+      expect(sol.inputPerMTok).toBe(4);
+      expect(sol.outputPerMTok).toBe(20);
+      expect(sol.contextWindow).toBe(1_050_000);
+      expect(sol.tierThreshold).toBe(272_000);
+      expect(sol.tierInputPerMTok).toBe(8);
+      expect(sol.tierOutputPerMTok).toBe(30);
+
+      expect(DEFAULT_PRICING_TABLE['gpt-5.6-terra']).toBeDefined();
+      expect(DEFAULT_PRICING_TABLE['gpt-5.6-luna']).toBeDefined();
     });
 
     it('has gpt-5.4-mini and gpt-5.4-nano', () => {
@@ -159,9 +226,13 @@ describe('DEFAULT_PRICING_TABLE', () => {
       expect(p.thinkingPerMTok).toBeUndefined();
     });
 
-    it('has o3 — no separate thinkingPerMTok (reasoning billed via outputTokens)', () => {
+    it('has o3 at its current repriced rate — no separate thinkingPerMTok (reasoning billed via outputTokens)', () => {
       const p = DEFAULT_PRICING_TABLE['o3'];
       expect(p).toBeDefined();
+      // Repriced down from its April 2025 launch rate ($10/$40).
+      expect(p.inputPerMTok).toBe(2);
+      expect(p.outputPerMTok).toBe(8);
+      expect(p.cacheReadPerMTok).toBe(0.5);
       expect(p.thinkingPerMTok).toBeUndefined();
     });
 
@@ -177,6 +248,39 @@ describe('DEFAULT_PRICING_TABLE', () => {
 
     it('has gpt-3.5-turbo', () => {
       expect(DEFAULT_PRICING_TABLE['gpt-3.5-turbo']).toBeDefined();
+    });
+
+    it.each([
+      ['gpt-5.5-pro', 30, 180, undefined, 1_050_000],
+      ['gpt-5.4-pro', 30, 180, undefined, 1_050_000],
+      ['gpt-5.2', 1.75, 14, 0.175, 400_000],
+      ['gpt-5.2-pro', 21, 168, undefined, 400_000],
+      ['gpt-5.1', 1.25, 10, 0.125, 400_000],
+      ['gpt-5-nano', 0.05, 0.4, 0.005, 400_000],
+      ['gpt-5-pro', 15, 120, undefined, 400_000],
+      ['gpt-5.6-cyber', 12.5, 75, 1.25, 400_000],
+      ['gpt-4.1', 2, 8, 0.5, 1_047_576],
+      ['gpt-4.1-mini', 0.4, 1.6, 0.1, 1_047_576],
+      ['gpt-4.1-nano', 0.1, 0.4, 0.025, 1_047_576],
+      ['o1-pro', 150, 600, undefined, 200_000],
+      ['o3-pro', 20, 80, undefined, 200_000],
+      ['gpt-4o-2024-05-13', 5, 15, undefined, 128_000],
+      ['gpt-4-0613', 30, 60, undefined, 8_192],
+      ['gpt-3.5-turbo-instruct', 1.5, 2, undefined, 4_096],
+    ])('has %s catalog-gap entry with vendor rates', (key, input, output, cacheRead, ctx) => {
+      const p = DEFAULT_PRICING_TABLE[key];
+      expect(p.inputPerMTok).toBe(input);
+      expect(p.outputPerMTok).toBe(output);
+      expect(p.cacheReadPerMTok).toBe(cacheRead);
+      expect(p.contextWindow).toBe(ctx);
+    });
+
+    it.each(['gpt-5.5-pro', 'gpt-5.4-pro'])('%s re-prices the full request above 272k', (key) => {
+      const p = DEFAULT_PRICING_TABLE[key];
+      expect(p.tierThreshold).toBe(272_000);
+      expect(p.tierInputPerMTok).toBe(60);
+      expect(p.tierOutputPerMTok).toBe(270);
+      expect(p.tierMode).toBeUndefined();
     });
 
     it('all OpenAI entries have required fields', () => {
@@ -202,6 +306,80 @@ describe('DEFAULT_PRICING_TABLE', () => {
         expect(typeof p.outputPerMTok).toBe('number');
         expect(typeof p.contextWindow).toBe('number');
       }
+    });
+  });
+
+  describe('AWS Bedrock models', () => {
+    // Bare `anthropic.*` keys price the Geo/In-region tier; `global.anthropic.*`
+    // keys price the ~10%-cheaper Global tier. Every current-gen pair should
+    // be internally consistent: bare = global * 1.1 on every rate field.
+    it('prices bare anthropic.* keys at 1.1x their global.anthropic.* counterpart', () => {
+      const currentGenModels = [
+        'anthropic.claude-sonnet-5',
+        'anthropic.claude-sonnet-5-5',
+        'anthropic.claude-opus-5-5',
+        'anthropic.claude-fable-5',
+        'anthropic.claude-opus-5',
+        'anthropic.claude-opus-4-8',
+        'anthropic.claude-opus-4-7',
+        'anthropic.claude-sonnet-4-6',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+        'anthropic.claude-opus-4-6-v1',
+        'anthropic.claude-opus-4-5-20251101-v1:0',
+        'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'anthropic.claude-haiku-5-5',
+        'anthropic.claude-fable-5-1',
+        'anthropic.claude-mythos-5-1',
+      ];
+      for (const model of currentGenModels) {
+        const geo = DEFAULT_PRICING_TABLE[model];
+        const global = DEFAULT_PRICING_TABLE[`global.${model}`];
+        expect(geo).toBeDefined();
+        expect(global).toBeDefined();
+        expect(geo.inputPerMTok).toBeCloseTo(global.inputPerMTok * 1.1, 5);
+        expect(geo.outputPerMTok).toBeCloseTo(global.outputPerMTok * 1.1, 5);
+        expect(geo.cacheReadPerMTok).toBeCloseTo(global.cacheReadPerMTok! * 1.1, 5);
+        expect(geo.cacheCreationPerMTok).toBeCloseTo(global.cacheCreationPerMTok! * 1.1, 5);
+        expect(geo.contextWindow).toBe(global.contextWindow);
+      }
+    });
+
+    it('has Mythos and legacy Claude geo rates matching the AWS pricing page', () => {
+      const mythos = DEFAULT_PRICING_TABLE['anthropic.claude-mythos-preview'];
+      expect([
+        mythos.inputPerMTok,
+        mythos.outputPerMTok,
+        mythos.cacheCreationPerMTok,
+        mythos.cacheReadPerMTok,
+      ]).toEqual([27.5, 137.5, 34.375, 2.75]);
+      const opus41 = DEFAULT_PRICING_TABLE['anthropic.claude-opus-4-1-20250805-v1:0'];
+      expect([
+        opus41.inputPerMTok,
+        opus41.outputPerMTok,
+        opus41.cacheCreationPerMTok,
+        opus41.cacheReadPerMTok,
+      ]).toEqual([15, 75, 18.75, 1.5]);
+      const haiku3 = DEFAULT_PRICING_TABLE['anthropic.claude-3-haiku-20240307-v1:0'];
+      expect([haiku3.inputPerMTok, haiku3.outputPerMTok, haiku3.cacheReadPerMTok]).toEqual([
+        0.25,
+        1.25,
+        undefined,
+      ]);
+    });
+
+    it('has claude-sonnet-5 Geo/In-region rate confirmed exactly against AWS pricing data', () => {
+      const p = DEFAULT_PRICING_TABLE['anthropic.claude-sonnet-5'];
+      expect(p.inputPerMTok).toBe(2.2);
+      expect(p.outputPerMTok).toBe(11);
+      expect(p.cacheReadPerMTok).toBe(0.22);
+      expect(p.cacheCreationPerMTok).toBe(2.75);
+    });
+
+    it('has claude-sonnet-5 Global tier matching Anthropic direct-API pricing (Bedrock parity)', () => {
+      const bedrockGlobal = DEFAULT_PRICING_TABLE['global.anthropic.claude-sonnet-5'];
+      const directApi = DEFAULT_PRICING_TABLE['claude-sonnet-5'];
+      expect(bedrockGlobal.inputPerMTok).toBe(directApi.inputPerMTok);
+      expect(bedrockGlobal.outputPerMTok).toBe(directApi.outputPerMTok);
     });
   });
 

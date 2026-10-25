@@ -119,6 +119,27 @@ describe('WorkflowStore', () => {
     expect(complete[0].status).toBe('completed');
   });
 
+  // A killed/unfinished run's rollup may have no numeric durationMs at all.
+  // Coercing that to 0 would make it read as a confirmed-instant run and
+  // silently skew any average computed over duration_ms. It must read back
+  // as null (unknown), not 0.
+  it('reports duration_ms as null (not 0) when the rollup has no numeric durationMs', () => {
+    writeFileSync(
+      join(wfDir, 'wf_abc12345-6dd.json'),
+      makeWfJson({ durationMs: undefined, status: 'killed' }),
+    );
+    const store = new WorkflowStore({ projectsDir });
+    const rows = store.listRuns();
+    expect(rows[0].duration_ms).toBeNull();
+  });
+
+  it('still reports a real duration_ms of 0 as 0, not conflated with unknown', () => {
+    writeFileSync(join(wfDir, 'wf_abc12345-6dd.json'), makeWfJson({ durationMs: 0 }));
+    const store = new WorkflowStore({ projectsDir });
+    const rows = store.listRuns();
+    expect(rows[0].duration_ms).toBe(0);
+  });
+
   it('integrates getCostForRun for total_usd', () => {
     writeFileSync(join(wfDir, 'wf_abc12345-6dd.json'), makeWfJson());
     const store = new WorkflowStore({
@@ -127,6 +148,53 @@ describe('WorkflowStore', () => {
     });
     const rows = store.listRuns();
     expect(rows[0].total_usd).toBeCloseTo(4.56, 2);
+  });
+
+  // total_usd === null is ambiguous between "confirmed $0" and "this
+  // process never observed the run's cost". cost_unknown resolves that
+  // ambiguity when hasCostForRun is wired.
+  describe('cost_unknown', () => {
+    it('is false when total_usd is a real positive number', () => {
+      writeFileSync(join(wfDir, 'wf_abc12345-6dd.json'), makeWfJson());
+      const store = new WorkflowStore({
+        projectsDir,
+        getCostForRun: () => 4.56,
+        hasCostForRun: () => true,
+      });
+      expect(store.listRuns()[0].cost_unknown).toBe(false);
+    });
+
+    it('is false when hasCostForRun confirms a genuine $0 spend', () => {
+      writeFileSync(join(wfDir, 'wf_abc12345-6dd.json'), makeWfJson());
+      const store = new WorkflowStore({
+        projectsDir,
+        getCostForRun: () => 0,
+        hasCostForRun: () => true,
+      });
+      const row = store.listRuns()[0];
+      expect(row.total_usd).toBeNull();
+      expect(row.cost_unknown).toBe(false);
+    });
+
+    it('is true when hasCostForRun reports the cost was never observed', () => {
+      writeFileSync(join(wfDir, 'wf_abc12345-6dd.json'), makeWfJson());
+      const store = new WorkflowStore({
+        projectsDir,
+        getCostForRun: () => 0,
+        hasCostForRun: () => false,
+      });
+      const row = store.listRuns()[0];
+      expect(row.total_usd).toBeNull();
+      expect(row.cost_unknown).toBe(true);
+    });
+
+    it('defaults to true (conservative) when hasCostForRun is not wired at all', () => {
+      writeFileSync(join(wfDir, 'wf_abc12345-6dd.json'), makeWfJson());
+      const store = new WorkflowStore({ projectsDir }); // no getCostForRun/hasCostForRun
+      const row = store.listRuns()[0];
+      expect(row.total_usd).toBeNull();
+      expect(row.cost_unknown).toBe(true);
+    });
   });
 
   it('returns null when run not found', () => {

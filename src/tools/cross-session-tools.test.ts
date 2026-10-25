@@ -6,6 +6,7 @@ import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals
 jest.mock('../security/index.js', () => ({ validateSsrfUrl: jest.fn() }));
 
 import { validateSsrfUrl } from '../security/index.js';
+import { stagingHost } from '../shared/transport/http-client.js';
 import { existsSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,6 +21,7 @@ import { TaskDetector } from '../metrics/task-detector.js';
 import { PromptFeedbackEngine } from '../metrics/prompt-feedback.js';
 import { RecommendationEngine } from '../metrics/recommendation-engine.js';
 import { PersonalCoach } from '../metrics/personal-coach.js';
+import { ZERO_QUALITY_PROXY_COUNTS } from '../metrics/quality-proxy-tracker.js';
 import type { ToolCallRecord } from '../storage/types.js';
 import {
   handleGetSessionHistory,
@@ -29,6 +31,7 @@ import {
   handleGetClaudeMdImpact,
   handleGetCostPerOutcome,
   handleGetRecommendations,
+  handleGetModelRecommendation,
   handleGetPlatformComparison,
   handleGetTeamSummary,
   handleSubscribeDigest,
@@ -37,6 +40,7 @@ import {
   handleGetPersonalInsights,
   toFiniteNumber,
   registerCrossSessionTools,
+  getNerdgraphUrl,
 } from './cross-session-tools.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
@@ -63,6 +67,8 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
   return {
     sessionId: `sess-${now}-${Math.random().toString(36).slice(2)}`,
     sessionName: null,
+    sessionNameSource: null,
+    sessionIntent: null,
     repoName: null,
     startTime: now - 60_000,
     endTime: now,
@@ -71,6 +77,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     developer: 'alice',
     model: 'claude-sonnet-4-20250514',
     toolBreakdown: { Read: 5, Edit: 3, Bash: 2 },
+    skillBreakdown: {},
     filesRead: ['/src/index.ts'],
     filesModified: ['/src/index.ts'],
     linesAdded: 20,
@@ -81,6 +88,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     buildRunCount: 1,
     buildPassCount: 1,
     estimatedCostUsd: 0.05,
+    subagentCostUsd: 0,
     tokensInput: 5000,
     tokensOutput: 2000,
     tokensThinking: 1000,
@@ -88,6 +96,10 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     tokensCacheCreation: 0,
     cacheSavingsUsd: 0,
     efficiencyScore: 0.75,
+    toolSelectionMetrics: null,
+    modelBreakdown: {},
+    costByWorkflowRunId: {},
+    qualityProxy: { ...ZERO_QUALITY_PROXY_COUNTS },
     antiPatterns: [],
     taskCount: 1,
     taskSuccessRate: 1,
@@ -114,6 +126,24 @@ function makeToolCall(overrides?: Partial<ToolCallRecord>): ToolCallRecord {
     ...overrides,
   } as ToolCallRecord;
 }
+
+describe('getNerdgraphUrl', () => {
+  it('returns US endpoint by default', () => {
+    expect(getNerdgraphUrl(null)).toBe('https://api.newrelic.com/graphql');
+  });
+
+  it('returns staging endpoint', () => {
+    expect(getNerdgraphUrl('staging')).toBe(`https://${stagingHost('api')}/graphql`);
+  });
+
+  it('returns EU endpoint', () => {
+    expect(getNerdgraphUrl('eu')).toBe('https://api.eu.newrelic.com/graphql');
+  });
+
+  it('returns JP endpoint', () => {
+    expect(getNerdgraphUrl('jp')).toBe('https://api.jp.newrelic.com/graphql');
+  });
+});
 
 describe('Cross-session tool handlers', () => {
   // -------------------------------------------------------------------------
@@ -146,6 +176,28 @@ describe('Cross-session tool handlers', () => {
 
     expect(result.isError).toBe(true);
     expect(parsed.error).toBe('Invalid since date');
+  });
+
+  it('handleGetSessionHistory exposes skills as the sorted keys of skillBreakdown', () => {
+    store.saveSession(
+      makeSummary({
+        sessionId: 'sess-with-skills',
+        skillBreakdown: { simplify: 2, 'pstack:how': 1 },
+      }),
+    );
+    store.saveSession(makeSummary({ sessionId: 'sess-no-skills', skillBreakdown: {} }));
+
+    const result = handleGetSessionHistory(store, {});
+    const parsed = JSON.parse(result.content[0]!.text);
+
+    const withSkills = parsed.sessions.find(
+      (s: { session_id: string }) => s.session_id === 'sess-with-skills',
+    );
+    const withoutSkills = parsed.sessions.find(
+      (s: { session_id: string }) => s.session_id === 'sess-no-skills',
+    );
+    expect(withSkills.skills).toEqual(['pstack:how', 'simplify']);
+    expect(withoutSkills.skills).toEqual([]);
   });
 
   // -------------------------------------------------------------------------
@@ -248,6 +300,27 @@ describe('Cross-session tool handlers', () => {
   // -------------------------------------------------------------------------
   // 4. get_collaboration_profile
   // -------------------------------------------------------------------------
+
+  it('handleGetCollaborationProfile falls back to the configured developer, not "unknown"', () => {
+    store.saveSession(makeSummary({ sessionId: 's-dev', userMessages: 10, toolCallCount: 20 }));
+    const profiler = new CollaborationProfiler({ sessionStore: store });
+
+    const result = handleGetCollaborationProfile(profiler, {}, 'alice');
+    const parsed = JSON.parse(result.content[0]!.text);
+
+    expect(parsed.developer).toBe('alice');
+    expect(parsed.session_count).toBe(1);
+  });
+
+  it('handleGetCollaborationProfile reports insufficient data when the developer has no sessions', () => {
+    const profiler = new CollaborationProfiler({ sessionStore: store });
+
+    const result = handleGetCollaborationProfile(profiler, { developer: 'nobody' });
+    const parsed = JSON.parse(result.content[0]!.text);
+
+    expect(parsed.session_count).toBe(0);
+    expect(parsed.classification).toBe('Insufficient data');
+  });
 
   it('handleGetCollaborationProfile returns dimension scores and classification', () => {
     store.saveSession(
@@ -352,6 +425,44 @@ describe('Cross-session tool handlers', () => {
     expect(parsed).toHaveProperty('total_cost');
     expect(parsed).toHaveProperty('total_tasks');
     expect(parsed).toHaveProperty('roi_estimate');
+  });
+
+  it('handleGetCostPerOutcome reads persisted sessions when a session store is given', () => {
+    store.saveSession(
+      makeSummary({
+        sessionId: 'cpo-1',
+        toolCallCount: 4,
+        toolBreakdown: { Write: 1, Edit: 3 },
+        filesModified: ['/src/a.ts'],
+        testRunCount: 0,
+        testPassCount: 0,
+        estimatedCostUsd: 2,
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: 'cpo-2',
+        toolCallCount: 2,
+        toolBreakdown: { Edit: 2 },
+        filesModified: ['/state.json'],
+        testRunCount: 0,
+        testPassCount: 0,
+        estimatedCostUsd: 1,
+      }),
+    );
+
+    const result = handleGetCostPerOutcome(
+      new CostPerOutcomeAnalyzer(),
+      new TaskDetector(),
+      {},
+      store,
+    );
+    const parsed = JSON.parse(result.content[0]!.text);
+
+    expect(parsed.total_tasks).toBe(2);
+    expect(parsed.total_cost).toBe(3);
+    expect(parsed.outcome_distribution.feature.count).toBe(1);
+    expect(parsed.outcome_distribution.configuration.count).toBe(1);
   });
 
   it('handleGetCostPerOutcome filters tasks by since parameter', () => {
@@ -463,7 +574,6 @@ describe('Cross-session tool handlers', () => {
     const costPerOutcomeAnalyzer = new CostPerOutcomeAnalyzer();
 
     const engine = new RecommendationEngine({
-      sessionStore: store,
       trendAnalyzer,
       collaborationProfiler,
       claudeMdTracker,
@@ -484,6 +594,103 @@ describe('Cross-session tool handlers', () => {
     expect(rec).toHaveProperty('priority');
     expect(rec).toHaveProperty('detail');
     expect(rec).toHaveProperty('evidence');
+  });
+
+  // -------------------------------------------------------------------------
+  // 7b. handleGetModelRecommendation
+  // -------------------------------------------------------------------------
+
+  it('handleGetModelRecommendation returns model recommendation report', () => {
+    const trendAnalyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Create sessions with strong recommendation
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `sonnet-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.9,
+        }),
+      );
+      store.saveSession(
+        makeSummary({
+          sessionId: `opus-${i}`,
+          model: 'opus',
+          efficiencyScore: 0.6,
+        }),
+      );
+    }
+
+    const result = handleGetModelRecommendation(trendAnalyzer, {});
+    const parsed = JSON.parse(result.content[0]!.text);
+
+    expect(parsed).toHaveProperty('ranked');
+    expect(parsed).toHaveProperty('recommendedModel');
+    expect(parsed).toHaveProperty('confidence');
+    expect(parsed).toHaveProperty('byOutcome');
+    expect(parsed).toHaveProperty('generatedAt');
+    expect(parsed.recommendedModel).toBe('sonnet');
+    expect(parsed.confidence).toBe('high');
+  });
+
+  it('handleGetModelRecommendation returns error for invalid since date', () => {
+    const trendAnalyzer = new TrendAnalyzer({ sessionStore: store });
+
+    const result = handleGetModelRecommendation(trendAnalyzer, {
+      since: 'invalid-date',
+    });
+
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0]!.text);
+    expect(parsed.error).toContain('Invalid since date');
+  });
+
+  it('handleGetModelRecommendation respects developer filter', () => {
+    const trendAnalyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Alice with sonnet (better) and opus (worse) for comparison
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `alice-sonnet-${i}`,
+          developer: 'alice',
+          model: 'sonnet',
+          efficiencyScore: 0.9,
+        }),
+      );
+    }
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `alice-opus-${i}`,
+          developer: 'alice',
+          model: 'opus',
+          efficiencyScore: 0.5,
+        }),
+      );
+    }
+
+    // Bob with only haiku (should not affect Alice's recommendation)
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `bob-haiku-${i}`,
+          developer: 'bob',
+          model: 'haiku',
+          efficiencyScore: 0.7,
+        }),
+      );
+    }
+
+    const result = handleGetModelRecommendation(trendAnalyzer, {
+      developer: 'alice',
+    });
+    const parsed = JSON.parse(result.content[0]!.text);
+
+    // Alice should get sonnet recommendation (0.9 vs 0.5 = 0.4 gap)
+    // with high confidence (20 sessions) due to meaningful gap and comparable runner-up
+    expect(parsed.recommendedModel).toBe('sonnet');
+    expect(parsed.confidence).toBe('high');
   });
 
   // -------------------------------------------------------------------------
@@ -615,7 +822,7 @@ describe('Cross-session tool handlers', () => {
   });
 
   // -------------------------------------------------------------------------
-  // 12. get_platform_comparison — error_rate uses tool success, not task success (#101)
+  // 12. get_platform_comparison — error_rate uses tool success, not task success
   // -------------------------------------------------------------------------
 
   it('handleGetPlatformComparison error_rate reflects tool failures, not test pass rate', () => {
@@ -717,7 +924,6 @@ describe('Cross-session tool handlers', () => {
     });
     const costPerOutcomeAnalyzer = new CostPerOutcomeAnalyzer();
     const engine = new RecommendationEngine({
-      sessionStore: store,
       trendAnalyzer,
       collaborationProfiler,
       claudeMdTracker,
@@ -1155,6 +1361,7 @@ describe('registerCrossSessionTools()', () => {
       'nr_observe_get_claudemd_impact',
       'nr_observe_get_collaboration_profile',
       'nr_observe_get_cost_per_outcome',
+      'nr_observe_get_model_recommendation',
       'nr_observe_get_personal_insights',
       'nr_observe_get_platform_comparison',
       'nr_observe_get_recommendations',
@@ -1224,7 +1431,6 @@ describe('registerCrossSessionTools()', () => {
       costPerOutcomeAnalyzer,
       taskDetector: new TaskDetector(),
       recommendationEngine: new RecommendationEngine({
-        sessionStore: store,
         trendAnalyzer,
         collaborationProfiler,
         claudeMdTracker,
@@ -1241,6 +1447,7 @@ describe('registerCrossSessionTools()', () => {
       'nr_observe_get_claudemd_impact',
       'nr_observe_get_collaboration_profile',
       'nr_observe_get_cost_per_outcome',
+      'nr_observe_get_model_recommendation',
       'nr_observe_get_personal_insights',
       'nr_observe_get_platform_comparison',
       'nr_observe_get_recommendations',

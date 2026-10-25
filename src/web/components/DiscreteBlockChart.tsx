@@ -1,16 +1,22 @@
-import { useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { JSX } from 'react';
+import { createPortal } from 'react-dom';
 
 /**
  * Shared discrete-block chart used by the Today view's `ConcurrencyIndicator`
- * and the History view's per-day peak chart. Each item renders as a column of
- * stacked square blocks bottom-aligned within a fixed-height SVG. The SVG
- * scales horizontally to the container via `width="100%"` + `viewBox` +
- * `xMidYMax meet`. Tooltip placement uses `getBoundingClientRect` against the
- * actually-rendered column group rather than a viewBox-derived percentage, so
- * it survives BOTH the horizontal scale (Today's 96-bucket case where the
- * chart fills width) AND the centering offset (History's narrow-data case
- * where the chart is height-limited and centered with empty side margins).
+ * and `ForecastEodCard`, and the History view's per-day peak chart. Each item
+ * renders as a column of stacked square blocks bottom-aligned within a
+ * fixed-height SVG. The SVG scales horizontally to the container via
+ * `width="100%"` + `viewBox` + `xMidYMax meet`. Tooltip placement uses
+ * `getBoundingClientRect` against the actually-rendered column group rather
+ * than a viewBox-derived percentage, so it survives BOTH the horizontal scale
+ * (Today's 96-bucket case where the chart fills width) AND the centering
+ * offset (History's narrow-data case where the chart is height-limited and
+ * centered with empty side margins). The tooltip itself is portaled to
+ * `document.body` and positioned `fixed` from those same viewport
+ * coordinates, so it escapes any `overflow-hidden` ancestor (e.g. the
+ * `ConcurrencyIndicator` card clips its celebration-burst animation) instead
+ * of being clipped by it.
  */
 
 export interface DiscreteBlockChartItem {
@@ -21,6 +27,15 @@ export interface DiscreteBlockChartItem {
    * grid, `"06-09: 3"` for the daily-peak grid).
    */
   readonly tooltip: string;
+  /**
+   * Explicit peak flag, sourced from the caller's raw (pre-quantization)
+   * value. When omitted, peak defaults to `count === effectiveMax` — correct
+   * for integer counts (ConcurrencyIndicator, History's daily-peak grid) but
+   * wrong when `count` is itself a quantized block count (e.g. dollars
+   * rounded into blocks), where two different raw values can round to the
+   * same top block and falsely tie for peak.
+   */
+  readonly isPeak?: boolean;
 }
 
 export interface DiscreteBlockChartProps {
@@ -32,6 +47,17 @@ export interface DiscreteBlockChartProps {
    */
   readonly maxCount?: number;
   readonly ariaLabel: string;
+  /**
+   * Quantizes every column into at most this many blocks: the tallest
+   * column renders exactly `levels` blocks, the rest scale proportionally
+   * (`Math.ceil(count / effectiveMax * levels)`, 0 stays 0). Lets columns
+   * built from very different raw units (dollars, call counts, concurrency)
+   * share one visual scale. Tooltips still show the caller's raw value via
+   * `item.tooltip` — this only changes how many blocks are drawn.
+   * Default undefined preserves the original one-block-per-count behavior
+   * (History's per-day peak grid and other existing callers are unaffected).
+   */
+  readonly levels?: number;
 }
 
 // Sourced from `--color-chart-block` / `--color-chart-block-peak` in
@@ -49,9 +75,27 @@ export function DiscreteBlockChart({
   data,
   maxCount,
   ariaLabel,
+  levels,
 }: DiscreteBlockChartProps): JSX.Element | null {
-  const containerRef = useRef<HTMLDivElement>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number; text: string } | null>(null);
+
+  // The tooltip's position is captured once, on mouseEnter, from the
+  // anchor's getBoundingClientRect(). It doesn't track the anchor on
+  // scroll, so a scroll while hovering would leave it visually detached
+  // from the block it's describing — dismiss it instead of showing a
+  // stale position. `capture: true` on scroll catches scrolling of any
+  // ancestor scroll container, not just the window itself (inner-element
+  // scroll events don't bubble in the normal phase).
+  useEffect(() => {
+    if (!tooltip) return;
+    const dismiss = (): void => setTooltip(null);
+    window.addEventListener('scroll', dismiss, { capture: true });
+    window.addEventListener('resize', dismiss);
+    return () => {
+      window.removeEventListener('scroll', dismiss, { capture: true });
+      window.removeEventListener('resize', dismiss);
+    };
+  }, [tooltip]);
 
   // Empty-state: render nothing so callers can show their own empty UI in
   // the surrounding layout rather than reserving height for a blank chart.
@@ -60,14 +104,20 @@ export function DiscreteBlockChart({
   }
 
   const effectiveMax = Math.max(maxCount ?? 0, ...data.map((d) => d.count), 1);
-  const chartHeight = effectiveMax * (BLOCK_SIZE + BLOCK_GAP);
+  const chartLevels = levels ?? effectiveMax;
+  const chartHeight = chartLevels * (BLOCK_SIZE + BLOCK_GAP);
   const chartWidth = data.length * COL_WIDTH;
 
+  // Raw count when `levels` is unset; otherwise scale so the tallest
+  // column renders exactly `levels` blocks.
+  const blockCount = (count: number): number =>
+    levels === undefined ? count : count <= 0 ? 0 : Math.ceil((count / effectiveMax) * levels);
+
   return (
-    <div ref={containerRef} className="relative">
+    <>
       <svg
         width="100%"
-        height={chartHeight}
+        style={{ height: 'auto', maxHeight: chartHeight, display: 'block' }}
         role="img"
         aria-label={ariaLabel}
         viewBox={`0 0 ${chartWidth} ${chartHeight}`}
@@ -76,8 +126,23 @@ export function DiscreteBlockChart({
       >
         {data.map((item, colIdx) => {
           const blocks: JSX.Element[] = [];
-          for (let b = 0; b < item.count; b++) {
-            const isPeak = item.count === effectiveMax;
+          if (item.count === 0) {
+            // A faint track cell keeps the time axis readable when most
+            // columns are empty; without it a quiet day reads as a narrow chart.
+            blocks.push(
+              <rect
+                key={`${colIdx}-track`}
+                x={colIdx * COL_WIDTH}
+                y={chartHeight - (BLOCK_SIZE + BLOCK_GAP)}
+                width={BLOCK_SIZE}
+                height={BLOCK_SIZE}
+                rx={1}
+                fill="var(--color-surface-5)"
+              />,
+            );
+          }
+          for (let b = 0; b < blockCount(item.count); b++) {
+            const isPeak = item.isPeak ?? item.count === effectiveMax;
             blocks.push(
               <rect
                 key={`${colIdx}-${b}`}
@@ -96,9 +161,6 @@ export function DiscreteBlockChart({
             <g
               key={colIdx}
               onMouseEnter={(e) => {
-                const parent = containerRef.current;
-                if (!parent) return;
-                const parentRect = parent.getBoundingClientRect();
                 // Anchor the tooltip to the topmost visible block when the
                 // column has any (`heatmap-cell` rects, ordered bottom-to-top
                 // in render order — last is highest); fall back to the
@@ -110,8 +172,8 @@ export function DiscreteBlockChart({
                 const anchor = blocks[blocks.length - 1] ?? target;
                 const bounds = anchor.getBoundingClientRect();
                 setTooltip({
-                  x: bounds.left - parentRect.left + bounds.width / 2,
-                  y: bounds.top - parentRect.top,
+                  x: bounds.left + bounds.width / 2,
+                  y: bounds.top,
                   text: item.tooltip,
                 });
               }}
@@ -128,22 +190,24 @@ export function DiscreteBlockChart({
           );
         })}
       </svg>
-      {tooltip && (
-        <div
-          className="absolute px-1.5 py-0.5 bg-bg-elevated border border-border-subtle text-[10px] text-ink-base rounded-md shadow-md pointer-events-none whitespace-nowrap tabular-nums"
-          // Tooltip bottom-edge sits 4 px above the column's topmost block.
-          // Computed in container-relative pixels via getBoundingClientRect,
-          // so it survives the SVG's scale + centering under
-          // `xMidYMax meet`.
-          style={{
-            left: tooltip.x,
-            top: tooltip.y,
-            transform: 'translate(-50%, calc(-100% - 4px))',
-          }}
-        >
-          {tooltip.text}
-        </div>
-      )}
-    </div>
+      {tooltip &&
+        createPortal(
+          <div
+            className="fixed z-50 px-1.5 py-0.5 bg-bg-elevated border border-border-subtle text-[10px] text-ink-base rounded-md shadow-md pointer-events-none whitespace-nowrap tabular-nums"
+            // Tooltip bottom-edge sits 4 px above the column's topmost block,
+            // in viewport pixels from getBoundingClientRect, so it survives
+            // the SVG's scale + centering under `xMidYMax meet` and paints
+            // above every ancestor's overflow/stacking context.
+            style={{
+              left: tooltip.x,
+              top: tooltip.y,
+              transform: 'translate(-50%, calc(-100% - 4px))',
+            }}
+          >
+            {tooltip.text}
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }

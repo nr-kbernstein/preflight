@@ -34,6 +34,7 @@ jest.mock('./schedule.js', () => ({
   removeDashboardDaemon: jest.fn(() => false),
   getDashboardDaemonStatus: jest.fn(() => ({ installed: false, readable: false })),
   resolveBinaryPath: jest.fn(() => '/usr/local/bin/preflight'),
+  resolveNamedBinaryOnPath: jest.fn(() => null),
 }));
 jest.mock('./install-helper.js', () => ({
   mergeSettings: jest.fn((s: unknown) => s),
@@ -43,6 +44,22 @@ jest.mock('./install-helper.js', () => ({
   detectSettingsPath: jest.fn(() => '/tmp/settings.json'),
   detectMcpConfigPath: jest.fn(() => '/tmp/mcp.json'),
   generateNrConfig: jest.fn(() => ({})),
+}));
+jest.mock('./copilot-install-helper.js', () => ({
+  detectCopilotHooksPath: jest.fn(() => '/tmp/copilot-hooks.json'),
+  detectVsCodeMcpPath: jest.fn(() => '/tmp/vscode-mcp.json'),
+  detectVsCodeSettingsPath: jest.fn(() => '/tmp/vscode-settings.json'),
+  mergeCopilotHooksFile: jest.fn((s: unknown) => s),
+  removeCopilotHooksFile: jest.fn((s: unknown) => s),
+  mergeVsCodeMcpConfig: jest.fn((s: unknown) => s),
+  removeVsCodeMcpConfig: jest.fn((s: unknown) => s),
+  mergeVsCodeSettings: jest.fn((s: unknown) => s),
+  removeVsCodeHookFilesLocationsEntry: jest.fn((s: unknown) => s),
+  applyHookCollisionFix: jest.fn(() => ({ applied: false, reason: 'claude-hooks-absent' })),
+  installCopilotSdkExtension: jest.fn(() => ({ copied: false, reason: 'exists' })),
+}));
+jest.mock('../hooks/copilot-sdk-extension-health.js', () => ({
+  copilotSdkExtensionInstallPath: jest.fn(() => '/tmp/copilot-extension/extension.mjs'),
 }));
 jest.mock('./platform.js', () => ({
   isWsl: jest.fn(() => false),
@@ -75,6 +92,7 @@ import * as scheduleMod from './schedule.js';
 import * as platformMod from './platform.js';
 import { runInstallCli } from './cli.js';
 import * as installHelperMod from './install-helper.js';
+import * as copilotInstallHelperMod from './copilot-install-helper.js';
 import * as configMod from '../config.js';
 import * as setupWizardMod from './setup-wizard.js';
 
@@ -89,6 +107,20 @@ const mockedSchedule = scheduleMod as unknown as {
   installDashboardDaemon: jest.Mock;
   getDashboardDaemonStatus: jest.Mock;
   resolveBinaryPath: jest.Mock;
+  resolveNamedBinaryOnPath: jest.Mock;
+};
+const mockedCopilotHelper = copilotInstallHelperMod as unknown as {
+  detectCopilotHooksPath: jest.Mock;
+  detectVsCodeMcpPath: jest.Mock;
+  detectVsCodeSettingsPath: jest.Mock;
+  mergeCopilotHooksFile: jest.Mock;
+  removeCopilotHooksFile: jest.Mock;
+  mergeVsCodeMcpConfig: jest.Mock;
+  removeVsCodeMcpConfig: jest.Mock;
+  mergeVsCodeSettings: jest.Mock;
+  removeVsCodeHookFilesLocationsEntry: jest.Mock;
+  applyHookCollisionFix: jest.Mock;
+  installCopilotSdkExtension: jest.Mock;
 };
 const mockedPlatform = platformMod as unknown as {
   isWsl: jest.Mock;
@@ -108,6 +140,11 @@ const mockedSetupWizard = {
 };
 
 describe('schedule subcommand', () => {
+  const mockedFsForSchedule = fsMod as unknown as {
+    existsSync: jest.Mock;
+    realpathSync: jest.Mock;
+  };
+  const mockedChildForSchedule = childMod as unknown as { execFileSync: jest.Mock };
   let stdoutSpy: ReturnType<typeof jest.spyOn>;
   let exitSpy: ReturnType<typeof jest.spyOn>;
   const savedPlatform = process.platform;
@@ -121,12 +158,48 @@ describe('schedule subcommand', () => {
         throw new Error(`process.exit(${String(code)})`);
       });
     Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+    mockedFsForSchedule.realpathSync.mockReturnValue('/home/user/preflight/dist/index.js');
+    mockedFsForSchedule.existsSync.mockImplementation(
+      (p: unknown) => String(p) === '/home/user/preflight/package.json',
+    );
+    mockedChildForSchedule.execFileSync.mockReset();
+    mockedChildForSchedule.execFileSync.mockReturnValue('/home/user/preflight');
   });
 
   afterEach(() => {
     stdoutSpy.mockRestore();
     exitSpy.mockRestore();
     Object.defineProperty(process, 'platform', { value: savedPlatform, configurable: true });
+    mockedFsForSchedule.existsSync.mockImplementation(() => false);
+    mockedFsForSchedule.realpathSync.mockImplementation((p: unknown) => p);
+    mockedChildForSchedule.execFileSync.mockReset();
+  });
+
+  function mockHomebrewEntryPoint(): void {
+    const mFs = fsMod as unknown as { existsSync: jest.Mock; realpathSync: jest.Mock };
+    mFs.realpathSync.mockReturnValue(
+      '/opt/homebrew/Cellar/preflight/1.57.4/libexec/lib/node_modules/@newrelic/preflight/dist/index.js',
+    );
+    mFs.existsSync.mockImplementation(
+      (p: unknown) =>
+        String(p) ===
+        '/opt/homebrew/Cellar/preflight/1.57.4/libexec/lib/node_modules/@newrelic/preflight/package.json',
+    );
+  }
+
+  it('refuses --time on a Homebrew install and points at brew upgrade', async () => {
+    mockHomebrewEntryPoint();
+    await expect(runInstallCli(['schedule', '--time', '08:00'])).rejects.toThrow('process.exit(1)');
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('brew upgrade preflight');
+    expect(mockedSchedule.installSchedule).not.toHaveBeenCalled();
+  });
+
+  it('still allows --disable on a Homebrew install so an existing schedule can be removed', async () => {
+    mockHomebrewEntryPoint();
+    mockedSchedule.removeSchedule.mockReturnValue(true);
+    await runInstallCli(['schedule', '--disable']);
+    expect(mockedSchedule.removeSchedule).toHaveBeenCalled();
   });
 
   it('prints status when no flags given and no schedule installed', async () => {
@@ -155,6 +228,33 @@ describe('schedule subcommand', () => {
     const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
     expect(output).toContain('plist unreadable');
     expect(output).toContain('reinstall');
+  });
+
+  it('refuses --time on a package-manager install with the upgrade hint and does not install', async () => {
+    mockedFsForSchedule.realpathSync.mockReturnValue(
+      '/usr/local/lib/node_modules/@newrelic/preflight/dist/index.js',
+    );
+    mockedFsForSchedule.existsSync.mockImplementation(
+      (p: unknown) => String(p) === '/usr/local/lib/node_modules/@newrelic/preflight/package.json',
+    );
+    mockedChildForSchedule.execFileSync.mockImplementation(() => {
+      throw new Error('not a repository');
+    });
+    await expect(runInstallCli(['schedule', '--time', '08:00'])).rejects.toThrow('process.exit(1)');
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('package manager');
+    expect(output).toContain('npm install -g @newrelic/preflight@latest');
+    expect(mockedSchedule.installSchedule).not.toHaveBeenCalled();
+  });
+
+  it('still allows --disable on a package-manager install so a stale schedule can be removed', async () => {
+    mockedFsForSchedule.realpathSync.mockReturnValue('/usr/local/lib/node_modules/p/dist/index.js');
+    mockedChildForSchedule.execFileSync.mockImplementation(() => {
+      throw new Error('not a repository');
+    });
+    mockedSchedule.removeSchedule.mockReturnValue(true);
+    await runInstallCli(['schedule', '--disable']);
+    expect(mockedSchedule.removeSchedule).toHaveBeenCalled();
   });
 
   it('installs schedule with --time 08:00', async () => {
@@ -468,6 +568,30 @@ describe('platform resolution via install', () => {
     expect(mockedHelper.mergeSettings).toHaveBeenCalledWith(expect.anything(), expect.anything(), {
       platform: 'wsl-linux-cc',
     });
+  });
+
+  // Regression guard: the VS Code double-count fix must apply regardless of
+  // which installer (Claude or Copilot) ran most recently — not just from
+  // `preflight install --copilot`. See applyHookCollisionFix's own on-disk
+  // checks in copilot-install-helper.ts for why this is safe to call
+  // unconditionally even when Copilot was never installed.
+  it('calls applyHookCollisionFix with claudeHooksJustInstalled, using the fixed desktop settings path', async () => {
+    mockedPlatform.isWsl.mockReturnValue(false);
+    await runInstallCli(['install']);
+    expect(mockedCopilotHelper.applyHookCollisionFix).toHaveBeenCalledWith({
+      claudeSettingsPath: `${homedir()}/.claude/settings.json`,
+      copilotHooksPath: expect.anything(),
+      vsCodeSettingsPath: expect.anything(),
+      claudeHooksJustInstalled: true,
+    });
+  });
+
+  it('prints the double-count-fix confirmation when applyHookCollisionFix applies it', async () => {
+    mockedPlatform.isWsl.mockReturnValue(false);
+    mockedCopilotHelper.applyHookCollisionFix.mockReturnValue({ applied: true });
+    await runInstallCli(['install']);
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('Disabled duplicate Claude-format hook reading in VS Code');
   });
 });
 
@@ -1227,6 +1351,58 @@ describe('platform transition matrix', () => {
     expect(stderr).toContain('invalid JSON');
     stderrSpy.mockRestore();
   });
+
+  // The --mode option's help text claims "default: local", but nothing
+  // enforced that — omitting --mode meant no mode was written, and
+  // loadMcpConfig's own fallback resolves that to 'cloud'. Defaulting to
+  // 'local' only when no mode is already saved makes the help text true
+  // without disturbing existing users.
+  it('bare install with no existing config and no --mode defaults mode to local', async () => {
+    mFs.readFileSync.mockReturnValue('{}');
+
+    await runInstallCli(['install']);
+
+    const written = findConfigWrite(mFs);
+    expect(written?.mode).toBe('local');
+  });
+
+  it('install without --mode preserves an existing saved mode (no silent overwrite)', async () => {
+    mFs.readFileSync.mockReturnValue(JSON.stringify({ mode: 'cloud' }));
+
+    await runInstallCli(['install', '--windows-cc']);
+
+    const written = findConfigWrite(mFs);
+    expect(written?.mode).toBe('cloud');
+  });
+
+  it('install --mode local overrides an existing saved cloud mode', async () => {
+    mFs.readFileSync.mockReturnValue(JSON.stringify({ mode: 'cloud' }));
+
+    await runInstallCli(['install', '--mode', 'local']);
+
+    const written = findConfigWrite(mFs);
+    expect(written?.mode).toBe('local');
+  });
+
+  it('install --mode both persists mode both on a fresh config', async () => {
+    mFs.readFileSync.mockReturnValue('{}');
+
+    await runInstallCli(['install', '--mode', 'both']);
+
+    const written = findConfigWrite(mFs);
+    expect(written?.mode).toBe('both');
+  });
+
+  it('install without --mode on an existing credentialed config with no mode key does not write one (protects pre-existing cloud users)', async () => {
+    mFs.readFileSync.mockReturnValue(
+      JSON.stringify({ licenseKey: 'NRLIC-existing', accountId: '12345' }),
+    );
+
+    await runInstallCli(['install']);
+
+    const written = findConfigWrite(mFs);
+    expect(written?.mode).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1325,6 +1501,27 @@ describe('preflight update', () => {
     const output = getOutput();
     expect(output).toContain('package manager');
     expect(output).toContain('npm install -g @newrelic/preflight@latest');
+  });
+
+  it('exits 1 with the brew upgrade hint on a Homebrew install, without running git', async () => {
+    mFs.realpathSync.mockReturnValue(
+      '/opt/homebrew/Cellar/preflight/1.57.4/libexec/lib/node_modules/@newrelic/preflight/dist/index.js',
+    );
+    mFs.existsSync.mockImplementation(
+      (p: unknown) =>
+        String(p) ===
+        '/opt/homebrew/Cellar/preflight/1.57.4/libexec/lib/node_modules/@newrelic/preflight/package.json',
+    );
+    // On Apple Silicon the Cellar is inside Homebrew's own git repo.
+    mExec.execFileSync.mockImplementation((cmd: unknown, args: unknown) => {
+      if (cmd === 'git' && (args as string[]).includes('--show-toplevel')) return '/opt/homebrew';
+    });
+    await expect(runInstallCli(['update'])).rejects.toThrow('process.exit(1)');
+    const output = getOutput();
+    expect(output).toContain('installed with Homebrew');
+    expect(output).toContain('brew upgrade preflight');
+    expect(output).not.toContain('npm install -g');
+    expect(mExec.execFileSync).not.toHaveBeenCalled();
   });
 
   it('exits 1 with git-not-installed hint when git binary is absent', async () => {
@@ -1718,8 +1915,10 @@ describe('preflight local', () => {
     (LocalStore as unknown as jest.Mock).mockImplementation(() => ({
       getLiveLocalDashboardProcess: jest.fn(() => null),
       listLocalInstances: jest.fn(() => []),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     const readlineMod = await import('node:readline/promises');
     (readlineMod.createInterface as unknown as jest.Mock).mockReturnValue({
@@ -1736,17 +1935,19 @@ describe('preflight local', () => {
     return stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
   }
 
-  it('prints "No --local processes running" when the registry is empty', async () => {
+  it('prints "No --local or --stdio processes running" when the registry is empty', async () => {
     await runInstallCli(['local']);
-    expect(getOutput()).toContain('No --local processes running');
+    expect(getOutput()).toContain('No --local or --stdio processes running');
   });
 
   it('cleans up dead entries silently before listing', async () => {
     (LocalStore as unknown as jest.Mock).mockImplementation(() => ({
       getLiveLocalDashboardProcess: jest.fn(() => null),
       listLocalInstances: jest.fn(() => []),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 2),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     await runInstallCli(['local']);
     expect(getOutput()).toContain('Cleaned up 2 stale registry entries');
@@ -1759,8 +1960,10 @@ describe('preflight local', () => {
         { pid: 100, argv: [], cwd: '/owner', startedAt: Date.now() - 1000, alive: true },
         { pid: 200, argv: [], cwd: '/orphan', startedAt: Date.now() - 2000, alive: true },
       ]),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     await runInstallCli(['local']);
     const output = getOutput();
@@ -1777,8 +1980,10 @@ describe('preflight local', () => {
       listLocalInstances: jest.fn(() => [
         { pid: 200, argv: [], cwd: '/orphan', startedAt: Date.now(), alive: true },
       ]),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     const killSpy = jest.spyOn(process, 'kill');
     await runInstallCli(['local']);
@@ -1795,8 +2000,10 @@ describe('preflight local', () => {
         { pid: 200, argv: [], cwd: '/orphan-a', startedAt: Date.now(), alive: true },
         { pid: 201, argv: [], cwd: '/orphan-b', startedAt: Date.now(), alive: true },
       ]),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance,
+      removeStdioHeartbeat: jest.fn(),
     }));
     const readlineMod = await import('node:readline/promises');
     const questionMock = jest.fn(async (_prompt: string) => 'y');
@@ -1832,8 +2039,10 @@ describe('preflight local', () => {
       listLocalInstances: jest.fn(() => [
         { pid: 200, argv: [], cwd: '/orphan', startedAt: Date.now(), alive: true },
       ]),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     const readlineMod = await import('node:readline/promises');
     (readlineMod.createInterface as unknown as jest.Mock).mockReturnValue({
@@ -1859,8 +2068,10 @@ describe('preflight local', () => {
       listLocalInstances: jest.fn(() => [
         { pid: 200, argv: [], cwd: '/orphan', startedAt: Date.now(), alive: true },
       ]),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     const readlineMod = await import('node:readline/promises');
     (readlineMod.createInterface as unknown as jest.Mock).mockReturnValue({
@@ -1901,8 +2112,10 @@ describe('preflight local', () => {
       listLocalInstances: jest.fn(() => [
         { pid: 200, argv: [], cwd: '/orphan', startedAt: Date.now(), alive: true },
       ]),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     const killSpy = jest.spyOn(process, 'kill');
     await runInstallCli(['local', '--clean']);
@@ -1916,14 +2129,121 @@ describe('preflight local', () => {
       listLocalInstances: jest.fn(() => [
         { pid: 100, argv: [], cwd: '/owner', startedAt: Date.now(), alive: true },
       ]),
+      listActiveStdioInstances: jest.fn(() => []),
       gcDeadLocalInstances: jest.fn(() => 0),
       unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
     }));
     const killSpy = jest.spyOn(process, 'kill');
     await runInstallCli(['local', '--clean']);
     expect(getOutput()).toContain('No orphaned processes to clean up');
     expect(killSpy).not.toHaveBeenCalled();
     killSpy.mockRestore();
+  });
+
+  it('lists live --stdio processes alongside --local ones', async () => {
+    (LocalStore as unknown as jest.Mock).mockImplementation(() => ({
+      getLiveLocalDashboardProcess: jest.fn(() => null),
+      listLocalInstances: jest.fn(() => []),
+      listActiveStdioInstances: jest.fn(() => [
+        {
+          pid: 300,
+          sessionId: 'sess-a',
+          argv: ['/opt/preflight/dist/index.js', '--stdio'],
+          cwd: '/home/user/project',
+          startedAt: Date.now() - 5000,
+          alive: true,
+        },
+      ]),
+      gcDeadLocalInstances: jest.fn(() => 0),
+      unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
+    }));
+    await runInstallCli(['local']);
+    const output = getOutput();
+    expect(output).toContain('1 --stdio MCP process(es) running');
+    expect(output).toContain('PID 300');
+    expect(output).toContain('sess-a');
+    expect(output).toContain('/home/user/project');
+    expect(output).toContain('restart Claude Code');
+  });
+
+  it('does not list a --stdio process whose heartbeat PID is dead', async () => {
+    (LocalStore as unknown as jest.Mock).mockImplementation(() => ({
+      getLiveLocalDashboardProcess: jest.fn(() => null),
+      listLocalInstances: jest.fn(() => []),
+      listActiveStdioInstances: jest.fn(() => [
+        {
+          pid: 999999,
+          sessionId: 'sess-dead',
+          argv: [],
+          cwd: null,
+          startedAt: Date.now(),
+          alive: false,
+        },
+      ]),
+      gcDeadLocalInstances: jest.fn(() => 0),
+      unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
+    }));
+    await runInstallCli(['local']);
+    expect(getOutput()).toContain('No --local or --stdio processes running');
+  });
+
+  it('--clean auto-kills a --stdio process whose recorded binary no longer exists on disk', async () => {
+    const removeStdioHeartbeat = jest.fn();
+    (LocalStore as unknown as jest.Mock).mockImplementation(() => ({
+      getLiveLocalDashboardProcess: jest.fn(() => null),
+      listLocalInstances: jest.fn(() => []),
+      listActiveStdioInstances: jest.fn(() => [
+        {
+          pid: 300,
+          sessionId: 'sess-orphan',
+          argv: ['/opt/preflight-uninstalled/dist/index.js', '--stdio'],
+          cwd: '/home/user/project',
+          startedAt: Date.now(),
+          alive: true,
+        },
+      ]),
+      gcDeadLocalInstances: jest.fn(() => 0),
+      unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat,
+    }));
+    const killSpy = jest.spyOn(process, 'kill').mockImplementation(() => {
+      throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+    });
+    await runInstallCli(['local', '--clean']);
+    expect(killSpy).toHaveBeenCalledWith(300, 'SIGTERM');
+    expect(removeStdioHeartbeat).toHaveBeenCalledWith('sess-orphan');
+    killSpy.mockRestore();
+  });
+
+  it('--clean does not touch a live --stdio process whose recorded binary still exists on disk', async () => {
+    (LocalStore as unknown as jest.Mock).mockImplementation(() => ({
+      getLiveLocalDashboardProcess: jest.fn(() => null),
+      listLocalInstances: jest.fn(() => []),
+      listActiveStdioInstances: jest.fn(() => [
+        {
+          // process.execPath is always a real, existing file — a safe stand-in
+          // for "the binary is still on disk".
+          pid: 300,
+          sessionId: 'sess-fine',
+          argv: [process.execPath],
+          cwd: '/home/user/project',
+          startedAt: Date.now(),
+          alive: true,
+        },
+      ]),
+      gcDeadLocalInstances: jest.fn(() => 0),
+      unregisterLocalInstance: jest.fn(),
+      removeStdioHeartbeat: jest.fn(),
+    }));
+    (fsMod.existsSync as jest.Mock).mockImplementation((p: unknown) => p === process.execPath);
+    const killSpy = jest.spyOn(process, 'kill');
+    await runInstallCli(['local', '--clean']);
+    expect(killSpy).not.toHaveBeenCalledWith(300, 'SIGTERM');
+    killSpy.mockRestore();
+    (fsMod.existsSync as jest.Mock).mockImplementation(() => false);
   });
 });
 
@@ -2021,6 +2341,65 @@ describe('preflight doctor', () => {
     const prog = createInstallProgram();
     await prog.parseAsync(['node', 'preflight', 'doctor']);
     expect(process.exitCode).toBe(2);
+  });
+
+  it('outputs JSON when --json flag is passed', async () => {
+    const checks = [
+      makeCheck({ check: 'Config valid', status: 'ok' }),
+      makeCheck({ check: 'Hooks wired', status: 'ok' }),
+    ];
+    mockedRunDiagnostics.mockResolvedValue(checks);
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    await prog.parseAsync(['node', 'preflight', 'doctor', '--json']);
+    const jsonOutput = output.join('');
+    const parsed = JSON.parse(jsonOutput);
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(parsed).toHaveLength(2);
+    expect(parsed.map((c: DiagnosticCheck) => c.check)).toEqual(['Config valid', 'Hooks wired']);
+  });
+
+  it('exits with 0 when --json and all checks pass', async () => {
+    mockedRunDiagnostics.mockResolvedValue([makeCheck({ status: 'ok' })]);
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    await prog.parseAsync(['node', 'preflight', 'doctor', '--json']);
+    expect(process.exitCode).toBe(0);
+  });
+
+  it('exits with 1 when --json and a check fails', async () => {
+    mockedRunDiagnostics.mockResolvedValue([
+      makeCheck({ status: 'fail', detail: 'bad', fix: 'preflight install' }),
+    ]);
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    await prog.parseAsync(['node', 'preflight', 'doctor', '--json']);
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('exits with 2 when --json and only warnings', async () => {
+    mockedRunDiagnostics.mockResolvedValue([makeCheck({ status: 'warn', detail: 'mild' })]);
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    await prog.parseAsync(['node', 'preflight', 'doctor', '--json']);
+    expect(process.exitCode).toBe(2);
+  });
+
+  it('does not print banner when --json is passed', async () => {
+    mockedRunDiagnostics.mockResolvedValue([makeCheck({ status: 'ok' })]);
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    await prog.parseAsync(['node', 'preflight', 'doctor', '--json']);
+    expect(output.join('')).not.toContain('Running diagnostics');
+  });
+
+  it('writes exactly one JSON line and nothing else when --json is passed', async () => {
+    const checks = [makeCheck({ check: 'Config valid', status: 'ok' })];
+    mockedRunDiagnostics.mockResolvedValue(checks);
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    await prog.parseAsync(['node', 'preflight', 'doctor', '--json']);
+    expect(output.join('')).toBe(`${JSON.stringify(checks)}\n`);
   });
 });
 
@@ -2146,5 +2525,250 @@ describe('preflight setup', () => {
     await runInstallCli(['setup']);
     expect(output.join('')).not.toContain('Setup failed');
     expect(process.exitCode).toBeFalsy();
+  });
+
+  it('passes staging: false to the wizard by default', async () => {
+    mockedSetupWizard.runSetupWizard.mockResolvedValue(undefined);
+    await runInstallCli(['setup']);
+    expect(mockedSetupWizard.runSetupWizard).toHaveBeenCalledWith({ staging: false });
+  });
+
+  it('passes staging: true to the wizard when --staging is given', async () => {
+    mockedSetupWizard.runSetupWizard.mockResolvedValue(undefined);
+    await runInstallCli(['setup', '--staging']);
+    expect(mockedSetupWizard.runSetupWizard).toHaveBeenCalledWith({ staging: true });
+  });
+
+  it('hides --staging from setup --help', async () => {
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    const helpText = prog.commands.find((c) => c.name() === 'setup')!.helpInformation();
+    expect(helpText).not.toContain('--staging');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// --staging is hidden from --help across every command that supports it
+// ---------------------------------------------------------------------------
+
+describe('--staging is hidden from help everywhere it is supported', () => {
+  it('setup, and (via createInstallProgram) any other install-CLI subcommand, never advertises --staging', async () => {
+    const { createInstallProgram } = await import('./cli.js');
+    const prog = createInstallProgram();
+    for (const cmd of prog.commands) {
+      expect(cmd.helpInformation()).not.toContain('--staging');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Copilot install/uninstall
+// ---------------------------------------------------------------------------
+
+describe('copilot install/uninstall', () => {
+  let stdoutSpy: ReturnType<typeof jest.spyOn>;
+  let exitSpy: ReturnType<typeof jest.spyOn>;
+  let mFs: {
+    existsSync: jest.Mock;
+    writeFileSync: jest.Mock;
+    readFileSync: jest.Mock;
+    realpathSync: jest.Mock;
+  };
+  let mExec: { execFileSync: jest.Mock };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mFs = fsMod as unknown as {
+      existsSync: jest.Mock;
+      writeFileSync: jest.Mock;
+      readFileSync: jest.Mock;
+      realpathSync: jest.Mock;
+    };
+    mExec = childMod as unknown as { execFileSync: jest.Mock };
+    mFs.existsSync.mockImplementation(() => false);
+    mFs.readFileSync.mockImplementation(() => '{}');
+    // An earlier describe block (handleUpdate/findRepoRoot tests) leaves
+    // realpathSync pinned to a fixed unrelated return value via
+    // mockReturnValue — clearAllMocks() doesn't undo that. Restore the
+    // module mock's original identity behavior so writeJsonFile's symlink
+    // guard sees real paths regardless of test execution order.
+    mFs.realpathSync.mockImplementation((p: unknown) => p);
+    mockedSchedule.resolveBinaryPath.mockReturnValue('/usr/local/bin/preflight');
+    mockedSchedule.resolveNamedBinaryOnPath.mockReturnValue(null);
+    mockedCopilotHelper.detectCopilotHooksPath.mockReturnValue(
+      `${homedir()}/.copilot/hooks/preflight.json`,
+    );
+    mockedCopilotHelper.detectVsCodeMcpPath.mockReturnValue(`${homedir()}/Code/User/mcp.json`);
+    mockedCopilotHelper.detectVsCodeSettingsPath.mockReturnValue(
+      `${homedir()}/Code/User/settings.json`,
+    );
+    mockedCopilotHelper.applyHookCollisionFix.mockReturnValue({
+      applied: false,
+      reason: 'claude-hooks-absent',
+    });
+    mockedCopilotHelper.installCopilotSdkExtension.mockReturnValue({
+      copied: false,
+      reason: 'exists',
+    });
+    stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    exitSpy = jest
+      .spyOn(process, 'exit')
+      .mockImplementation((code?: string | number | null | undefined) => {
+        throw new Error(`process.exit(${String(code)})`);
+      });
+  });
+
+  afterEach(() => {
+    stdoutSpy.mockRestore();
+    exitSpy.mockRestore();
+    process.exitCode = undefined;
+  });
+
+  it('always writes the Copilot hooks file, regardless of whether the copilot CLI is present', async () => {
+    mockedSchedule.resolveNamedBinaryOnPath.mockReturnValue(null);
+    await runInstallCli(['install', '--copilot']);
+    expect(mockedCopilotHelper.mergeCopilotHooksFile).toHaveBeenCalledWith(
+      expect.anything(),
+      '/usr/local/bin/preflight',
+    );
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('Copilot hooks written');
+  });
+
+  it('skips CLI MCP registration and prints a clear message when the copilot CLI is not found', async () => {
+    mockedSchedule.resolveNamedBinaryOnPath.mockReturnValue(null);
+    await runInstallCli(['install', '--copilot']);
+    expect(mExec.execFileSync).not.toHaveBeenCalled();
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('copilot` CLI not found on PATH');
+  });
+
+  it('registers the MCP server via `copilot mcp add` with an argv array when the CLI is found', async () => {
+    mockedSchedule.resolveNamedBinaryOnPath.mockReturnValue('/opt/homebrew/bin/copilot');
+    mExec.execFileSync.mockImplementation(() => Buffer.from(''));
+
+    await runInstallCli(['install', '--copilot', '--license-key', 'abc123', '--account-id', '456']);
+
+    expect(mExec.execFileSync).toHaveBeenCalledWith(
+      '/opt/homebrew/bin/copilot',
+      ['mcp', 'remove', 'preflight'],
+      { stdio: 'pipe' },
+    );
+    expect(mExec.execFileSync).toHaveBeenCalledWith(
+      '/opt/homebrew/bin/copilot',
+      [
+        'mcp',
+        'add',
+        'preflight',
+        '--env',
+        'MCP_CLIENT=copilot-sdk',
+        '--env',
+        'NEW_RELIC_LICENSE_KEY=abc123',
+        '--env',
+        'NEW_RELIC_ACCOUNT_ID=456',
+        '--',
+        '/usr/local/bin/preflight',
+        '--stdio',
+      ],
+      { stdio: 'pipe' },
+    );
+  });
+
+  it('never lets a license key with shell metacharacters be interpreted by a shell', async () => {
+    mockedSchedule.resolveNamedBinaryOnPath.mockReturnValue('/opt/homebrew/bin/copilot');
+    mExec.execFileSync.mockImplementation(() => Buffer.from(''));
+    const dangerousKey = '`rm -rf /`; touch pwned; $(echo evil)';
+
+    await runInstallCli([
+      'install',
+      '--copilot',
+      '--license-key',
+      dangerousKey,
+      '--account-id',
+      '456',
+    ]);
+
+    // execFileSync (never execSync/exec) with the key as one literal argv
+    // element — no shell ever parses it, so the metacharacters are inert.
+    const addCall = mExec.execFileSync.mock.calls.find(
+      (c: unknown[]) => Array.isArray(c[1]) && (c[1] as unknown[]).includes('add'),
+    );
+    expect(addCall![1]).toContain(`NEW_RELIC_LICENSE_KEY=${dangerousKey}`);
+  });
+
+  it('skips VS Code steps gracefully when the VS Code user directory is not found', async () => {
+    mFs.existsSync.mockImplementation(() => false);
+    await runInstallCli(['install', '--copilot']);
+    expect(mockedCopilotHelper.mergeVsCodeMcpConfig).not.toHaveBeenCalled();
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('VS Code user directory not found');
+  });
+
+  it('writes the VS Code MCP entry and settings when the VS Code user directory exists', async () => {
+    mFs.existsSync.mockImplementation(() => true);
+    await runInstallCli(['install', '--copilot']);
+    expect(mockedCopilotHelper.mergeVsCodeMcpConfig).toHaveBeenCalled();
+    expect(mockedCopilotHelper.mergeVsCodeSettings).toHaveBeenCalledWith(expect.anything(), {
+      enableAgentDebugLog: true,
+    });
+  });
+
+  it('calls applyHookCollisionFix unconditionally, marking copilotHooksJustInstalled', async () => {
+    await runInstallCli(['install', '--copilot']);
+    expect(mockedCopilotHelper.applyHookCollisionFix).toHaveBeenCalledWith(
+      expect.objectContaining({ copilotHooksJustInstalled: true }),
+    );
+  });
+
+  it('rejects --copilot combined with --windows-cc', async () => {
+    await expect(runInstallCli(['install', '--copilot', '--windows-cc'])).rejects.toThrow(
+      'process.exit(1)',
+    );
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('cannot be combined with');
+  });
+
+  it('rejects --copilot combined with --linux-cc', async () => {
+    await expect(runInstallCli(['install', '--copilot', '--linux-cc'])).rejects.toThrow(
+      'process.exit(1)',
+    );
+  });
+
+  it('uninstall --copilot reports nothing to do when no Copilot config exists', async () => {
+    mFs.existsSync.mockImplementation(() => false);
+    mockedSchedule.resolveNamedBinaryOnPath.mockReturnValue(null);
+    await runInstallCli(['uninstall', '--copilot', '--yes']);
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('Nothing installed for Copilot');
+  });
+
+  it('uninstall --copilot removes the hooks file and MCP entry when present, with --yes skipping confirmation', async () => {
+    mFs.existsSync.mockImplementation(() => true);
+    mockedSchedule.resolveNamedBinaryOnPath.mockReturnValue('/opt/homebrew/bin/copilot');
+    mExec.execFileSync.mockImplementation(() => Buffer.from(''));
+
+    await runInstallCli(['uninstall', '--copilot', '--yes']);
+
+    expect(mockedCopilotHelper.removeCopilotHooksFile).toHaveBeenCalled();
+    expect(mockedCopilotHelper.removeVsCodeMcpConfig).toHaveBeenCalled();
+    expect(mExec.execFileSync).toHaveBeenCalledWith(
+      '/opt/homebrew/bin/copilot',
+      ['mcp', 'remove', 'preflight'],
+      { stdio: 'pipe' },
+    );
+    const output = stdoutSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('');
+    expect(output).toContain('Uninstall complete');
+  });
+
+  it('rejects uninstall --copilot combined with --windows-cc', async () => {
+    await expect(runInstallCli(['uninstall', '--copilot', '--windows-cc'])).rejects.toThrow(
+      'process.exit(1)',
+    );
+  });
+
+  it('rejects uninstall --copilot combined with --daemon', async () => {
+    await expect(runInstallCli(['uninstall', '--copilot', '--daemon'])).rejects.toThrow(
+      'process.exit(1)',
+    );
   });
 });

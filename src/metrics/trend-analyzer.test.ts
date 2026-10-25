@@ -12,6 +12,7 @@ import {
   percentChange,
   significantChange,
 } from './trend-analyzer.js';
+import { ZERO_QUALITY_PROXY_COUNTS } from './quality-proxy-tracker.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let tmpDir: string;
@@ -36,6 +37,8 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
   return {
     sessionId: `sess-${now}-${Math.random().toString(36).slice(2)}`,
     sessionName: null,
+    sessionNameSource: null,
+    sessionIntent: null,
     repoName: null,
     startTime: now - 60_000,
     endTime: now,
@@ -44,6 +47,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     developer: 'alice',
     model: 'claude-sonnet-4-20250514',
     toolBreakdown: { Read: 5, Edit: 3, Bash: 2 },
+    skillBreakdown: {},
     filesRead: ['/src/index.ts'],
     filesModified: ['/src/index.ts'],
     linesAdded: 20,
@@ -54,6 +58,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     buildRunCount: 1,
     buildPassCount: 1,
     estimatedCostUsd: 0.05,
+    subagentCostUsd: 0,
     tokensInput: 5000,
     tokensOutput: 2000,
     tokensThinking: 1000,
@@ -61,6 +66,10 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     tokensCacheCreation: 0,
     cacheSavingsUsd: 0,
     efficiencyScore: 0.75,
+    toolSelectionMetrics: null,
+    modelBreakdown: {},
+    costByWorkflowRunId: {},
+    qualityProxy: { ...ZERO_QUALITY_PROXY_COUNTS },
     antiPatterns: [],
     taskCount: 1,
     taskSuccessRate: 1,
@@ -510,6 +519,349 @@ describe('significantChange', () => {
   it('does not flag minor variation as significant', () => {
     const values = [0.7, 0.71, 0.69, 0.72, 0.68, 0.71];
     expect(significantChange(values)).toBe(false);
+  });
+});
+
+describe('rankModelsByOutcome', () => {
+  it('returns insufficient_data when only 1-2 sessions exist', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    store.saveSession(makeSummary({ sessionId: 's1', model: 'sonnet' }));
+
+    const report = analyzer.rankModelsByOutcome();
+
+    expect(report.confidence).toBe('insufficient_data');
+    expect(report.recommendedModel).toBeNull();
+  });
+
+  it('ranks models by efficiency score with high confidence when sufficient sessions', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Model A: 20 sessions with high efficiency (0.9)
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `a-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.9,
+          estimatedCostUsd: 0.05,
+        }),
+      );
+    }
+
+    // Model B: 20 sessions with lower efficiency (0.6)
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `b-${i}`,
+          model: 'opus',
+          efficiencyScore: 0.6,
+          estimatedCostUsd: 0.08,
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    expect(report.confidence).toBe('high');
+    expect(report.recommendedModel).toBe('sonnet');
+    expect(report.ranked[0]?.model).toBe('sonnet');
+    expect(report.ranked[0]?.avgEfficiencyScore).toBeCloseTo(0.9, 1);
+    expect(report.ranked[1]?.model).toBe('opus');
+    expect(report.ranked[1]?.avgEfficiencyScore).toBeCloseTo(0.6, 1);
+  });
+
+  it('excludes sessions with model: null from rankings', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Sessions with null model
+    for (let i = 0; i < 5; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `null-${i}`,
+          model: null,
+          efficiencyScore: 0.95,
+        }),
+      );
+    }
+
+    // Real model
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `sonnet-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.8,
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    expect(report.ranked).toHaveLength(1);
+    expect(report.ranked[0]?.model).toBe('sonnet');
+  });
+
+  it('separates outcomes correctly in byOutcome', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Bug fix session (tests + files modified)
+    for (let i = 0; i < 10; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `bug-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.85,
+          testRunCount: 2,
+          testPassCount: 2,
+          filesModified: ['/src/index.ts'],
+        }),
+      );
+    }
+
+    // Investigation session (mostly read/grep)
+    for (let i = 0; i < 10; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `inv-${i}`,
+          model: 'opus',
+          efficiencyScore: 0.7,
+          testRunCount: 0,
+          filesModified: [],
+          toolBreakdown: { Read: 8, Grep: 2 },
+          skillBreakdown: {},
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    expect(report.byOutcome.length).toBeGreaterThan(0);
+
+    const bugFixOutcome = report.byOutcome.find((o) => o.outcome === 'bug_fix');
+    expect(bugFixOutcome?.ranked[0]?.model).toBe('sonnet');
+
+    const investigationOutcome = report.byOutcome.find((o) => o.outcome === 'investigation');
+    expect(investigationOutcome?.ranked[0]?.model).toBe('opus');
+  });
+
+  it('ties broken by lower cost when efficiency is equal', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Model A: high efficiency, high cost
+    for (let i = 0; i < 8; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `a-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.8,
+          estimatedCostUsd: 0.1,
+        }),
+      );
+    }
+
+    // Model B: same efficiency, lower cost
+    for (let i = 0; i < 8; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `b-${i}`,
+          model: 'haiku',
+          efficiencyScore: 0.8,
+          estimatedCostUsd: 0.02,
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    expect(report.ranked[0]?.model).toBe('haiku');
+    expect(report.ranked[0]?.avgCostUsd).toBeLessThan(report.ranked[1]!.avgCostUsd);
+  });
+
+  it('respects developer filter', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Alice with sonnet: high efficiency
+    for (let i = 0; i < 10; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `alice-${i}`,
+          developer: 'alice',
+          model: 'sonnet',
+          efficiencyScore: 0.9,
+        }),
+      );
+    }
+
+    // Bob with opus: low efficiency
+    for (let i = 0; i < 10; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `bob-${i}`,
+          developer: 'bob',
+          model: 'opus',
+          efficiencyScore: 0.5,
+        }),
+      );
+    }
+
+    const aliceReport = analyzer.rankModelsByOutcome({ developer: 'alice' });
+    expect(aliceReport.ranked[0]?.model).toBe('sonnet');
+    expect(aliceReport.ranked[0]?.avgEfficiencyScore).toBeCloseTo(0.9, 1);
+
+    const bobReport = analyzer.rankModelsByOutcome({ developer: 'bob' });
+    expect(bobReport.ranked[0]?.model).toBe('opus');
+    expect(bobReport.ranked[0]?.avgEfficiencyScore).toBeCloseTo(0.5, 1);
+  });
+
+  it('close-gap case with ample samples on both sides still yields insufficient_data', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Model A: 20 sessions with efficiency 0.80
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `a-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.8,
+          estimatedCostUsd: 0.05,
+        }),
+      );
+    }
+
+    // Model B: 20 sessions with efficiency 0.78 (gap = 0.02, below 0.05 threshold)
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `b-${i}`,
+          model: 'opus',
+          efficiencyScore: 0.78,
+          estimatedCostUsd: 0.08,
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    // Despite having 20 sessions for both, the gap is too small
+    expect(report.confidence).toBe('insufficient_data');
+    expect(report.recommendedModel).toBeNull();
+    // But ranked list is still populated and sorted
+    expect(report.ranked[0]?.model).toBe('sonnet');
+    expect(report.ranked[0]?.avgEfficiencyScore).toBeCloseTo(0.8, 1);
+  });
+
+  it('single model in entire history never gets a confident recommendation', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // 25 sessions with only one model
+    for (let i = 0; i < 25; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `s-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.9,
+          estimatedCostUsd: 0.05,
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    // No runner-up means no comparison, no recommendation
+    expect(report.confidence).toBe('insufficient_data');
+    expect(report.recommendedModel).toBeNull();
+    // But the single model is still listed
+    expect(report.ranked).toHaveLength(1);
+    expect(report.ranked[0]?.model).toBe('sonnet');
+  });
+
+  it('excludes multi-model sessions from per-model ranking rather than misattributing them to s.model', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+    const modelBreakdownEntry = (requestCount: number) => ({
+      requestCount,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCostUsd: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      totalThinkingTokens: 0,
+    });
+
+    // 20 single-model sonnet sessions with high efficiency.
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `sonnet-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.9,
+          modelBreakdown: { sonnet: modelBreakdownEntry(5) },
+        }),
+      );
+    }
+
+    // 20 multi-model sessions (an orchestrator model plus a subagent model)
+    // labeled s.model='sonnet' but whose modelBreakdown shows two models —
+    // these can't be attributed to sonnet alone, and must not be counted in
+    // its ranking bucket.
+    for (let i = 0; i < 20; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `mixed-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.1,
+          modelBreakdown: {
+            sonnet: modelBreakdownEntry(3),
+            haiku: modelBreakdownEntry(7),
+          },
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    const sonnetStats = report.ranked.find((m) => m.model === 'sonnet');
+    expect(sonnetStats).toBeDefined();
+    // Only the 20 single-model sessions count — if the mixed sessions leaked
+    // in via s.model, sessionCount would be 40 and avgEfficiencyScore would
+    // be pulled down toward 0.5.
+    expect(sonnetStats!.sessionCount).toBe(20);
+    expect(sonnetStats!.avgEfficiencyScore).toBeCloseTo(0.9, 1);
+  });
+
+  it('meaningful gap still recommends even at low confidence tier', () => {
+    const analyzer = new TrendAnalyzer({ sessionStore: store });
+
+    // Model A: 3 sessions with efficiency 0.9 (meets MIN_SESSIONS_LOW_CONFIDENCE)
+    for (let i = 0; i < 3; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `a-${i}`,
+          model: 'sonnet',
+          efficiencyScore: 0.9,
+          estimatedCostUsd: 0.05,
+        }),
+      );
+    }
+
+    // Model B: 3 sessions with efficiency 0.5 (gap = 0.4, well above 0.05 threshold)
+    for (let i = 0; i < 3; i++) {
+      store.saveSession(
+        makeSummary({
+          sessionId: `b-${i}`,
+          model: 'opus',
+          efficiencyScore: 0.5,
+          estimatedCostUsd: 0.08,
+        }),
+      );
+    }
+
+    const report = analyzer.rankModelsByOutcome();
+
+    // With comparable runner-up AND meaningful gap, recommendation fires even at low confidence
+    expect(report.confidence).toBe('low');
+    expect(report.recommendedModel).toBe('sonnet');
+    expect(report.ranked[0]?.model).toBe('sonnet');
   });
 });
 

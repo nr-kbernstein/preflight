@@ -160,6 +160,17 @@ function parseTaskUpdate(input: Record<string, unknown>): ToolFields {
   return fields;
 }
 
+function parseSkill(input: Record<string, unknown>): ToolFields {
+  const fields: ToolFields = {};
+  if (typeof input.skill === 'string') fields.skillName = input.skill;
+  if (typeof input.argsLength === 'number') {
+    fields.skillArgsLength = input.argsLength;
+  } else if (typeof input.args === 'string') {
+    fields.skillArgsLength = input.args.length;
+  }
+  return fields;
+}
+
 // ---------------------------------------------------------------------------
 // Dispatcher
 // ---------------------------------------------------------------------------
@@ -169,12 +180,17 @@ const INPUT_PARSERS: Record<string, (input: Record<string, unknown>) => ToolFiel
   Write: parseWrite,
   Edit: parseEdit,
   Bash: parseBash,
+  // PowerShell is a real, first-party Claude Code tool on native Windows,
+  // auto-enabled without Git Bash — same command/description/timeout/
+  // run_in_background input shape as Bash (code.claude.com/docs/en/tools-reference).
+  PowerShell: parseBash,
   Grep: parseGrep,
   Glob: parseGlob,
   Agent: parseAgent,
   AskUserQuestion: parseAskUserQuestion,
   TaskCreate: parseTaskCreate,
   TaskUpdate: parseTaskUpdate,
+  Skill: parseSkill,
 };
 
 function parseEditOutput(output: Record<string, unknown>): ToolFields {
@@ -199,6 +215,7 @@ function parseAgentOutput(output: Record<string, unknown>): ToolFields {
     fields.agentInterrupted = output.agentInterrupted;
   if (typeof output.agentResultLength === 'number')
     fields.agentResultLength = output.agentResultLength;
+  if (typeof output.spawnedAgentId === 'string') fields.spawnedAgentId = output.spawnedAgentId;
   return fields;
 }
 
@@ -248,6 +265,15 @@ export function parseToolSpecificFields(
     const outputParser = OUTPUT_PARSERS[normalizedName];
     if (outputParser && output !== null && output !== undefined && typeof output === 'object') {
       Object.assign(fields, outputParser(output as Record<string, unknown>));
+    }
+    // Set by the collector for `gh pr create` and MCP create_pull_request, so
+    // it is tool-name independent here.
+    const createdPrNumber =
+      output !== null && typeof output === 'object'
+        ? (output as Record<string, unknown>).createdPrNumber
+        : undefined;
+    if (typeof createdPrNumber === 'string' && /^\d{1,9}$/.test(createdPrNumber)) {
+      fields.createdPrNumber = createdPrNumber;
     }
 
     return fields;

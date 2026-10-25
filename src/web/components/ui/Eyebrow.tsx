@@ -9,9 +9,7 @@ export interface EyebrowProps {
 }
 
 export function Eyebrow({ children, as = 'div', className = '' }: EyebrowProps): JSX.Element {
-  const classes = ['text-sm font-semibold text-ink-base', className]
-    .filter(Boolean)
-    .join(' ');
+  const classes = ['text-sm font-semibold text-ink-base', className].filter(Boolean).join(' ');
   if (as === 'h2') {
     return <h2 className={classes}>{children}</h2>;
   }

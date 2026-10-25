@@ -7,6 +7,7 @@ import {
   injectDeveloperDefault,
   escapeLuceneValue,
 } from './deploy-dashboards.js';
+import { stagingHost } from '../shared/transport/http-client.js';
 
 describe('escapeLuceneValue', () => {
   it('escapes backslashes before single quotes', () => {
@@ -154,7 +155,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: true,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -172,7 +175,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -191,7 +196,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -199,6 +206,48 @@ describe('runDeployDashboards', () => {
     });
     expect(code).toBe(1);
     expect(out.text()).toContain('NEW_RELIC_API_KEY');
+  });
+
+  it('rejects --staging + --eu', async () => {
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_API_KEY = 'NRAK-test';
+    const out = new CapturedStdout();
+    const code = await runDeployDashboards({
+      all: false,
+      update: false,
+      teardown: false,
+      print: false,
+      staging: true,
+      eu: true,
+      jp: false,
+      developer: null,
+      file: 'sample.json',
+      dataDir,
+      stdout: out,
+    });
+    expect(code).toBe(1);
+    expect(out.text()).toContain('mutually exclusive');
+  });
+
+  it('rejects --eu + --jp', async () => {
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_API_KEY = 'NRAK-test';
+    const out = new CapturedStdout();
+    const code = await runDeployDashboards({
+      all: false,
+      update: false,
+      teardown: false,
+      print: false,
+      staging: false,
+      eu: true,
+      jp: true,
+      developer: null,
+      file: 'sample.json',
+      dataDir,
+      stdout: out,
+    });
+    expect(code).toBe(1);
+    expect(out.text()).toContain('mutually exclusive');
   });
 
   it('rejects --teardown + --update', async () => {
@@ -210,7 +259,9 @@ describe('runDeployDashboards', () => {
       update: true,
       teardown: true,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -239,7 +290,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -270,7 +323,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: null,
       dataDir,
@@ -311,7 +366,9 @@ describe('runDeployDashboards', () => {
       update: true,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -348,7 +405,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: true,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -373,7 +432,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: true,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -382,6 +443,61 @@ describe('runDeployDashboards', () => {
     });
     expect(code).toBe(0);
     expect(out.text()).toContain('No dashboard named');
+  });
+
+  it('--staging targets staging API URL', async () => {
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_API_KEY = 'NRAK-test';
+    const { fetch: fetchImpl, calls } = makeFetchMock([
+      { data: { dashboardCreate: { entityResult: { guid: 'G', name: 'Test Dashboard' } } } },
+    ]);
+    const out = new CapturedStdout();
+    await runDeployDashboards({
+      all: false,
+      update: false,
+      teardown: false,
+      print: false,
+      staging: true,
+      eu: false,
+      jp: false,
+      developer: null,
+      file: 'sample.json',
+      dataDir,
+      fetchImpl,
+      stdout: out,
+    });
+    expect(calls[0].url).toBe(`https://${stagingHost('api')}/graphql`);
+  });
+
+  it('--jp targets Japan API URL', async () => {
+    process.env.NEW_RELIC_ACCOUNT_ID = '12345';
+    process.env.NEW_RELIC_API_KEY = 'NRAK-test';
+    const { fetch: fetchImpl, calls } = makeFetchMock([
+      {
+        data: {
+          dashboardCreate: {
+            entityResult: { guid: 'GUID-JP', name: 'Test Dashboard' },
+            errors: null,
+          },
+        },
+      },
+    ]);
+    const out = new CapturedStdout();
+    await runDeployDashboards({
+      all: false,
+      update: false,
+      teardown: false,
+      print: false,
+      staging: false,
+      eu: false,
+      jp: true,
+      developer: null,
+      file: 'sample.json',
+      dataDir,
+      fetchImpl,
+      stdout: out,
+    });
+    expect(calls[0].url).toBe('https://api.jp.newrelic.com/graphql');
   });
 
   it('throws when NerdGraph returns errors with null data (HTTP 200)', async () => {
@@ -396,7 +512,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -424,7 +542,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir,
@@ -444,7 +564,9 @@ describe('runDeployDashboards', () => {
       update: false,
       teardown: false,
       print: false,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'sample.json',
       dataDir: join(tmpdir(), 'definitely-does-not-exist-xyz'),
@@ -468,7 +590,9 @@ describe('resolveDataDir (via runDeployDashboards default path)', () => {
       update: false,
       teardown: false,
       print: true,
+      staging: false,
       eu: false,
+      jp: false,
       developer: null,
       file: 'ai-coding-assistant-overview.json',
       // No dataDir override — exercises the resolver.

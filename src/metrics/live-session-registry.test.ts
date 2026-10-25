@@ -1,4 +1,4 @@
-import { LiveSessionRegistry } from './live-session-registry.js';
+import { LiveSessionRegistry, DEFAULT_STALE_THRESHOLD_MS } from './live-session-registry.js';
 
 describe('LiveSessionRegistry', () => {
   beforeEach(() => {
@@ -103,6 +103,52 @@ describe('LiveSessionRegistry', () => {
     expect(reg.isLive('sess-a')).toBe(false);
   });
 
+  it('exports DEFAULT_STALE_THRESHOLD_MS matching the constructor default', () => {
+    expect(DEFAULT_STALE_THRESHOLD_MS).toBe(180_000);
+  });
+
+  describe('getTodaySessionIds', () => {
+    it('keeps a session in today-seen after it goes stale in getLiveSessions', () => {
+      const reg = new LiveSessionRegistry(5000);
+      reg.touch('sess-a');
+      jest.advanceTimersByTime(6000);
+      expect(reg.getLiveSessions()).toEqual([]);
+      expect(reg.getTodaySessionIds()).toEqual(['sess-a']);
+    });
+
+    it('excludes synthetic session IDs by default', () => {
+      const reg = new LiveSessionRegistry();
+      reg.touch('real-session');
+      reg.touch('local-1234567890');
+      expect(reg.getTodaySessionIds()).toEqual(['real-session']);
+    });
+
+    it('includeSynthetic: true returns every session seen today', () => {
+      const reg = new LiveSessionRegistry();
+      reg.touch('real-session');
+      reg.touch('local-1234567890');
+      const all = reg.getTodaySessionIds({ includeSynthetic: true });
+      expect(all).toEqual(expect.arrayContaining(['real-session', 'local-1234567890']));
+      expect(all).toHaveLength(2);
+    });
+
+    it('expires an entry once the calendar day rolls over', () => {
+      jest.setSystemTime(new Date(2026, 0, 15, 23, 59, 0));
+      const reg = new LiveSessionRegistry();
+      reg.touch('sess-a');
+      expect(reg.getTodaySessionIds()).toEqual(['sess-a']);
+      jest.setSystemTime(new Date(2026, 0, 16, 0, 1, 0));
+      expect(reg.getTodaySessionIds()).toEqual([]);
+    });
+
+    it('is cleared on reset()', () => {
+      const reg = new LiveSessionRegistry();
+      reg.touch('sess-a');
+      reg.reset();
+      expect(reg.getTodaySessionIds()).toEqual([]);
+    });
+  });
+
   describe('concurrency tracking', () => {
     it('tracks peak concurrent sessions via touch()', () => {
       const reg = new LiveSessionRegistry(5000);
@@ -159,6 +205,117 @@ describe('LiveSessionRegistry', () => {
       const ts = reg.getConcurrencyTimeSeries();
       expect(ts.length).toBeLessThanOrEqual(2880);
       reg.stopSampling();
+    });
+  });
+
+  describe('setAuthoritativeName', () => {
+    it('sets the display name for a session', () => {
+      const reg = new LiveSessionRegistry();
+      reg.setAuthoritativeName('sess-a', 'refactor auth flow', 'ai-title');
+      expect(reg.getSessionName('sess-a')).toBe('refactor auth flow');
+    });
+
+    it('overrides a cwd basename already stored by touch()', () => {
+      const reg = new LiveSessionRegistry();
+      reg.touch('sess-a', '/Users/dev/projects/preflight');
+      expect(reg.getSessionName('sess-a')).toBe('preflight');
+      reg.setAuthoritativeName('sess-a', 'session naming logic', 'ai-title');
+      expect(reg.getSessionName('sess-a')).toBe('session naming logic');
+    });
+
+    it('is not overwritten by a later touch() with a cwd', () => {
+      const reg = new LiveSessionRegistry();
+      reg.setAuthoritativeName('sess-a', 'session naming logic', 'ai-title');
+      reg.touch('sess-a', '/Users/dev/projects/preflight');
+      expect(reg.getSessionName('sess-a')).toBe('session naming logic');
+    });
+
+    it('ignores an empty name', () => {
+      const reg = new LiveSessionRegistry();
+      reg.touch('sess-a', '/Users/dev/projects/preflight');
+      reg.setAuthoritativeName('sess-a', '', 'ai-title');
+      expect(reg.getSessionName('sess-a')).toBe('preflight');
+    });
+
+    it('is cleared on reset()', () => {
+      const reg = new LiveSessionRegistry();
+      reg.setAuthoritativeName('sess-a', 'session naming logic', 'ai-title');
+      reg.reset();
+      expect(reg.getSessionName('sess-a')).toBeNull();
+    });
+
+    // --- Phase 2 freshness: re-resolution may upgrade, never downgrade ---
+
+    it('upgrades the name as a better source arrives (cwd -> auto -> ai-title -> user)', () => {
+      const reg = new LiveSessionRegistry();
+      // cwd basename first (from touch), then progressively better re-resolves.
+      reg.touch('sess-a', '/Users/dev/projects/preflight');
+      expect(reg.getSessionName('sess-a')).toBe('preflight');
+      reg.setAuthoritativeName('sess-a', 'auto guess', 'auto');
+      expect(reg.getSessionName('sess-a')).toBe('auto guess');
+      reg.setAuthoritativeName('sess-a', 'refined title', 'ai-title');
+      expect(reg.getSessionName('sess-a')).toBe('refined title');
+      reg.setAuthoritativeName('sess-a', 'human named it', 'user');
+      expect(reg.getSessionName('sess-a')).toBe('human named it');
+    });
+
+    it('refreshes text for the same source (ai-title -> refined ai-title)', () => {
+      const reg = new LiveSessionRegistry();
+      reg.setAuthoritativeName('sess-a', 'first guess', 'ai-title');
+      reg.setAuthoritativeName('sess-a', 'refined title', 'ai-title');
+      expect(reg.getSessionName('sess-a')).toBe('refined title');
+    });
+
+    it('never downgrades a user name to auto or cwd', () => {
+      const reg = new LiveSessionRegistry();
+      reg.setAuthoritativeName('sess-a', 'human named it', 'user');
+      // A later re-resolve that fell back to auto/cwd (e.g. the job-state file
+      // disappeared) must not demote the user name.
+      reg.setAuthoritativeName('sess-a', 'auto guess', 'auto');
+      expect(reg.getSessionName('sess-a')).toBe('human named it');
+      reg.setAuthoritativeName('sess-a', 'cwd basename', 'cwd');
+      expect(reg.getSessionName('sess-a')).toBe('human named it');
+      // And a later touch() with a cwd still can't clobber it either.
+      reg.touch('sess-a', '/Users/dev/projects/preflight');
+      expect(reg.getSessionName('sess-a')).toBe('human named it');
+    });
+
+    it('does not downgrade an ai-title to auto', () => {
+      const reg = new LiveSessionRegistry();
+      reg.setAuthoritativeName('sess-a', 'refined title', 'ai-title');
+      reg.setAuthoritativeName('sess-a', 'auto guess', 'auto');
+      expect(reg.getSessionName('sess-a')).toBe('refined title');
+    });
+  });
+
+  describe('getSessionNameSource', () => {
+    it('returns null for an unknown/unnamed session', () => {
+      const reg = new LiveSessionRegistry();
+      expect(reg.getSessionNameSource('sess-a')).toBeNull();
+    });
+
+    it("reports 'cwd' for a name set by the touch() streaming fallback", () => {
+      const reg = new LiveSessionRegistry();
+      reg.touch('sess-a', '/Users/dev/projects/preflight');
+      expect(reg.getSessionName('sess-a')).toBe('preflight');
+      expect(reg.getSessionNameSource('sess-a')).toBe('cwd');
+    });
+
+    it('reports the authoritative source and tracks upgrades', () => {
+      const reg = new LiveSessionRegistry();
+      reg.touch('sess-a', '/Users/dev/projects/preflight');
+      expect(reg.getSessionNameSource('sess-a')).toBe('cwd');
+      reg.setAuthoritativeName('sess-a', 'refined title', 'ai-title');
+      expect(reg.getSessionNameSource('sess-a')).toBe('ai-title');
+      reg.setAuthoritativeName('sess-a', 'human named it', 'user');
+      expect(reg.getSessionNameSource('sess-a')).toBe('user');
+    });
+
+    it('is cleared on reset()', () => {
+      const reg = new LiveSessionRegistry();
+      reg.setAuthoritativeName('sess-a', 'human named it', 'user');
+      reg.reset();
+      expect(reg.getSessionNameSource('sess-a')).toBeNull();
     });
   });
 });

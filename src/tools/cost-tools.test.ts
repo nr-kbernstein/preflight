@@ -9,7 +9,9 @@ import {
   registerCostTools,
 } from './cost-tools.js';
 import { CostTracker } from '../metrics/cost-tracker.js';
+import { estimatedFromOf } from '../__test-utils__/estimated-from.js';
 import { BudgetTracker } from '../metrics/budget-tracker.js';
+import { SessionResumeTracker } from '../metrics/session-resume-tracker.js';
 import { localDateKey } from '../lib/date.js';
 import { buildCostForecastFromInputs } from '../metrics/cost-forecast.js';
 import type { TokenReport } from './cost-tools.js';
@@ -226,6 +228,111 @@ describe('handleGetCostBreakdown()', () => {
 
     expect(body.cost_per_million_tokens).toBeNull();
   });
+
+  it('lists models Preflight cannot price in unpriced_models', () => {
+    const tracker = new CostTracker();
+    handleReportTokens(tracker, {
+      input_tokens: 1000,
+      output_tokens: 1000,
+      model: 'claude-sonnet-4',
+    });
+    handleReportTokens(tracker, { input_tokens: 1000, output_tokens: 1000, model: 'gw-mystery' });
+
+    const body = JSON.parse(handleGetCostBreakdown(tracker).content[0].text);
+
+    expect(body.unpriced_models).toEqual(['gw-mystery']);
+  });
+
+  it('includes rate_multiplier_applied, defaulting to 1', () => {
+    const tracker = new CostTracker();
+    const result = handleGetCostBreakdown(tracker);
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.rate_multiplier_applied).toBe(1);
+  });
+
+  it('reflects a configured rateMultiplier in rate_multiplier_applied and total_usd', () => {
+    const tracker = new CostTracker(undefined, { rateMultiplier: 0.85 });
+    handleReportTokens(tracker, {
+      input_tokens: 500_000,
+      output_tokens: 500_000,
+      model: 'claude-sonnet-4',
+    });
+
+    const result = handleGetCostBreakdown(tracker);
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.rate_multiplier_applied).toBe(0.85);
+    expect(body.total_usd).toBeCloseTo(9.0 * 0.85, 2);
+  });
+
+  it('includes by_agent_type breakdown from subagent token usage', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      {
+        inputTokens: 10_000,
+        outputTokens: 2_000,
+        thinkingTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalTokens: 12_000,
+      },
+      'claude-sonnet-4',
+      { agentId: 'agent-1', agentType: 'general-purpose' },
+    );
+
+    const result = handleGetCostBreakdown(tracker);
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.by_agent_type).toHaveProperty('general-purpose');
+    expect(body.by_agent_type['general-purpose']).toBeGreaterThan(0);
+  });
+
+  it('returns an empty by_agent_type when no subagent token usage has ctx.agentType', () => {
+    const tracker = new CostTracker();
+    const result = handleGetCostBreakdown(tracker);
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.by_agent_type).toEqual({});
+  });
+
+  it('reports calls on a model with no price in unpriced_by_model', () => {
+    const tracker = new CostTracker();
+    handleReportTokens(tracker, {
+      input_tokens: 1_000,
+      output_tokens: 200,
+      model: 'claude-foo-9-9',
+    });
+    handleReportTokens(tracker, {
+      input_tokens: 1_000,
+      output_tokens: 200,
+      model: 'claude-sonnet-4',
+    });
+
+    const body = JSON.parse(handleGetCostBreakdown(tracker).content[0].text);
+
+    expect(body.unpriced_by_model).toEqual({ 'claude-foo-9-9': { calls: 1, tokens: 1_200 } });
+  });
+
+  it('reports family-priced calls in estimated_by_model', () => {
+    const tracker = new CostTracker();
+    handleReportTokens(tracker, {
+      input_tokens: 1_000,
+      output_tokens: 200,
+      model: 'claude-opus-5-9',
+    });
+
+    const body = JSON.parse(handleGetCostBreakdown(tracker).content[0].text);
+
+    expect(body.estimated_by_model).toEqual({
+      'claude-opus-5-9': {
+        calls: 1,
+        tokens: 1_200,
+        estimatedFrom: estimatedFromOf('claude-opus-5-9'),
+      },
+    });
+    expect(body.unpriced_by_model).toEqual({});
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -239,7 +346,6 @@ describe('handleGetPromptCacheHealth()', () => {
     // we need precise control, so spy on getMetrics instead.
     jest.spyOn(tracker, 'getMetrics').mockReturnValue({
       sessionTotalCostUsd: null,
-      costByTask: null,
       costByModel: {},
       costPerLineOfCode: null,
       costPerFileModified: null,
@@ -258,6 +364,14 @@ describe('handleGetPromptCacheHealth()', () => {
       subagentCostUsd: 0,
       parentCostUsd: 0,
       costByWorkflowRunId: {},
+      costByDayUsd: {},
+      subagentCostByDayUsd: {},
+      unpricedByModel: {},
+      estimatedByModel: {},
+      subagentByAgentType: {},
+      highContextCostUsd: 0,
+      apiDurationMs: null,
+      costRateMultiplierApplied: 1,
       ...overrides,
     } satisfies CostMetrics);
     return tracker;
@@ -276,6 +390,7 @@ describe('handleGetPromptCacheHealth()', () => {
       totalInputTokens: 2_000,
       totalCacheReadTokens: 6_000,
       totalCacheCreationTokens: 2_000,
+      totalThinkingTokens: 0,
       cacheHitRate: 0.6,
       totalCacheSavingsUsd: 0.12,
       reportCount: 5,
@@ -291,6 +406,7 @@ describe('handleGetPromptCacheHealth()', () => {
       totalInputTokens: 9_000,
       totalCacheReadTokens: 500,
       totalCacheCreationTokens: 500,
+      totalThinkingTokens: 0,
       cacheHitRate: 0.05,
       totalCacheSavingsUsd: 0.001,
       reportCount: 5,
@@ -306,6 +422,7 @@ describe('handleGetPromptCacheHealth()', () => {
       totalInputTokens: 5_000,
       totalCacheReadTokens: 3_000,
       totalCacheCreationTokens: 2_000,
+      totalThinkingTokens: 0,
       cacheHitRate: 0.3,
       totalCacheSavingsUsd: 0.05,
       reportCount: 5,
@@ -320,6 +437,7 @@ describe('handleGetPromptCacheHealth()', () => {
       totalInputTokens: 5_000,
       totalCacheReadTokens: 3_000,
       totalCacheCreationTokens: 2_000,
+      totalThinkingTokens: 0,
       cacheHitRate: 0.3,
       totalCacheSavingsUsd: 0.05,
       reportCount: 5,
@@ -336,6 +454,7 @@ describe('handleGetPromptCacheHealth()', () => {
       totalInputTokens: 3_000,
       totalCacheReadTokens: 6_000,
       totalCacheCreationTokens: 1_000,
+      totalThinkingTokens: 0,
       cacheHitRate: 0.6,
       totalCacheSavingsUsd: 0.25,
       reportCount: 3,
@@ -378,6 +497,20 @@ describe('handleGetBudgetStatus()', () => {
 
 describe('handleGetCostForecast()', () => {
   it('anchors the end-of-day forecast to getCostForDay()/getFirstActivityMsForDay(), not the full session spend', () => {
+    // Freeze the clock. The handler and the `expected` computation below each
+    // read Date.now() independently, and today's day-bucket anchor is only
+    // milliseconds old here, so the projected rate is dailySpend / (a few ms):
+    // even single-digit ms of drift between the two reads moves a five-figure
+    // end-of-day forecast past toBeCloseTo(…, 2). Seen failing on CI runners.
+    jest.useFakeTimers({ now: Date.now() });
+    try {
+      runAnchoredForecastCase();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  function runAnchoredForecastCase(): void {
     const tracker = new CostTracker();
 
     // Backdated (but within the 48h late-arrival window) so it inflates the
@@ -428,6 +561,52 @@ describe('handleGetCostForecast()', () => {
     // `body` given the huge backdated "yesterday" spend above.
     expect(body.forecastEndOfDayUsd).toBeCloseTo(expected.forecastEndOfDayUsd ?? 0, 2);
     expect(sessionTotalCostUsd).toBeGreaterThan(tracker.getCostForDay(todayKey));
+  }
+
+  it('omits resumeContext when no sessionResumeTracker is passed', () => {
+    const tracker = new CostTracker();
+    const result = handleGetCostForecast(tracker, Date.now());
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.resumeContext).toBeUndefined();
+  });
+
+  it('includes resumeContext (all zeros) when a sessionResumeTracker with no resumes is passed', () => {
+    const tracker = new CostTracker();
+    const resumeTracker = new SessionResumeTracker();
+    const result = handleGetCostForecast(tracker, Date.now(), resumeTracker);
+    const body = JSON.parse(result.content[0].text);
+
+    expect(body.resumeContext).toEqual({
+      resumeCount: 0,
+      totalEstimatedCacheWriteUsd: 0,
+      lastResume: null,
+    });
+  });
+
+  it('includes resumeContext reflecting a recorded resume, without perturbing the forecast fields', () => {
+    const tracker = new CostTracker();
+    const resumeTracker = new SessionResumeTracker();
+    resumeTracker.recordResume({
+      secondsSinceLastResponse: 5400,
+      contextTokens: 182340,
+      promptCacheLikelyExpired: true,
+      estimatedCacheWriteUsd: 1.1396,
+      timestampMs: 1700000000000,
+    });
+
+    const sessionStartMs = Date.now() - 60_000;
+    const withResume = handleGetCostForecast(tracker, sessionStartMs, resumeTracker);
+    const withoutResume = handleGetCostForecast(tracker, sessionStartMs);
+    const bodyWithResume = JSON.parse(withResume.content[0].text);
+    const bodyWithoutResume = JSON.parse(withoutResume.content[0].text);
+
+    expect(bodyWithResume.resumeContext.resumeCount).toBe(1);
+    expect(bodyWithResume.resumeContext.totalEstimatedCacheWriteUsd).toBeCloseTo(1.1396);
+    expect(bodyWithResume.resumeContext.lastResume.estimatedCacheWriteUsd).toBeCloseTo(1.1396);
+    // The forecast math itself must be identical with/without resumeContext present.
+    expect(bodyWithResume.forecastEndOfDayUsd).toBe(bodyWithoutResume.forecastEndOfDayUsd);
+    expect(bodyWithResume.rateUsdPerMs).toBe(bodyWithoutResume.rateUsdPerMs);
   });
 });
 

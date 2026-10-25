@@ -7,19 +7,19 @@
  *   - efficiency         — from TrendAnalyzer
  *   - prompt_engineering — from PromptFeedbackEngine
  *   - claudemd           — from ClaudeMdTracker
- *   - model_selection    — from TrendAnalyzer.detectModelMigrationImpact()
+ *   - model_selection    — from TrendAnalyzer.rankModelsByOutcome()
  */
 
 import { createHash } from 'node:crypto';
 import type { MetricAggregator } from '../shared/index.js';
 import { createLogger } from '../shared/index.js';
-import type { SessionStore } from '../storage/session-store.js';
 import type { TrendAnalyzer } from './trend-analyzer.js';
 import type { CollaborationProfiler } from './collaboration-profile.js';
 import type { ClaudeMdTracker } from './claudemd-tracker.js';
 import type { PromptFeedbackEngine } from './prompt-feedback.js';
 import type { CostPerOutcomeAnalyzer } from './cost-per-outcome.js';
 import type { TaskDetector } from './task-detector.js';
+import type { ModelUsageTracker } from './model-usage-tracker.js';
 
 const logger = createLogger('recommendation-engine');
 
@@ -35,6 +35,12 @@ export interface Recommendation {
   readonly detail: string;
   readonly evidence: string;
   readonly estimatedSavings?: string;
+  // Only set for 'prompt_engineering' recommendations — identifies which of
+  // PromptFeedbackEngine's own sub-categories (prompt_context/plan_mode/
+  // file_paths/claudemd_impact) produced this item. Lets callers dedupe
+  // against other categories (e.g. 'claudemd_impact' restates the same
+  // signal as the top-level 'claudemd' category) without parsing title text.
+  readonly subCategory?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,35 +49,54 @@ export interface Recommendation {
 
 const PRIORITY_ORDER: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
+// Judgment calls, not derived from data — see the class-level comment above
+// getCostRecommendations()/getEfficiencyRecommendations() for the rationale.
+const MIN_INVESTIGATION_SAMPLE = 3;
+const INVESTIGATION_COST_MULTIPLIER = 2;
+const MIN_WEEKLY_SESSIONS_FOR_TREND_COMPARISON = 3;
+const MIN_EFFICIENCY_DROP_POINTS = 0.1;
+const CLAUDEMD_LARGE_TOKEN_THRESHOLD = 3000;
+const CLAUDEMD_MIN_PER_TURN_COST_USD = 0.005;
+
+// Human-readable titles for PromptFeedbackEngine's sub-categories — its
+// `category` field is a slug (e.g. 'plan_mode'), not display text. Falls
+// back to the raw slug for any future category this map hasn't caught up to.
+const PROMPT_RECOMMENDATION_TITLES: Record<string, string> = {
+  prompt_context: 'High correction rate',
+  plan_mode: 'Low autonomy on complex tasks',
+  file_paths: 'Frequent file re-reads',
+  claudemd_impact: 'Negative instruction-file impact',
+};
+
 // ---------------------------------------------------------------------------
 // RecommendationEngine
 // ---------------------------------------------------------------------------
 
 export class RecommendationEngine {
-  private readonly sessionStore: SessionStore;
   private readonly trendAnalyzer: TrendAnalyzer;
   private readonly collaborationProfiler: CollaborationProfiler;
   private readonly claudeMdTracker: ClaudeMdTracker;
   private readonly promptFeedbackEngine: PromptFeedbackEngine;
   private readonly costPerOutcomeAnalyzer: CostPerOutcomeAnalyzer;
   private readonly taskDetector?: TaskDetector;
+  private readonly modelUsageTracker?: ModelUsageTracker;
 
   constructor(options: {
-    sessionStore: SessionStore;
     trendAnalyzer: TrendAnalyzer;
     collaborationProfiler: CollaborationProfiler;
     claudeMdTracker: ClaudeMdTracker;
     promptFeedbackEngine: PromptFeedbackEngine;
     costPerOutcomeAnalyzer: CostPerOutcomeAnalyzer;
     taskDetector?: TaskDetector;
+    modelUsageTracker?: ModelUsageTracker;
   }) {
-    this.sessionStore = options.sessionStore;
     this.trendAnalyzer = options.trendAnalyzer;
     this.collaborationProfiler = options.collaborationProfiler;
     this.claudeMdTracker = options.claudeMdTracker;
     this.promptFeedbackEngine = options.promptFeedbackEngine;
     this.costPerOutcomeAnalyzer = options.costPerOutcomeAnalyzer;
     this.taskDetector = options.taskDetector;
+    this.modelUsageTracker = options.modelUsageTracker;
   }
 
   /**
@@ -212,15 +237,26 @@ export class RecommendationEngine {
       );
     }
 
-    // Expensive investigations
-    if (attribution.costPerInvestigation > 2) {
+    // Expensive investigations — compared against this developer's own
+    // average task cost rather than a fixed dollar figure, since what
+    // "expensive" means depends on the developer's task mix and a stale
+    // absolute threshold doesn't scale with it. Requires a few investigation
+    // tasks so one outlier doesn't trigger this alone.
+    const investigationCount = attribution.outcomeDistribution['investigation']?.count ?? 0;
+    const avgTaskCost =
+      attribution.totalTasks > 0 ? attribution.totalCost / attribution.totalTasks : 0;
+    if (
+      investigationCount >= MIN_INVESTIGATION_SAMPLE &&
+      avgTaskCost > 0 &&
+      attribution.costPerInvestigation > avgTaskCost * INVESTIGATION_COST_MULTIPLIER
+    ) {
       recs.push(
         makeRec(
           'cost_optimization',
           'medium',
           'Expensive investigation tasks',
-          'Investigation tasks cost more than expected. Consider using Grep/Glob before asking AI to explore.',
-          `Investigation tasks cost $${round(attribution.costPerInvestigation, 2)} avg`,
+          'Investigation tasks are costing notably more than your other task types this week. Check whether they need a more targeted read pattern — but a broad exploration or subagent fan-out can legitimately cost more than a manual grep while still saving more of your time.',
+          `Investigation tasks cost $${round(attribution.costPerInvestigation, 2)} avg vs $${round(avgTaskCost, 2)} avg across all task types`,
         ),
       );
     }
@@ -244,14 +280,23 @@ export class RecommendationEngine {
       const previous = effTrend[effTrend.length - 2]!;
       const drop = previous.value - latest.value;
 
-      if (drop > 0.1) {
-        const dropPct = round(drop * 100, 0);
+      // Require a minimum sample in the latest week — a single scored
+      // session can otherwise swing the score and trigger this alone (same
+      // gating personal-coach.ts uses for its own weekly comparisons).
+      const hasSufficientSample = latest.sessionCount >= MIN_WEEKLY_SESSIONS_FOR_TREND_COMPARISON;
+
+      if (hasSufficientSample && drop > MIN_EFFICIENCY_DROP_POINTS) {
+        // The score is on a [0,1] scale, so a drop of 0.1 is 10 *points*,
+        // not 10% — reporting it as "%" mislabels a point-scale delta as a
+        // percentage (personal-coach.ts already describes the equivalent
+        // case correctly, as points).
+        const dropPoints = round(drop * 100, 0);
         recs.push(
           makeRec(
             'efficiency',
             'high',
             'Efficiency score dropped',
-            `Your efficiency score dropped ${dropPct}% from ${previous.week} to ${latest.week}. Check for increased anti-patterns.`,
+            `Your efficiency score dropped ${dropPoints} points from ${previous.week} to ${latest.week}. Check for increased anti-patterns.`,
             `Efficiency: ${round(previous.value, 2)} → ${round(latest.value, 2)}`,
           ),
         );
@@ -271,10 +316,11 @@ export class RecommendationEngine {
       makeRec(
         'prompt_engineering',
         pr.priority,
-        pr.category,
+        PROMPT_RECOMMENDATION_TITLES[pr.category] ?? pr.category,
         pr.message,
         pr.evidence,
         pr.estimatedImpact,
+        pr.category,
       ),
     );
   }
@@ -299,13 +345,22 @@ export class RecommendationEngine {
         );
       }
 
-      if (impact.contextTokensForClaudeMd !== null && impact.contextTokensForClaudeMd > 3000) {
+      // Gated on the cache-adjusted per-turn cost, not just raw token count —
+      // a large but well-cached CLAUDE.md (served from prompt cache on
+      // repeat turns) has a real marginal cost far below what its token
+      // count alone would suggest, and shouldn't be flagged as a problem.
+      if (
+        impact.contextTokensForClaudeMd !== null &&
+        impact.contextTokensForClaudeMd > CLAUDEMD_LARGE_TOKEN_THRESHOLD &&
+        impact.estimatedPerTurnCostUsd !== null &&
+        impact.estimatedPerTurnCostUsd > CLAUDEMD_MIN_PER_TURN_COST_USD
+      ) {
         recs.push(
           makeRec(
             'claudemd',
             'medium',
             'Large CLAUDE.md context cost',
-            `CLAUDE.md consumes ~${impact.contextTokensForClaudeMd} tokens per turn. Consider condensing rarely-used sections.`,
+            `CLAUDE.md consumes ~${impact.contextTokensForClaudeMd} tokens per turn (~$${impact.estimatedPerTurnCostUsd.toFixed(4)}, cache-adjusted). Consider condensing rarely-used sections.`,
             `${impact.contextTokensForClaudeMd} tokens/turn`,
           ),
         );
@@ -317,40 +372,33 @@ export class RecommendationEngine {
 
   private getModelRecommendations(): Recommendation[] {
     const recs: Recommendation[] = [];
+    const report = this.trendAnalyzer.rankModelsByOutcome();
 
-    const sessions = this.sessionStore.loadAllSessions();
-    const models = new Set(sessions.map((s) => s.model).filter(Boolean));
-
-    if (models.size >= 2) {
-      const modelArr = [...models];
-      const comparison = this.trendAnalyzer.detectModelMigrationImpact(modelArr[0]!, modelArr[1]!);
-
-      if (
-        comparison.modelASessionCount >= 2 &&
-        comparison.modelBSessionCount >= 2 &&
-        comparison.modelACost > 0 &&
-        comparison.modelBCost > 0
-      ) {
-        const costRatio = round(comparison.modelACost / comparison.modelBCost, 1);
-        const effA = comparison.modelAEfficiency ?? 0;
-        const effB = comparison.modelBEfficiency ?? 0;
-        const effDiff = round(Math.abs(effA - effB) * 100, 0);
-
-        const actualRatio = costRatio > 1 ? costRatio : 1 / costRatio;
-        if (actualRatio > 2 && effDiff < 15) {
-          const cheaper = costRatio > 1 ? modelArr[1] : modelArr[0];
-          recs.push(
-            makeRec(
-              'model_selection',
-              'medium',
-              'Cost-inefficient model usage',
-              `One model costs ${actualRatio}x more but only improves efficiency by ${effDiff}%. Consider using ${cheaper} for routine tasks.`,
-              `${modelArr[0]}: $${round(comparison.modelACost, 2)}/session, ${modelArr[1]}: $${round(comparison.modelBCost, 2)}/session`,
-            ),
-          );
-        }
-      }
+    if (report.confidence !== 'high' || report.recommendedModel === null) {
+      return recs;
     }
+
+    const currentModel = this.modelUsageTracker?.getMetrics().mostUsedModel ?? null;
+    if (currentModel === null || currentModel === report.recommendedModel) {
+      return recs;
+    }
+
+    const top = report.ranked.find((m) => m.model === report.recommendedModel);
+    const current = report.ranked.find((m) => m.model === currentModel);
+    if (!top) return recs;
+
+    recs.push(
+      makeRec(
+        'model_selection',
+        'high',
+        'Historically better-performing model available',
+        `Across ${top.sessionCount} past sessions, ${report.recommendedModel} averaged a higher efficiency score than your current default (${currentModel}). Consider switching. Note: this doesn't control for task difficulty — if harder work tends to get routed to one model, its score is pulled down independent of the model itself.`,
+        `${report.recommendedModel}: avg efficiency ${top.avgEfficiencyScore ?? 'n/a'}, $${top.avgCostUsd}/session (n=${top.sessionCount})` +
+          (current
+            ? `; ${currentModel}: avg efficiency ${current.avgEfficiencyScore ?? 'n/a'}, $${current.avgCostUsd}/session (n=${current.sessionCount})`
+            : `; ${currentModel}: no scored sessions yet`),
+      ),
+    );
 
     return recs;
   }
@@ -367,6 +415,7 @@ function makeRec(
   detail: string,
   evidence: string,
   estimatedSavings?: string,
+  subCategory?: string,
 ): Recommendation {
   const hash = createHash('sha256').update(`${category}:${title}`).digest('hex').slice(0, 12);
 
@@ -378,6 +427,7 @@ function makeRec(
     detail,
     evidence,
     ...(estimatedSavings != null && { estimatedSavings }),
+    ...(subCategory != null && { subCategory }),
   };
 }
 

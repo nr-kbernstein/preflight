@@ -1,44 +1,69 @@
 import { useMemo, useState, useRef, useEffect } from 'react';
-import type { JSX } from 'react';
+import type { JSX, ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { useLocation } from 'wouter';
+import { Link, useLocation } from 'wouter';
 import {
   useLiveStore,
   useSubagentStats,
-  useObservabilityHealth,
   type AlertEvent,
+  type AntiPatternEvent,
 } from '../store/liveStore';
 import { Kpi } from '../components/Kpi';
 import { AnimatedCard } from '../components/AnimatedCard';
-import { HourlyCostBlocks, type HourlyCostEntry } from '../components/HourlyCostBlocks';
+import { DiscreteBlockChart, type DiscreteBlockChartItem } from '../components/DiscreteBlockChart';
 import { EmptyState } from '../components/EmptyState';
 import { SessionTrace } from '../components/SessionTrace';
 import { WorkflowRunDetail } from '../components/WorkflowRunDetail';
+import { SessionDetailDialog } from '../components/SessionDetailDialog';
 import type { AgentSpan } from '../components/AgentSwimlanes';
-import { ConcurrencyIndicator, type ConcurrencyData } from '../components/ConcurrencyIndicator';
-import { ActivityHeatmap } from '../components/ActivityHeatmap';
+import type { ConcurrencyData } from '../components/ConcurrencyIndicator';
+import { UnpricedSpendNotice } from '../components/UnpricedSpendNotice';
 import { ContextBar } from '../components/ContextBar';
-import { Card, Eyebrow, LiveBadge, Pill } from '../components/ui';
+import { Panel } from '../components/ui/Panel';
+import { HealthCard, type HealthCardRow, type HealthTone } from '../components/HealthCard';
+import { SpendBars, type SpendBarsDatum } from '../components/SpendBars';
+import {
+  UsageContributionPanel,
+  buildToolTableRows,
+  type ModelShareRow,
+} from '../components/UsageContributionPanel';
+import { AttentionList, type AttentionRow } from '../components/AttentionList';
+import { Card, Eyebrow, InfoTooltip, LiveBadge, Pill } from '../components/ui';
 import {
   fetchRecentAlerts,
   fetchCacheHealth,
   fetchCost,
+  fetchCostPerTool,
   fetchSessionCurrent,
   fetchSessionsList,
   fetchSessionReplay,
   fetchSessionSubagents,
   fetchWorkflows,
   fetchAntiPatterns,
+  fetchTurnCosts,
+  type TurnCostsResponse,
+  fetchDecisionTree,
+  type DecisionTreeResponse,
+  fetchContext,
+  type ContextResponse,
+  fetchContextComposition,
+  type ContextCompositionResponse,
+  fetchContextEfficiency,
+  type ContextEfficiencyResponse,
+  fetchComputeWaste,
   fetchQualityProxy,
+  fetchApiFailures,
+  type ApiFailureMetrics,
   fetchToolSelectionScore,
   fetchConcurrency,
   fetchActivityHeatmap,
-  fetchLatency,
   fetchModelUsage,
   fetchLiveSessions,
   fetchTodayAggregate,
   fetchObservabilityHealth,
+  fetchUsageInsights,
   TodayAggregateResponse,
+  type SessionStatus,
   ActivityHeatmapTodayResponse,
   LiveSessionEntry,
   NotFoundError,
@@ -46,17 +71,22 @@ import {
   ObservabilityHealthResponse,
   qk,
   type SessionSubagentsResponse,
+  type LatencyPercentiles,
+  type UsageInsightsReport,
 } from '../api/client';
 import {
   fmtTimeOfDay,
+  formatMs,
   formatNumber,
+  formatPct,
+  formatRelativeTime,
+  formatTokensCompact,
   formatUsd,
   formatUsdOrDash,
-  rateColor,
-  scoreColor,
   shortToolName,
 } from '../lib/format';
-import { isSameLocalDay, localStartOfDay } from '../../lib/date.js';
+import { isSameLocalDay, localStartOfDay, todayPortionRatio } from '../../lib/date.js';
+import { buildWeekForecast } from '../lib/forecast.js';
 
 const HEADER_TIMESTAMP_FORMAT = {
   weekday: 'short',
@@ -76,20 +106,19 @@ const SEVERITY_DOT: Record<AlertEvent['severity'], string> = {
 
 interface CostApiResponse {
   readonly cost: { readonly sessionTotalCostUsd?: number | null; readonly model?: string | null };
-  readonly forecast: { readonly forecastEndOfDayUsd?: number | null } | null;
+  readonly forecast: {
+    readonly forecastEndOfDayUsd?: number | null;
+    readonly forecastEndOfWeekUsd?: number | null;
+    readonly forecastSessionEndUsd?: number | null;
+    readonly confidenceNote?: string | null;
+  } | null;
   readonly sessionTodayUsd?: number | null;
 }
 
 // Minimal view of the /api/session/current payload.
-interface SessionCurrentApiResponse {
-  readonly efficiencyScore?: number | null;
-  readonly toolSuccessRate?: number | null;
-  readonly toolErrorCount?: number;
-  readonly toolCallCount?: number;
-}
-
 interface SessionAntiPattern {
   readonly type: string;
+  readonly sessionId?: string;
   readonly count?: number;
   readonly file?: string;
   readonly command?: string;
@@ -100,7 +129,58 @@ interface SessionAntiPattern {
   readonly agentCount?: number;
 }
 
-interface SessionSummary {
+// Reads whichever count-shaped field a given anti-pattern actually carries —
+// the persisted/API shape varies by pattern type (readCount for re-reading,
+// repeatCount for thrashing, etc.) with no single unified `count` field.
+function resolveAntiPatternCount(ap: SessionAntiPattern): number {
+  return (
+    ap.count ??
+    ap.iterations ??
+    ap.readCount ??
+    ap.repeatCount ??
+    ap.editCount ??
+    ap.agentCount ??
+    0
+  );
+}
+
+interface ComputeWasteApiResponse {
+  readonly total_tokens_wasted: number;
+  readonly retry_tokens_wasted: number;
+  readonly anti_pattern_tokens_wasted: number;
+  readonly breakdown: ReadonlyArray<{
+    readonly type: string;
+    readonly tokens_wasted: number;
+    readonly instances: number;
+  }>;
+  readonly by_session?: ReadonlyArray<{
+    readonly session_id: string;
+    readonly tokens_wasted: number;
+    readonly alert_count: number;
+  }>;
+  readonly status: 'clean' | 'moderate' | 'needs_attention';
+}
+
+function computeWasteRecommendationText(
+  status: ComputeWasteApiResponse['status'],
+  topPatternType: string | null,
+): string {
+  if (status === 'clean') return 'No compute waste detected this session.';
+
+  const patternAdvice: Record<string, string> = {
+    stuck_loop: 'Address the command output before re-running the same command.',
+    re_reading: 'Read each file once and keep relevant sections in mind.',
+    thrashing: 'Read the test failure output carefully before editing again.',
+    blind_editing: 'Verify changes with tests between edit batches.',
+    over_delegation:
+      'Multiple sub-agent spawns failed or were interrupted — investigate why before retrying.',
+  };
+
+  const advice = topPatternType !== null ? (patternAdvice[topPatternType] ?? null) : null;
+  return advice ?? 'Review anti-patterns to reduce repeated tool calls.';
+}
+
+export interface SessionSummary {
   readonly sessionId: string;
   readonly sessionName?: string | null;
   readonly startTime?: number;
@@ -111,6 +191,7 @@ interface SessionSummary {
   readonly antiPatterns?: SessionAntiPattern[];
   readonly model?: string | null;
   readonly toolSuccessRate?: number | null;
+  readonly toolBreakdown?: Record<string, number>;
 }
 
 interface QualityProxyMetrics {
@@ -145,66 +226,52 @@ export function Today(): JSX.Element {
   const cost = useLiveStore((s) => s.cost);
   const antiPatterns = useLiveStore((s) => s.antiPatterns);
   const subagentStats = useSubagentStats();
-  const observabilityHealth = useObservabilityHealth();
   const { data: healthApi } = useQuery<ObservabilityHealthResponse>({
     queryKey: ['observability-health'],
-    queryFn: fetchObservabilityHealth,
+    queryFn: ({ signal }) => fetchObservabilityHealth(signal),
     refetchInterval: 30_000,
   });
 
   const { data: costApi, isPending: costPending } = useQuery<CostApiResponse>({
     queryKey: qk.cost,
-    queryFn: fetchCost,
-  });
-  // The dashboard owner's session_current is arbitrary across
-  // N concurrent sessions, so we keep the call only for the efficiencyScore
-  // KPI (which is local to whichever MCP holds the dashboard). All other
-  // KPIs now derive from the aggregate endpoint, which fans out across every
-  // per-session buffer + persisted session.
-  const { data: sessionCurrent } = useQuery<SessionCurrentApiResponse>({
-    queryKey: qk.sessionCurrent,
-    queryFn: fetchSessionCurrent,
+    queryFn: ({ signal }) => fetchCost(signal),
     refetchInterval: 10_000,
   });
   const { data: aggregate, isPending: aggregatePending } = useQuery<TodayAggregateResponse>({
     queryKey: qk.sessionsTodayAggregate,
-    queryFn: fetchTodayAggregate,
+    queryFn: ({ signal }) => fetchTodayAggregate(signal),
     refetchInterval: 10_000,
   });
   const { data: todaySessions, isPending: sessionsPending } = useQuery<SessionSummary[]>({
     queryKey: qk.sessionsList(200),
-    queryFn: () => fetchSessionsList(200),
+    queryFn: ({ signal }) => fetchSessionsList(200, signal),
     refetchInterval: 10_000,
   });
   const { data: apiAntiPatterns, isPending: antiPatternsPending } = useQuery<SessionAntiPattern[]>({
     queryKey: qk.antiPatterns,
-    queryFn: fetchAntiPatterns,
+    queryFn: ({ signal }) => fetchAntiPatterns(signal),
   });
   const { data: concurrency, isPending: concurrencyPending } = useQuery<ConcurrencyData>({
     queryKey: qk.concurrency,
-    queryFn: fetchConcurrency,
+    queryFn: ({ signal }) => fetchConcurrency(signal),
     refetchInterval: 10_000,
   });
   const { data: todayHeatmap, isPending: todayHeatmapPending } =
     useQuery<ActivityHeatmapTodayResponse>({
       queryKey: qk.activityHeatmap('today'),
-      queryFn: () => fetchActivityHeatmap('today'),
+      queryFn: ({ signal }) => fetchActivityHeatmap('today', undefined, signal),
       refetchInterval: 30_000,
     });
   // Live-session list — drives the selector default and the
   // "Session ended" badge logic when the selected session goes stale.
   const { data: liveSessions, isPending: liveSessionsPending } = useQuery<LiveSessionEntry[]>({
     queryKey: qk.sessionsLive,
-    queryFn: fetchLiveSessions,
+    queryFn: ({ signal }) => fetchLiveSessions(signal),
     refetchInterval: 10_000,
   });
 
   const persistedTodaySpend = useMemo(
     () => computeTodaySpend(todaySessions ?? []),
-    [todaySessions],
-  );
-  const persistedTodayCalls = useMemo(
-    () => computeTodayToolCalls(todaySessions ?? []),
     [todaySessions],
   );
   const persistedTodayFlags = useMemo(
@@ -213,6 +280,19 @@ export function Today(): JSX.Element {
   );
   const hourlySpend = useMemo(() => buildHourlySpend(todaySessions ?? []), [todaySessions]);
 
+  // Fallback source for the attention panel's anti-pattern flags when
+  // neither the live SSE store nor this process's own /api/anti-patterns has
+  // anything — the pattern may have been detected by a different process,
+  // but its persisted session record (already fetched for the KPI strip)
+  // still has it.
+  const persistedAntiPatterns = useMemo(
+    () =>
+      (todaySessions ?? [])
+        .filter((s) => todayOverlapRatio(s) > 0)
+        .flatMap((s) => (s.antiPatterns ?? []).map((a) => ({ ...a, sessionId: s.sessionId }))),
+    [todaySessions],
+  );
+
   // Prefer the cross-session aggregate when present; fall
   // back to the legacy persisted-sessions math during the loading window so
   // the KPIs don't blink to zero on first paint. Use Math.max (not `??`)
@@ -220,8 +300,11 @@ export function Today(): JSX.Element {
   // disk-only data sources see no events from today (e.g., the live
   // session's events are in the in-memory tool-call buffer of a different
   // MCP, not in any drained buffer-*.jsonl file). Matches the spend +
-  // flags formulas just below.
-  const calls = Math.max(aggregate?.toolCallCount ?? 0, persistedTodayCalls);
+  // flags formulas just below. `costApi?.sessionTodayUsd` (the REST
+  // fallback for this process's own today-scoped spend) is folded in
+  // alongside the SSE and aggregate sources so the KPI reflects real spend
+  // as soon as any one source resolves, instead of waiting on the first SSE
+  // frame while the aggregate still legitimately reads 0.
   const spendLoading =
     (costPending || sessionsPending || aggregatePending) &&
     !cost &&
@@ -231,6 +314,7 @@ export function Today(): JSX.Element {
     cost?.todayTotalUsd ?? 0,
     aggregate?.totalCostUsd ?? 0,
     persistedTodaySpend,
+    costApi?.sessionTodayUsd ?? 0,
   );
 
   // Aggregate flags = anti-patterns from every live + persisted session today.
@@ -242,6 +326,12 @@ export function Today(): JSX.Element {
     aggregate?.antiPatternCount ?? 0,
     persistedTodayFlags + currentSessionFlags,
   );
+  const forecastKpiUsd = spendLoading
+    ? null
+    : (aggregate?.forecastEndOfDayUsd ??
+      cost?.forecastEodUsd ??
+      costApi?.forecast?.forecastEndOfDayUsd ??
+      null);
 
   // The subagent KPI must source from the polled aggregate
   // endpoint, not the liveStore — the SSE frames that would populate
@@ -250,24 +340,55 @@ export function Today(): JSX.Element {
   // (if/when wired) still bump the KPI between aggregate refetches, while the
   // API remains the source of truth for the at-rest value via polling.
   const subagentUsd = Math.max(aggregate?.subagentUsd ?? 0, subagentStats.usd);
-  const subagentTurns = Math.max(aggregate?.subagentTurnCount ?? 0, subagentStats.turns);
   // Distinguish "no data yet" (aggregate still loading and no live ticks) from
   // a genuine zero so the KPI shows the em-dash empty state instead of $0.00.
   const subagentHasData = aggregate !== undefined || subagentStats.turns > 0;
+  const subagentSub =
+    subagentHasData && todayTotal > 0
+      ? `${formatPct((subagentUsd / todayTotal) * 100)} of today`
+      : undefined;
+  void subagentSub; // Preserved for future Subagents breakdown table
+  // The watcher-off caveat only matters while this process has recorded no
+  // subagent turns of its own — once it has, the KPI is clearly live.
+  const watcherOff = healthApi?.watcherActive === false && subagentUsd === 0;
+  // buildWeekForecast clamps its own projection to at least the total it's
+  // given, so that total must be the most trustworthy total available.
+  // Prefer aggregate.totalCostUsd once it's the dominant source — it can
+  // legitimately read 0 before its disk-only sources see today's events,
+  // even though a fresher SSE/REST source already knows about real spend.
+  const weekForecastTotalUsd =
+    aggregate && aggregate.totalCostUsd >= todayTotal ? aggregate.totalCostUsd : todayTotal;
+  const weekForecast =
+    forecastKpiUsd !== null
+      ? buildWeekForecast(todaySessions ?? [], forecastKpiUsd, weekForecastTotalUsd, Date.now())
+      : null;
   const [headerTimestamp, setHeaderTimestamp] = useState(() =>
     new Date().toLocaleString(undefined, HEADER_TIMESTAMP_FORMAT),
   );
+  // Tracks the local calendar day this component last observed. The same
+  // 60s tick that refreshes the header clock also checks for a local-
+  // midnight rollover and clears the SSE-derived cost/subagent snapshot when
+  // one is detected — without this, a dashboard tab left open across
+  // midnight with no new tool-call activity right away keeps rendering
+  // yesterday's "Spend Today"/forecast/subagent numbers forever, since
+  // setCost()/addSubagentTurn() only fire on a fresh server push and nothing
+  // else invalidates the cached value.
+  const lastSeenDayRef = useRef(Date.now());
   useEffect(() => {
-    const id = setInterval(
-      () => setHeaderTimestamp(new Date().toLocaleString(undefined, HEADER_TIMESTAMP_FORMAT)),
-      60_000,
-    );
+    const id = setInterval(() => {
+      const now = Date.now();
+      setHeaderTimestamp(new Date(now).toLocaleString(undefined, HEADER_TIMESTAMP_FORMAT));
+      if (!isSameLocalDay(now, lastSeenDayRef.current)) {
+        lastSeenDayRef.current = now;
+        useLiveStore.getState().handleDayRollover();
+      }
+    }, 60_000);
     return () => clearInterval(id);
   }, []);
 
-  const effScore = sessionCurrent?.efficiencyScore ?? null;
+  const effScore = aggregate?.avgEfficiencyScore ?? null;
   const effDisplay =
-    effScore !== null && Number.isFinite(effScore) ? `${Math.round(effScore * 100)}%` : '—';
+    effScore !== null && Number.isFinite(effScore) ? formatPct(effScore * 100) : '—';
   const effSub =
     effScore === null
       ? 'needs more data'
@@ -285,7 +406,7 @@ export function Today(): JSX.Element {
     !concurrencyPending &&
     !todayHeatmapPending &&
     !liveSessionsPending &&
-    calls === 0 &&
+    (aggregate?.sessionCount ?? 0) === 0 &&
     todayTotal === 0 &&
     flagsCount === 0;
 
@@ -295,6 +416,10 @@ export function Today(): JSX.Element {
         <h1 className="text-xl font-semibold text-ink-base">Today</h1>
         <span className="text-xs text-ink-muted">{headerTimestamp}</span>
       </header>
+      <UnpricedSpendNotice
+        unpricedByModel={aggregate?.unpricedByModel}
+        estimatedByModel={aggregate?.estimatedByModel}
+      />
 
       {noActivityToday ? (
         <>
@@ -306,181 +431,128 @@ export function Today(): JSX.Element {
             />
           </AnimatedCard>
 
-          <AnimatedCard index={1}>
-            <RecentAlertsPanel />
+          <AnimatedCard index={1} className="mb-3">
+            <SpendBreakdownPanel todaySessions={todaySessions ?? []} />
+          </AnimatedCard>
+
+          <AnimatedCard index={2}>
+            <NeedsAttentionPanel
+              antiPatterns={antiPatterns}
+              apiAntiPatterns={apiAntiPatterns}
+              persistedAntiPatterns={persistedAntiPatterns}
+              flagsCount={flagsCount}
+            />
           </AnimatedCard>
         </>
       ) : (
         <>
-          {(observabilityHealth?.watcherDisabledByLock === true ||
-            healthApi?.watcherDisabledByLock === true) && (
-            <div className="rounded-lg border border-accent-amber/30 bg-accent-amber/10 px-4 py-3 text-sm text-accent-amber mb-4">
-              Subagent watcher is disabled (lock conflict). Subagent costs may be undercounted.
-              Check Settings &rarr; Observability health.
+          <AnimatedCard index={0} className="mb-4">
+            <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4">
+              <Card>
+                <Kpi
+                  label="efficiency"
+                  hero
+                  value={effDisplay}
+                  sub={effSub}
+                  {...(effScore !== null
+                    ? { animate: true, numericValue: Math.round(effScore * 100), suffix: '%' }
+                    : {})}
+                />
+              </Card>
+              <Card>
+                <Kpi
+                  label="spend today"
+                  value={spendLoading ? '…' : formatUsd(todayTotal)}
+                  sub={
+                    forecastKpiUsd != null && forecastKpiUsd > todayTotal
+                      ? weekForecast != null
+                        ? `→ ${formatUsd(forecastKpiUsd)} by end of day · ~${formatUsd(weekForecast)} by end of week`
+                        : `→ ${formatUsd(forecastKpiUsd)} by end of day`
+                      : undefined
+                  }
+                  {...(!spendLoading
+                    ? { animate: true, numericValue: todayTotal, format: formatUsd }
+                    : {})}
+                />
+              </Card>
+              <Card>
+                <Kpi
+                  label="avg cost / session"
+                  value={formatUsdOrDash(
+                    aggregate && aggregate.sessionCount > 0
+                      ? todayTotal / aggregate.sessionCount
+                      : null,
+                  )}
+                />
+              </Card>
+              <Card>
+                <Kpi
+                  label="sessions today"
+                  value={!aggregate ? '—' : String(aggregate.sessionCount)}
+                  sub={buildSessionStatusSub(aggregate?.sessionStatus)}
+                  {...(aggregate ? { animate: true, numericValue: aggregate.sessionCount } : {})}
+                />
+              </Card>
+              <Card>
+                <Kpi
+                  label="flags"
+                  tone={flagsCount > 0 ? 'warn' : 'neutral'}
+                  value={String(flagsCount)}
+                  animate
+                  numericValue={flagsCount}
+                />
+              </Card>
             </div>
-          )}
-          {healthApi?.watcherActive === false && subagentStats.turns === 0 && (
-            <div className="rounded-xl border border-border-subtle bg-bg-base px-4 py-3 text-sm text-ink-subtle mb-4">
-              Subagent cost tracking is disabled (
-              <code className="font-mono text-xs">NR_AI_ENABLE_SUBAGENT_WATCHER=0</code>), so spend
-              shown here excludes subagents. Unset that variable (it is on by default) and restart
-              to see full spend.
-            </div>
-          )}
-          <AnimatedCard
-            index={0}
-            className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4 mb-4"
-          >
-            <Card>
-              <Kpi
-                label="efficiency"
-                hero
-                value={effDisplay}
-                sub={effSub}
-                {...(effScore !== null
-                  ? { animate: true, numericValue: Math.round(effScore * 100), suffix: '%' }
-                  : {})}
-              />
-            </Card>
-            <Card>
-              <Kpi
-                label="spend today"
-                value={spendLoading ? '…' : formatUsd(todayTotal)}
-                {...(!spendLoading
-                  ? { animate: true, numericValue: todayTotal, format: formatUsd }
-                  : {})}
-              />
-            </Card>
-            <Card>
-              <Kpi
-                label="subagent spend"
-                value={!subagentHasData ? '—' : formatUsd(subagentUsd)}
-                sub={`${subagentTurns} turns`}
-                {...(subagentHasData
-                  ? { animate: true, numericValue: subagentUsd, format: formatUsd }
-                  : {})}
-              />
-            </Card>
-            <Card>
-              <Kpi label="tool calls" value={String(calls)} animate numericValue={calls} />
-            </Card>
-            <Card>
-              <Kpi
-                label="flags"
-                tone={flagsCount > 0 ? 'warn' : 'neutral'}
-                value={String(flagsCount)}
-                animate
-                numericValue={flagsCount}
-              />
-            </Card>
+            {watcherOff && (
+              <div className="mt-2 text-[10px] text-ink-muted">
+                Subagent cost tracking is disabled (
+                <code className="font-mono">NR_AI_ENABLE_SUBAGENT_WATCHER=0</code>), so spend shown
+                here excludes subagents. Unset it and restart to see full spend.
+              </div>
+            )}
           </AnimatedCard>
 
-          <AnimatedCard index={1} className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
-            <ForecastEodCard
-              todayTotal={todayTotal}
-              forecastEod={
-                spendLoading
-                  ? null
-                  : (cost?.forecastEodUsd ??
-                    (costApi?.forecast?.forecastEndOfDayUsd != null
-                      ? todayTotal +
-                        costApi.forecast.forecastEndOfDayUsd -
-                        (costApi.sessionTodayUsd ?? 0)
-                      : null))
-              }
-              hourlySpend={hourlySpend}
-              subagentUsd={subagentUsd}
+          <AnimatedCard
+            index={1}
+            className="grid grid-cols-1 xl:grid-cols-3 gap-4 mb-4 items-start"
+          >
+            <div className="xl:col-span-2">
+              <SpendTodayPanel
+                hourlySpend={hourlySpend}
+                forecastEod={forecastKpiUsd}
+                weekForecast={weekForecast}
+              />
+            </div>
+            <ActivityTodayPanel todayHeatmap={todayHeatmap} concurrency={concurrency} />
+          </AnimatedCard>
+
+          <AnimatedCard index={2} className="mb-4">
+            <NeedsAttentionPanel
+              antiPatterns={antiPatterns}
+              apiAntiPatterns={apiAntiPatterns}
+              persistedAntiPatterns={persistedAntiPatterns}
+              flagsCount={flagsCount}
             />
-            {concurrency && concurrency.buckets && (
-              <ConcurrencyIndicator
-                current={concurrency.current}
-                peak={concurrency.peak}
-                allTimePeak={concurrency.allTimePeak}
-                bucketSizeMs={concurrency.bucketSizeMs}
-                startTimestamp={concurrency.startTimestamp}
-                buckets={concurrency.buckets}
-              />
-            )}
           </AnimatedCard>
 
-          {flagsCount > 0 &&
-            (antiPatterns.length > 0 || (apiAntiPatterns && apiAntiPatterns.length > 0)) && (
-              <AnimatedCard index={2} className="mb-4">
-                <Card padding="sm" tone="warning" className="text-xs">
-                  {antiPatterns.length > 0 ? (
-                    <>
-                      <Pill tone="warning" size="sm" className="mr-2">
-                        {antiPatterns[0].type}
-                      </Pill>
-                      <span className="text-ink-muted">— </span>
-                      <span>{antiPatterns[0].count}× on </span>
-                      <code className="bg-surface-5 px-1 rounded">{antiPatterns[0].target}</code>
-                      {/* Per-session pill so users can identify
-                          which of N concurrent sessions triggered the alert. */}
-                      {antiPatterns[0].sessionId && (
-                        <Pill tone="neutral" size="sm" className="ml-2">
-                          Session: {sessionPillLabel(antiPatterns[0].sessionId, liveSessions ?? [])}
-                        </Pill>
-                      )}
-                    </>
-                  ) : apiAntiPatterns && apiAntiPatterns.length > 0 ? (
-                    <>
-                      <Pill tone="warning" size="sm" className="mr-2">
-                        {apiAntiPatterns[0].type}
-                      </Pill>
-                      <span className="text-ink-muted">— </span>
-                      <span>
-                        {apiAntiPatterns[0].count ??
-                          apiAntiPatterns[0].iterations ??
-                          apiAntiPatterns[0].readCount ??
-                          apiAntiPatterns[0].repeatCount ??
-                          apiAntiPatterns[0].editCount ??
-                          apiAntiPatterns[0].agentCount ??
-                          '?'}
-                        × on{' '}
-                      </span>
-                      <code className="bg-surface-5 px-1 rounded">
-                        {apiAntiPatterns[0].file ?? apiAntiPatterns[0].command ?? 'unknown'}
-                      </code>
-                    </>
-                  ) : null}
-                </Card>
-              </AnimatedCard>
-            )}
-
-          <AnimatedCard
-            index={3}
-            className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-4"
-          >
-            <QualityProxyPanel />
-            <ToolSelectionPanel />
-            <LatencyPanel />
-            <ModelUsagePanel />
-            <CacheHealthPanel />
+          <AnimatedCard index={3} className="mb-4">
+            <SpendBreakdownPanel todaySessions={todaySessions ?? []} />
           </AnimatedCard>
 
-          <AnimatedCard index={4}>
+          <AnimatedCard index={4} className="mb-4">
             <LiveSessionPane sessions={todaySessions ?? []} liveSessions={liveSessions ?? []} />
           </AnimatedCard>
 
-          {todayHeatmap && todayHeatmap.buckets?.length > 0 && (
-            <AnimatedCard index={5} className="mb-4">
-              <Card padding="sm">
-                <Eyebrow className="mb-2">Activity Today</Eyebrow>
-                <ActivityHeatmap
-                  variant="strip"
-                  buckets={todayHeatmap.buckets}
-                  maxCount={todayHeatmap.maxCount}
-                  bucketSizeMs={todayHeatmap.bucketSizeMs}
-                  startTimestamp={todayHeatmap.startTimestamp}
-                  ariaLabel="Today's activity density in 15-minute blocks"
-                />
-              </Card>
-            </AnimatedCard>
-          )}
-
-          <AnimatedCard index={6}>
-            <RecentAlertsPanel />
+          <AnimatedCard
+            index={5}
+            className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-4"
+          >
+            <CacheHealthCard aggregate={aggregate} />
+            <ToolSelectionCard />
+            <QualityCard />
+            <ComputeWasteCard liveSessions={liveSessions ?? []} />
+            <LatencyCard aggregate={aggregate} />
+            <ApiFailuresCard />
           </AnimatedCard>
         </>
       )}
@@ -488,324 +560,713 @@ export function Today(): JSX.Element {
   );
 }
 
-function QualityProxyPanel(): JSX.Element {
-  const { data } = useQuery<QualityProxyMetrics>({
-    queryKey: qk.qualityProxy,
-    queryFn: fetchQualityProxy,
-    refetchInterval: QUALITY_REFETCH_MS,
-  });
+// --- Sessions today KPI sub-label ---
+
+// Excludes 'completed' — the brief keeps the tile's existing (empty)
+// sub-label when only completed sessions exist today.
+const SESSION_STATUS_SUB_ORDER: readonly SessionStatus[] = [
+  'needs_input',
+  'ready_for_review',
+  'working',
+];
+
+function sessionStatusPhrase(status: SessionStatus, count: number): string {
+  if (status === 'needs_input') return count === 1 ? 'needs input' : 'need input';
+  if (status === 'ready_for_review') return 'ready for review';
+  return 'working';
+}
+
+export function buildSessionStatusSub(
+  sessionStatus: TodayAggregateResponse['sessionStatus'],
+): ReactNode | undefined {
+  if (!sessionStatus) return undefined;
+  const entries = SESSION_STATUS_SUB_ORDER.map((status) => ({
+    status,
+    count: sessionStatus.counts[status],
+    sessionIds: sessionStatus.sessionIds[status],
+  })).filter((entry) => entry.count > 0);
+  if (entries.length === 0) return undefined;
 
   return (
-    <Card padding="sm" className="h-full">
-      <Eyebrow className="mb-2">Quality</Eyebrow>
-      {!data || data.totalSignals === 0 ? (
-        <EmptyState
-          icon="checkmark"
-          title="Waiting for edits and test runs"
-          subtitle="Quality metrics appear after editing files and running tests."
-        />
-      ) : (
-        <>
-          <div className="grid grid-cols-2 gap-2 text-xs">
-            <div>
-              <span className="text-ink-muted">Diff Apply </span>
-              <span className={rateColor(data.diffApplyRate)}>
-                {data.diffApplyRate !== null ? `${(data.diffApplyRate * 100).toFixed(0)}%` : '—'}
-              </span>
-            </div>
-            <div>
-              <span className="text-ink-muted">Test Pass </span>
-              <span className={rateColor(data.testPassRate)}>
-                {data.testPassRate !== null ? `${(data.testPassRate * 100).toFixed(0)}%` : '—'}
-              </span>
-            </div>
-            <div>
-              <span className="text-ink-muted">Backtracks </span>
-              <span className={data.backtrackCount > 0 ? 'text-accent-amber' : ''}>
-                {data.backtrackCount}
-              </span>
-            </div>
-            <div>
-              <span className="text-ink-muted">Self-corrections </span>
-              <span className="text-ink-subtle">{data.selfCorrectionCount}</span>
-            </div>
-          </div>
-          {data.degradationDetected && (
-            <div className="text-accent-amber text-xs mt-2">&#9888; Quality degrading</div>
-          )}
-        </>
-      )}
-    </Card>
+    <>
+      {entries.map((entry, i) => (
+        <span key={entry.status}>
+          {i > 0 ? ' · ' : null}
+          <Link
+            href={`/sessions?sessionIds=${entry.sessionIds.map(encodeURIComponent).join(',')}`}
+            className="text-primary hover:underline"
+          >
+            {entry.count} {sessionStatusPhrase(entry.status, entry.count)}
+          </Link>
+        </span>
+      ))}
+    </>
   );
 }
 
-function ToolSelectionPanel(): JSX.Element {
-  const { data } = useQuery<ToolSelectionMetrics>({
-    queryKey: qk.toolSelectionScore,
-    queryFn: fetchToolSelectionScore,
-    refetchInterval: QUALITY_REFETCH_MS,
-  });
+// --- Needs Attention Panel ---
 
-  return (
-    <Card padding="sm" className="h-full">
-      <Eyebrow className="mb-2">Tool Selection</Eyebrow>
-      {!data || Array.isArray(data) || data.totalCalls === 0 ? (
-        <EmptyState
-          icon="radar"
-          title="Waiting for tool calls"
-          subtitle="Start a Claude Code session to begin scoring. Resets when the process restarts."
-        />
-      ) : (
-        <>
-          <div className="flex items-baseline gap-2">
-            <span className={`text-2xl font-semibold tabular-nums ${scoreColor(data.score)}`}>
-              {data.score.toFixed(2)}
-            </span>
-            <span className="text-[10px] text-ink-muted">/ 1.0</span>
-          </div>
-          <div className="text-[10px] text-ink-muted mt-1">
-            {data.penalizedCalls} of {data.totalCalls} calls penalized
-          </div>
-          {(data.redundantReadCount > 0 ||
-            data.repeatedFailureCount > 0 ||
-            data.unusedOutputCount > 0) && (
-            <div className="text-[10px] text-ink-subtle mt-1 space-x-2">
-              {data.redundantReadCount > 0 && <span>re-reads: {data.redundantReadCount}</span>}
-              {data.repeatedFailureCount > 0 && (
-                <span>repeat fails: {data.repeatedFailureCount}</span>
-              )}
-              {data.unusedOutputCount > 0 && <span>unused output: {data.unusedOutputCount}</span>}
-            </div>
-          )}
-          <div className="text-[10px] text-ink-subtle/60 mt-2">
-            Penalizes: reading the same file 3+ times without editing, repeated tool failures,
-            fetching large outputs never referenced.
-          </div>
-        </>
-      )}
-    </Card>
-  );
-}
-
-// --- Latency Panel ---
-
-interface LatencyPercentiles {
-  readonly p50: number;
-  readonly p95: number;
-  readonly p99: number;
+/**
+ * One row per anti-pattern type. Persisted sessions can carry hundreds of
+ * per-file flags for a day; the reader wants "Repeated reads ×187" with the
+ * files and sessions behind it, not one pill per path.
+ */
+export interface RawAttentionFlag {
+  readonly type: string;
   readonly count: number;
+  readonly target?: string;
+  readonly sessionId?: string;
 }
 
-interface LatencyMetrics {
-  readonly overall: LatencyPercentiles | null;
-  readonly byTool: Readonly<Record<string, LatencyPercentiles | null>>;
-  readonly slowestCalls: ReadonlyArray<{ toolName: string; durationMs: number }>;
+export function aggregateAttentionFlags(raw: readonly RawAttentionFlag[]): readonly AttentionRow[] {
+  const byType = new Map<
+    string,
+    { count: number; targets: Set<string>; sessionIds: Set<string> }
+  >();
+  for (const flag of raw) {
+    const entry = byType.get(flag.type) ?? {
+      count: 0,
+      targets: new Set<string>(),
+      sessionIds: new Set<string>(),
+    };
+    entry.count += flag.count;
+    if (flag.target && flag.target !== 'unknown') entry.targets.add(flag.target);
+    if (flag.sessionId) entry.sessionIds.add(flag.sessionId);
+    byType.set(flag.type, entry);
+  }
+  return [...byType.entries()]
+    .map(([type, { count, targets, sessionIds }]) => ({
+      type,
+      count,
+      targets: [...targets],
+      sessionIds: [...sessionIds],
+    }))
+    .sort((a, b) => b.count - a.count);
 }
 
-function LatencyPanel(): JSX.Element {
-  const { data } = useQuery<LatencyMetrics>({
-    queryKey: qk.latency,
-    queryFn: fetchLatency,
-    refetchInterval: QUALITY_REFETCH_MS,
+function NeedsAttentionPanel({
+  antiPatterns,
+  apiAntiPatterns,
+  persistedAntiPatterns,
+  flagsCount,
+}: {
+  antiPatterns: readonly AntiPatternEvent[];
+  apiAntiPatterns: SessionAntiPattern[] | undefined;
+  persistedAntiPatterns: SessionAntiPattern[];
+  flagsCount: number;
+}): JSX.Element {
+  // The query returns `null` when the endpoint is 404 (cloud mode — no
+  // alert engine), so the panel can fall back to flags-only instead of a
+  // permanent red error banner. retry: false avoids the 4× request
+  // multiplier React Query would otherwise produce on every refetch.
+  const { data, error } = useQuery<readonly AlertEvent[] | null>({
+    queryKey: qk.alertsRecent,
+    queryFn: async ({ signal }) => {
+      try {
+        return await fetchRecentAlerts(signal);
+      } catch (err) {
+        if (err instanceof NotFoundError) return null;
+        throw err;
+      }
+    },
+    refetchInterval: RECENT_ALERTS_REFETCH_MS,
+    retry: false,
   });
 
-  // Guard `data.byTool` separately — the API can return `data` with `byTool`
-  // missing (or `null`) when no tool calls have been recorded yet, and
-  // `Object.entries(undefined)` throws. Surfaced widely in test runs where
-  // mock fixtures returned `{}` and the crash bubbled up to unrelated tests.
-  const topTools = data?.byTool
-    ? Object.entries(data.byTool)
-        .filter(
-          (entry): entry is [string, LatencyPercentiles] => entry[1] !== null && entry[1].count > 0,
-        )
-        .sort((a, b) => b[1].p95 - a[1].p95)
-        .slice(0, 4)
-    : [];
+  const entries: readonly AlertEvent[] = data ?? [];
+  const sortedEntries = [...entries].sort((a, b) => b.firedAt - a.firedAt);
+  const firingCount = sortedEntries.filter((a) => a.state === 'firing').length;
+
+  // Same fallback priority the old banner used: prefer the live SSE list,
+  // then this process's own /api/anti-patterns, then whatever's already
+  // persisted in today's session records.
+  const rawFlags: readonly RawAttentionFlag[] =
+    antiPatterns.length > 0
+      ? antiPatterns.map((a) => ({ type: a.type, count: a.count, target: a.target }))
+      : apiAntiPatterns && apiAntiPatterns.length > 0
+        ? apiAntiPatterns.map((a) => ({
+            type: a.type,
+            count: resolveAntiPatternCount(a),
+            target: a.file ?? a.command ?? 'unknown',
+          }))
+        : persistedAntiPatterns.map((a) => ({
+            type: a.type,
+            count: resolveAntiPatternCount(a),
+            target: a.file ?? a.command ?? 'unknown',
+            sessionId: a.sessionId,
+          }));
+  const aggregated = aggregateAttentionFlags(rawFlags);
+  // The Flags KPI counts flags this process never saw in detail (other
+  // sessions' aggregate totals), so never contradict it with "nothing".
+  const flags =
+    aggregated.length === 0 && flagsCount > 0
+      ? [{ type: 'anti_pattern_flags', count: flagsCount, targets: [], sessionIds: [] }]
+      : aggregated;
 
   return (
-    <Card padding="sm" className="h-full">
-      <Eyebrow className="mb-2">Latency (ms)</Eyebrow>
-      {!data || !data.overall ? (
-        <EmptyState
-          icon="clock"
-          title="Waiting for tool calls"
-          subtitle="Latency percentiles appear after tool calls complete."
-        />
-      ) : (
-        <>
-          <div className="flex gap-4 text-xs mb-2">
-            <div>
-              <span className="text-ink-muted">p50 </span>
-              <span className="text-ink-base tabular-nums">{data.overall.p50}</span>
-            </div>
-            <div>
-              <span className="text-ink-muted">p95 </span>
-              <span className="text-ink-base tabular-nums">{data.overall.p95}</span>
-            </div>
-            <div>
-              <span className="text-ink-muted">p99 </span>
-              <span className="text-ink-base tabular-nums">{data.overall.p99}</span>
-            </div>
-          </div>
-          {topTools.length > 0 && (
-            <div className="space-y-1">
-              {topTools.map(([tool, p]) => (
-                <div key={tool} className="flex items-center gap-2 text-xs">
-                  <span className="text-ink-muted truncate w-28 shrink-0">
-                    {shortToolName(tool)}
-                  </span>
-                  <span className="tabular-nums text-ink-subtle">{p.p95}ms p95</span>
-                </div>
-              ))}
-            </div>
-          )}
-        </>
+    <Panel title="Needs attention">
+      {error && (
+        <div className="text-accent-red text-[11px] mb-2">Error loading recent alerts.</div>
       )}
-    </Card>
+      <AttentionList rows={flags} firingCount={firingCount} alertsHref="/alerts" />
+      {sortedEntries.length > 0 && (
+        <table className="w-full text-xs mt-3">
+          <thead className="text-ink-muted">
+            <tr>
+              <th className="text-left pb-1">when</th>
+              <th className="text-left pb-1">sev</th>
+              <th className="text-left pb-1">rule</th>
+              <th className="text-right pb-1">value / threshold</th>
+              <th className="text-left pb-1 pl-2">state</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sortedEntries.slice(0, 5).map((a) => (
+              <tr key={`${a.id}-${a.firedAt}-${a.state}`} className="border-t border-border-subtle">
+                <td className="py-1 text-ink-subtle tabular-nums whitespace-nowrap">
+                  {formatRelativeTime(a.firedAt)}
+                </td>
+                <td className="py-1">
+                  <span aria-hidden="true" className={SEVERITY_DOT[a.severity]}>
+                    ●
+                  </span>{' '}
+                  <span className="text-ink-subtle uppercase tracking-wider text-[10px]">
+                    {a.severity}
+                  </span>
+                </td>
+                <td className="py-1">{a.title}</td>
+                <td className="py-1 text-right tabular-nums">
+                  {formatNumber(a.value)} / {formatNumber(a.threshold)}
+                </td>
+                <td
+                  className={
+                    'py-1 pl-2 ' + (a.state === 'firing' ? 'text-accent-amber' : 'text-ink-muted')
+                  }
+                >
+                  {a.state}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </Panel>
   );
 }
 
-// --- Model Usage Panel ---
+// --- Spend Breakdown Panel ---
+//
+// Consolidates what used to be two separate panels (a cost-based Models/
+// Tools/Skills breakdown, and a Skills/Subagents/Plugins/Loops/Tools
+// "contribution" panel built on the shared UsageContributionPanel) into one.
+// The two panels showed an identical Skills table and disagreeing Tools
+// tables — merging onto UsageContributionPanel with an added Models table
+// (see ModelShareRow / UsageContributionPanel's modelRows prop) removes both.
 
 interface ModelStats {
   readonly requestCount: number;
   readonly totalCostUsd: number;
-  readonly costPerOutputToken: number | null;
   readonly costPerMillionTokens: number | null;
 }
 
 interface ModelUsageMetrics {
   readonly byModel: Readonly<Record<string, ModelStats>>;
   readonly mostUsedModel: string | null;
-  readonly mostEfficientModel: string | null;
 }
 
-function ModelUsagePanel(): JSX.Element {
-  const { data } = useQuery<ModelUsageMetrics>({
+function SpendBreakdownPanel({
+  todaySessions,
+}: {
+  todaySessions: readonly SessionSummary[];
+}): JSX.Element {
+  const { data: costData } = useQuery<TurnCostsResponse>({
+    queryKey: qk.costPerTool(),
+    queryFn: ({ signal }) => fetchCostPerTool(undefined, undefined, signal),
+    refetchInterval: QUALITY_REFETCH_MS,
+    retry: false,
+  });
+  // Same shape-defensive guard as the health cards below — `data.byModel`
+  // can be missing or null when no token events have been recorded yet.
+  const { data: modelData } = useQuery<ModelUsageMetrics>({
     queryKey: qk.modelUsage,
-    queryFn: fetchModelUsage,
+    queryFn: ({ signal }) => fetchModelUsage(signal),
+    refetchInterval: QUALITY_REFETCH_MS,
+  });
+  const { data: usageData, isError: usageError } = useQuery<UsageInsightsReport>({
+    queryKey: qk.usageInsights('today'),
+    queryFn: ({ signal }) => fetchUsageInsights('today', signal),
     refetchInterval: QUALITY_REFETCH_MS,
   });
 
-  // Same shape-defensive guard as LatencyPanel — `data.byModel` can be
-  // missing or null when no token events have been recorded yet.
-  const models = data?.byModel
-    ? Object.entries(data.byModel)
-        .filter(([, s]) => s.requestCount > 0)
-        .sort((a, b) => b[1].totalCostUsd - a[1].totalCostUsd)
-        .slice(0, 4)
+  const models = modelData?.byModel
+    ? Object.entries(modelData.byModel).filter(([, s]) => s.requestCount > 0)
     : [];
+  const modelsTotalCost = models.reduce((sum, [, s]) => sum + s.totalCostUsd, 0);
+  const modelRows: ModelShareRow[] = models.map(([model, s]) => ({
+    model,
+    requestCount: s.requestCount,
+    costPerMillionTokens: s.costPerMillionTokens,
+    totalCostUsd: s.totalCostUsd,
+    sharePct: modelsTotalCost > 0 ? (s.totalCostUsd / modelsTotalCost) * 100 : 0,
+  }));
+
+  const toolRows = buildToolTableRows(
+    todaySessions.filter((s) => todayOverlapRatio(s) > 0),
+    costData?.costByToolType,
+  );
+
+  const attributionRate = costData?.attributionRate ?? 1;
+  const lowAttribution = costData != null && attributionRate < 0.5;
 
   return (
-    <Card padding="sm" className="h-full">
-      <Eyebrow className="mb-2">Model Usage</Eyebrow>
-      {!data || models.length === 0 ? (
-        <EmptyState
-          icon="radar"
-          title="No model data yet"
-          subtitle="Start a Claude Code session to see model cost breakdown. Resets when the process restarts."
-        />
-      ) : (
-        <div className="space-y-1.5">
-          {models.map(([model, s]) => (
-            <div key={model} className="flex items-center justify-between text-xs gap-2">
-              <span className="text-ink-muted truncate">{model}</span>
-              <div className="flex gap-3 shrink-0 tabular-nums">
-                <span className="text-ink-subtle">{s.requestCount}req</span>
-                <span className="text-ink-subtle">
-                  {formatUsdOrDash(s.costPerMillionTokens)}/1M tok
-                </span>
-                <span className="text-ink-base">{formatUsd(s.totalCostUsd)}</span>
-              </div>
-            </div>
-          ))}
-          {data?.mostEfficientModel && (
-            <div className="text-[10px] text-accent-green mt-1">
-              Most efficient: {data.mostEfficientModel}
-            </div>
-          )}
-        </div>
-      )}
-    </Card>
+    <UsageContributionPanel
+      data={usageData}
+      isError={usageError}
+      title="Where today's spend went"
+      subtitle="Since midnight"
+      modelRows={modelRows}
+      toolRows={toolRows}
+      toolCostAvailable={true}
+      // /api/cost-per-tool returns attributionRate (the share of session cost
+      // captured in its tool-type breakdown). When attribution is low, we caveat
+      // the Tools and Skills shares to explain they're partial.
+      toolCoverageCaveat={
+        lowAttribution
+          ? `Tool and skill shares are based on ${formatPct(attributionRate * 100)} of session cost`
+          : null
+      }
+    />
   );
 }
 
-function cacheRecommendationText(
-  status: CacheHealthResponse['status'],
-  hitRatePct: number | null,
-): string {
-  const pct = hitRatePct !== null ? `${hitRatePct}%` : null;
-  if (status === 'excellent')
-    return pct
-      ? `Cache hit rate is ${pct}. Cache is well-structured.`
-      : 'Cache is well-structured. No changes needed.';
-  if (status === 'can_improve')
-    return pct
-      ? `Cache hit rate is ${pct}. Placing stable content before variable content in prompts could improve this.`
-      : 'Place stable content before variable content in prompts to improve.';
-  return pct
-    ? `Cache hit rate is ${pct}. Restructuring your system prompt so stable context appears at the top could bring this above 60%.`
-    : 'Restructure your system prompt so stable context appears at the top.';
+// --- Health grid cards ---
+
+function cacheBandText(status: CacheHealthResponse['status']): string {
+  switch (status) {
+    case 'excellent':
+      return 'Hit rate above 60%';
+    case 'can_improve':
+      return 'Hit rate between 30% and 60%';
+    case 'needs_attention':
+      return 'Hit rate below 30%';
+    default:
+      return 'No cache activity';
+  }
 }
 
-function CacheHealthPanel(): JSX.Element {
-  const { data } = useQuery<CacheHealthResponse>({
+function CacheHealthCard({
+  aggregate,
+}: {
+  aggregate: TodayAggregateResponse | undefined;
+}): JSX.Element {
+  const { data: trendData } = useQuery<CacheHealthResponse>({
     queryKey: qk.cacheHealth,
-    queryFn: fetchCacheHealth,
+    queryFn: ({ signal }) => fetchCacheHealth(signal),
     refetchInterval: QUALITY_REFETCH_MS,
   });
 
-  const noActivity =
-    !data || data.status === 'no_cache_activity' || data.cache_hit_rate_pct == null;
+  const data = aggregate?.cacheHealth;
+  const noActivity = !data || data.status === 'no_cache_activity' || data.cacheHitRatePct == null;
+  const tooltip =
+    'Prompt cache hit rate today, with a suggestion for improving it — usually by moving stable context earlier in the prompt.';
+
+  if (noActivity) {
+    return (
+      <HealthCard
+        title="Cache Health"
+        tooltip={tooltip}
+        value="—"
+        tone="neutral"
+        detail="Appears once token usage with cache reads is reported."
+      />
+    );
+  }
+
+  const tone: HealthTone =
+    data.status === 'excellent' ? 'good' : data.status === 'can_improve' ? 'warn' : 'bad';
+
+  const rows: HealthCardRow[] = [
+    { label: 'Cache read', value: formatTokensCompact(data.totalCacheReadTokens) },
+    { label: 'Cache write', value: formatTokensCompact(data.totalCacheCreationTokens) },
+  ];
+  if (trendData?.week_over_week_delta_pts != null && trendData.week_over_week_delta_pts !== 0) {
+    const delta = trendData.week_over_week_delta_pts;
+    rows.push({ label: 'vs last week', value: `${delta > 0 ? '+' : ''}${delta}pts` });
+  }
 
   return (
-    <Card padding="sm" className="h-full">
-      <Eyebrow className="mb-2">Cache Health</Eyebrow>
-      {noActivity ? (
-        <EmptyState
-          icon="radar"
-          title="No cache data yet"
-          subtitle="Appears once token usage with cache reads is reported."
-        />
-      ) : (
+    <HealthCard
+      title="Cache Health"
+      tooltip={tooltip}
+      value={formatPct(data.cacheHitRatePct)}
+      tone={tone}
+      detail={`${cacheBandText(data.status)} · ${formatUsd(data.totalSavingsUsd)} saved today`}
+      rows={rows}
+    />
+  );
+}
+
+function ToolSelectionCard(): JSX.Element {
+  const { data } = useQuery<ToolSelectionMetrics>({
+    queryKey: qk.toolSelectionScore,
+    queryFn: ({ signal }) => fetchToolSelectionScore(signal),
+    refetchInterval: QUALITY_REFETCH_MS,
+  });
+  const tooltip =
+    "Scores how efficiently tools were chosen today: penalizes re-reading a file without editing it, retrying a failing call, or fetching output that's never used.";
+
+  if (!data || Array.isArray(data) || data.totalCalls === 0) {
+    return (
+      <HealthCard
+        title="Tool Selection"
+        tooltip={tooltip}
+        value="—"
+        tone="neutral"
+        detail="Waiting for tool calls."
+      />
+    );
+  }
+
+  const tone: HealthTone = data.score >= 0.9 ? 'good' : data.score >= 0.7 ? 'warn' : 'bad';
+
+  return (
+    <HealthCard
+      title="Tool Selection"
+      tooltip={tooltip}
+      value={formatPct(data.score * 100)}
+      tone={tone}
+      detail={`${data.penalizedCalls} of ${data.totalCalls} calls penalized`}
+      rows={[
+        { label: 'Re-reads', value: String(data.redundantReadCount) },
+        { label: 'Repeat fails', value: String(data.repeatedFailureCount) },
+        { label: 'Unused output', value: String(data.unusedOutputCount) },
+      ]}
+    />
+  );
+}
+
+function QualityCard(): JSX.Element {
+  const { data } = useQuery<QualityProxyMetrics>({
+    queryKey: qk.qualityProxy,
+    queryFn: ({ signal }) => fetchQualityProxy(signal),
+    refetchInterval: QUALITY_REFETCH_MS,
+  });
+  const tooltip =
+    "Diff apply rate and test pass rate across today's sessions, plus how often you backtracked or self-corrected. Watch for the degrading status if quality drops mid-session.";
+
+  if (!data || data.totalSignals === 0) {
+    return (
+      <HealthCard
+        title="Quality"
+        tooltip={tooltip}
+        value="—"
+        tone="neutral"
+        detail="Waiting for edits and test runs."
+      />
+    );
+  }
+
+  const tone: HealthTone = data.degradationDetected ? 'bad' : 'good';
+
+  return (
+    <HealthCard
+      title="Quality"
+      tooltip={tooltip}
+      value={data.diffApplyRate !== null ? formatPct(data.diffApplyRate * 100) : '—'}
+      tone={tone}
+      rows={[
+        {
+          label: 'Test pass',
+          value: data.testPassRate !== null ? formatPct(data.testPassRate * 100) : '—',
+        },
+        { label: 'Backtracks', value: String(data.backtrackCount) },
+        { label: 'Self-corrections', value: String(data.selfCorrectionCount) },
+      ]}
+    />
+  );
+}
+
+function ComputeWasteCard({ liveSessions }: { liveSessions: LiveSessionEntry[] }): JSX.Element {
+  const { data, isPending } = useQuery<ComputeWasteApiResponse>({
+    queryKey: qk.computeWaste,
+    queryFn: ({ signal }) => fetchComputeWaste(signal) as Promise<ComputeWasteApiResponse>,
+    retry: false,
+  });
+  const tooltip =
+    'Tokens wasted today on retried tool calls and anti-pattern activity (stuck loops, redundant reads, thrashing).';
+
+  if (isPending || !data || typeof data.total_tokens_wasted !== 'number') {
+    return (
+      <HealthCard
+        title="Compute Waste"
+        tooltip={tooltip}
+        value="—"
+        tone="neutral"
+        detail="No compute waste data yet."
+      />
+    );
+  }
+
+  const tone: HealthTone =
+    data.status === 'clean' ? 'good' : data.status === 'moderate' ? 'warn' : 'bad';
+  const topSession = data.by_session?.[0] ?? null;
+  const topOffender = data.breakdown[0] ?? null;
+
+  const rows: HealthCardRow[] = [
+    { label: 'Retry', value: `~${formatTokensCompact(data.retry_tokens_wasted)}` },
+    { label: 'Anti-pattern', value: `~${formatTokensCompact(data.anti_pattern_tokens_wasted)}` },
+  ];
+  if (topSession !== null) {
+    rows.push({
+      label: 'Top session',
+      value: `${sessionPillLabel(topSession.session_id, liveSessions)} (~${formatTokensCompact(topSession.tokens_wasted)})`,
+    });
+  }
+
+  return (
+    <HealthCard
+      title="Compute Waste"
+      tooltip={tooltip}
+      value={`~${formatTokensCompact(data.total_tokens_wasted)} tokens`}
+      tone={tone}
+      detail={computeWasteRecommendationText(data.status, topOffender?.type ?? null)}
+      rows={rows}
+    />
+  );
+}
+
+function LatencyCard({
+  aggregate,
+}: {
+  aggregate: TodayAggregateResponse | undefined;
+}): JSX.Element {
+  const data = aggregate?.latency;
+  const tooltip =
+    'How long tool calls took today — p50/p95/p99 across all calls, plus the slowest tools by p95.';
+
+  if (!data || !data.overall) {
+    return (
+      <HealthCard
+        title="Latency"
+        tooltip={tooltip}
+        value="—"
+        tone="neutral"
+        detail="Waiting for tool calls."
+      />
+    );
+  }
+
+  // Guard `data.byTool` separately — the API can return `data` with `byTool`
+  // missing (or `null`) when no tool calls have been recorded yet, and
+  // `Object.entries(undefined)` throws.
+  const topTools = data.byTool
+    ? Object.entries(data.byTool)
+        .filter(
+          (entry): entry is [string, LatencyPercentiles] => entry[1] !== null && entry[1].count > 0,
+        )
+        .sort((a, b) => b[1].p95 - a[1].p95)
+        .slice(0, 2)
+    : [];
+
+  const rows: HealthCardRow[] = [
+    { label: 'p50', value: formatMs(data.overall.p50) },
+    { label: 'p99', value: formatMs(data.overall.p99) },
+    ...topTools.map(([tool, p]) => ({ label: shortToolName(tool), value: formatMs(p.p95) })),
+  ];
+
+  return (
+    <HealthCard title="Latency" tooltip={tooltip} value={formatMs(data.overall.p95)} rows={rows} />
+  );
+}
+
+function ApiFailuresCard(): JSX.Element {
+  const { data } = useQuery<ApiFailureMetrics>({
+    queryKey: qk.apiFailures,
+    queryFn: ({ signal }) => fetchApiFailures(signal),
+    refetchInterval: QUALITY_REFETCH_MS,
+  });
+  const tooltip =
+    "Turns that failed outright after Claude Code's own retries were exhausted, captured via its StopFailure hook.";
+
+  const errorTypeEntries = data?.byErrorType
+    ? Object.entries(data.byErrorType).filter(([, count]) => count > 0)
+    : [];
+  const count = data?.totalFailures ?? 0;
+  const tone: HealthTone = count === 0 ? 'good' : 'bad';
+
+  return (
+    <HealthCard
+      title="API Failures"
+      tooltip={tooltip}
+      value={String(count)}
+      tone={tone}
+      detail="Reflects Claude Code's StopFailure hook"
+      rows={
+        errorTypeEntries.length > 0
+          ? errorTypeEntries.map(([type, c]) => ({ label: type, value: String(c) }))
+          : undefined
+      }
+    />
+  );
+}
+
+// --- Spend Today Panel ---
+
+function SpendTodayPanel({
+  hourlySpend,
+  forecastEod,
+  weekForecast,
+}: {
+  hourlySpend: readonly HourlyCostEntry[];
+  forecastEod: number | null;
+  weekForecast: number | null;
+}): JSX.Element {
+  const hasSpend = hourlySpend.some((h) => h.cost > 0);
+  const series = useMemo(
+    () => buildSpendTodaySeries(hourlySpend, forecastEod, Date.now()),
+    [hourlySpend, forecastEod],
+  );
+
+  return (
+    <Panel title="Spend by hour" subtitle="Today">
+      {hasSpend ? (
         <>
-          <div className="flex items-baseline gap-2 mb-1">
-            <span
-              className={`text-2xl font-semibold tabular-nums ${
-                data.status === 'excellent'
-                  ? 'text-accent-green'
-                  : data.status === 'needs_attention'
-                    ? 'text-accent-amber'
-                    : 'text-ink-base'
-              }`}
-            >
-              {data.cache_hit_rate_pct}%
-            </span>
-            <Pill tone={data.status === 'needs_attention' ? 'warning' : 'neutral'} size="sm">
-              {data.status === 'excellent' ? 'excellent' : data.status.replace('_', ' ')}
-            </Pill>
-          </div>
-          {data.total_savings_usd > 0 && (
-            <div className="text-xs text-accent-green mb-1">
-              ${data.total_savings_usd.toFixed(4)} saved
-            </div>
+          <SpendBars
+            data={series}
+            xTickFormatter={(key) => hourOfDayLabel(Number(key))}
+            tooltipLabel={(d) => d.label}
+          />
+          {weekForecast !== null && (
+            <p className="mt-1.5 text-[10px] text-ink-muted">
+              On pace for ~{formatUsd(weekForecast)} this week
+            </p>
           )}
-          {data.week_over_week_delta_pts !== null && data.week_over_week_delta_pts !== 0 && (
-            <div
-              className={`text-[10px] font-medium mb-1 ${
-                data.week_over_week_delta_pts > 0 ? 'text-accent-green' : 'text-accent-amber'
-              }`}
-            >
-              {data.week_over_week_delta_pts > 0 ? '↑' : '↓'}
-              {Math.abs(data.week_over_week_delta_pts)}pts vs last week
-            </div>
-          )}
-          <div className="text-[10px] text-ink-subtle/70 leading-snug">
-            {cacheRecommendationText(data.status, data.cache_hit_rate_pct)}
-          </div>
         </>
+      ) : (
+        <EmptyState variant="inline" title="No spend data yet" />
       )}
-    </Card>
+    </Panel>
+  );
+}
+
+// --- Activity Today Panel ---
+
+/**
+ * Re-buckets a raw timestamped series into 24 hourly buckets (0..23) for
+ * the local day containing `nowMs`. Lets Spend by hour (already hourly),
+ * Tool calls (15-minute heatmap buckets) and Concurrent sessions (its own
+ * bucket size) share one granularity so their charts scale identically.
+ * Points outside the local day are dropped. `mode: 'max'` is for gauges
+ * like concurrency, where summing sub-hour samples would double-count;
+ * `'sum'` (the default) is for counts and costs.
+ */
+export function bucketByHour(
+  points: ReadonlyArray<{ ts: number; value: number }>,
+  nowMs: number,
+  mode: 'sum' | 'max' = 'sum',
+): number[] {
+  const dayStart = localStartOfDay(nowMs);
+  const dayEnd = dayStart + 86_400_000;
+  const buckets = new Array<number>(24).fill(0);
+  for (const { ts, value } of points) {
+    if (ts < dayStart || ts >= dayEnd) continue;
+    const hour = Math.min(23, Math.floor((ts - dayStart) / 3_600_000));
+    buckets[hour] = mode === 'max' ? Math.max(buckets[hour]!, value) : buckets[hour]! + value;
+  }
+  return buckets;
+}
+
+// "10:00" — zero-padded 24-hour label for an hour index, the shared
+// tooltip convention for all three Activity-today charts.
+function hourOfDayLabel(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`;
+}
+
+// "Peak 10:00 — 38 calls" / "No calls recorded yet." for an already
+// hourly-bucketed count series.
+function hourlyCountsCaption(counts: readonly number[], unit: string): string {
+  const max = Math.max(0, ...counts);
+  if (max === 0) return `No ${unit} recorded yet.`;
+  const peakHour = counts.indexOf(max);
+  return `Peak ${hourOfDayLabel(peakHour)} — ${max} ${unit}`;
+}
+
+function ActivityTodayPanel({
+  todayHeatmap,
+  concurrency,
+}: {
+  todayHeatmap: ActivityHeatmapTodayResponse | undefined;
+  concurrency: ConcurrencyData | undefined;
+}): JSX.Element {
+  const now = Date.now();
+  const hasHeatmapData = (todayHeatmap?.buckets?.length ?? 0) > 0;
+  const hasConcurrencyData = (concurrency?.buckets?.length ?? 0) > 0;
+
+  const heatmapHourly = hasHeatmapData
+    ? bucketByHour(
+        todayHeatmap!.buckets.map((count, index) => ({
+          ts: todayHeatmap!.startTimestamp + index * todayHeatmap!.bucketSizeMs,
+          value: count,
+        })),
+        now,
+      )
+    : [];
+  const heatmapItems: DiscreteBlockChartItem[] = heatmapHourly.map((count, hour) => ({
+    count,
+    tooltip: `${hourOfDayLabel(hour)} — ${count} calls`,
+  }));
+
+  const concurrencyHourly = hasConcurrencyData
+    ? bucketByHour(
+        concurrency!.buckets.map((b) => ({ ts: b.timestamp, value: b.count })),
+        now,
+        'max',
+      )
+    : [];
+  const concurrencyItems: DiscreteBlockChartItem[] = concurrencyHourly.map((count, hour) => ({
+    count,
+    tooltip: `${hourOfDayLabel(hour)} — ${count} concurrent`,
+  }));
+
+  return (
+    <Panel title="Activity today">
+      <div className="flex flex-col gap-4">
+        <div>
+          <Eyebrow className="mb-1.5">Tool calls</Eyebrow>
+          <div className="flex items-end">
+            {hasHeatmapData ? (
+              <DiscreteBlockChart
+                data={heatmapItems}
+                levels={6}
+                ariaLabel="Today's activity density by hour"
+              />
+            ) : (
+              <EmptyState variant="inline" title="No heatmap data yet" />
+            )}
+          </div>
+          <p className="mt-1.5 text-[10px] text-ink-muted">
+            {hourlyCountsCaption(heatmapHourly, 'calls')}
+          </p>
+        </div>
+        <div>
+          <Eyebrow className="mb-1.5">Concurrent sessions</Eyebrow>
+          <div className="flex items-end">
+            {hasConcurrencyData ? (
+              <DiscreteBlockChart
+                data={concurrencyItems}
+                levels={6}
+                ariaLabel={`Concurrency over time, peak ${concurrency?.peak ?? 0}`}
+              />
+            ) : (
+              <EmptyState variant="inline" title="No session data yet" />
+            )}
+          </div>
+          <p className="mt-1.5 text-[10px] text-ink-muted">
+            now {concurrency?.current ?? 0} · peak {concurrency?.peak ?? 0}
+          </p>
+        </div>
+      </div>
+    </Panel>
   );
 }
 
@@ -818,6 +1279,7 @@ interface ReplayTimelineEntry {
   readonly success: boolean;
   readonly filePath?: string;
   readonly command?: string;
+  readonly agentId?: string;
 }
 
 interface ReplaySegment {
@@ -825,6 +1287,8 @@ interface ReplaySegment {
   readonly startIndex: number;
   readonly endIndex: number;
   readonly severity: 'warning' | 'critical';
+  readonly agentId?: string;
+  readonly agentScoped?: boolean;
 }
 
 interface ReplayData {
@@ -846,6 +1310,10 @@ function LiveSessionPane({
   // In-place workflow-run drawer (same pattern as the Sessions view) — opening
   // a run from the trace overlays the detail rather than navigating away.
   const [openRunId, setOpenRunId] = useState<string | null>(null);
+  // Decision-tree + turn-cost detail drawer — kept out of the fixed-height
+  // trace pane itself so a busy session's failure/turn count never eats into
+  // the trace's available vertical space.
+  const [showDetail, setShowDetail] = useState(false);
   const [, navigate] = useLocation();
   const setActiveSession = useLiveStore((s) => s.setActiveSession);
 
@@ -855,7 +1323,7 @@ function LiveSessionPane({
   // populates immediately on first paint instead of waiting an interval.
   const { data: current } = useQuery<{ sessionId: string; liveSessions?: string[] }>({
     queryKey: qk.sessionCurrent,
-    queryFn: fetchSessionCurrent,
+    queryFn: ({ signal }) => fetchSessionCurrent(signal),
   });
 
   const liveSessionIds = useMemo(() => {
@@ -872,61 +1340,6 @@ function LiveSessionPane({
     }
     return set;
   }, [liveSessions, current]);
-
-  // Most-recently-active live session — sorted server-side. Falls back to the
-  // first id in the liveSessionIds set when the API didn't supply ordering
-  // (e.g. during the legacy fallback path).
-  const mostRecentlyActiveId = liveSessions.length > 0 ? liveSessions[0]!.sessionId : null;
-  const firstLiveId =
-    mostRecentlyActiveId ?? (liveSessionIds.size > 0 ? [...liveSessionIds][0]! : null);
-  const activeId = selectedId ?? firstLiveId;
-  const isLive = activeId !== null && liveSessionIds.has(activeId);
-  // "Session ended" badge — true when the user explicitly
-  // selected a session that was previously live but is no longer in the live
-  // set (e.g. the owning Claude Code window closed). We deliberately don't
-  // auto-switch to a different session: that's jarring, and the user might be
-  // mid-investigation. Instead we pin the selection and surface a badge.
-  const sessionEnded = selectedId !== null && !liveSessionIds.has(selectedId);
-
-  // Keep the global liveStore in sync with the local selector
-  // so the rest of the dashboard (and any per-session caches) re-key when
-  // the user switches. Empty deps + activeId in array — fires only on change.
-  useEffect(() => {
-    setActiveSession(activeId);
-  }, [activeId, setActiveSession]);
-
-  const { data: replay } = useQuery<ReplayData>({
-    queryKey: activeId ? qk.sessionReplay(activeId) : ['replay', 'none'],
-    queryFn: () => fetchSessionReplay(activeId!),
-    enabled: activeId !== null,
-    retry: false,
-    refetchInterval: isLive ? LIVE_TAIL_REFETCH_MS : false,
-  });
-
-  // Subagent fan-out for the active session — same source as the Sessions view's
-  // trace. Tolerates a malformed/array payload (no agents) so the live tail
-  // still renders the parent lane.
-  const { data: subagentData } = useQuery<SessionSubagentsResponse>({
-    queryKey: activeId ? qk.sessionSubagents(activeId) : ['subagents', 'none'],
-    queryFn: () => fetchSessionSubagents(activeId!),
-    enabled: activeId !== null,
-    retry: false,
-    refetchInterval: isLive ? LIVE_TAIL_REFETCH_MS : false,
-  });
-
-  // Workflow runs → status lookup for the trace's per-group status icons.
-  const { data: workflowsData } = useQuery({
-    queryKey: qk.workflows,
-    queryFn: fetchWorkflows,
-    refetchInterval: isLive ? 10_000 : false,
-  });
-
-  const tailRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (isLive && tailRef.current) {
-      tailRef.current.scrollTop = tailRef.current.scrollHeight;
-    }
-  }, [replay?.timeline.length, isLive]);
 
   // Filter to sessions that count as "today", then merge in any live
   // sessions that haven't yet persisted to disk so the selector shows them
@@ -989,6 +1402,109 @@ function LiveSessionPane({
     return [...byId.values()].sort((a, b) => lastActivityFor(b) - lastActivityFor(a)).slice(0, 10);
   }, [sessions, liveSessions]);
 
+  // Most-recently-active live session — sorted server-side. Falls back to the
+  // first id in the liveSessionIds set when the API didn't supply ordering
+  // (e.g. during the legacy fallback path). When nothing is currently live,
+  // falls back to the most recently active session in today's history (see
+  // `todaySessions` above) so the trace pane shows real history instead of
+  // an empty "waiting for tool calls" state.
+  const mostRecentlyActiveId = liveSessions.length > 0 ? liveSessions[0]!.sessionId : null;
+  const firstLiveId =
+    mostRecentlyActiveId ??
+    (liveSessionIds.size > 0 ? [...liveSessionIds][0]! : null) ??
+    (todaySessions.length > 0 ? todaySessions[0]!.sessionId : null);
+  const activeId = selectedId ?? firstLiveId;
+  const isLive = activeId !== null && liveSessionIds.has(activeId);
+  // "Session ended" badge — true when the user explicitly
+  // selected a session that was previously live but is no longer in the live
+  // set (e.g. the owning Claude Code window closed). We deliberately don't
+  // auto-switch to a different session: that's jarring, and the user might be
+  // mid-investigation. Instead we pin the selection and surface a badge.
+  const sessionEnded = selectedId !== null && !liveSessionIds.has(selectedId);
+
+  // Keep the global liveStore in sync with the local selector
+  // so the rest of the dashboard (and any per-session caches) re-key when
+  // the user switches. Empty deps + activeId in array — fires only on change.
+  useEffect(() => {
+    setActiveSession(activeId);
+  }, [activeId, setActiveSession]);
+
+  const { data: replay } = useQuery<ReplayData>({
+    queryKey: activeId ? qk.sessionReplay(activeId) : ['replay', 'none'],
+    queryFn: ({ signal }) => fetchSessionReplay(activeId!, signal),
+    enabled: activeId !== null,
+    retry: false,
+    refetchInterval: isLive ? LIVE_TAIL_REFETCH_MS : false,
+  });
+
+  // Subagent fan-out for the active session — same source as the Sessions view's
+  // trace. Tolerates a malformed/array payload (no agents) so the live tail
+  // still renders the parent lane.
+  const { data: subagentData } = useQuery<SessionSubagentsResponse>({
+    queryKey: activeId ? qk.sessionSubagents(activeId) : ['subagents', 'none'],
+    queryFn: ({ signal }) => fetchSessionSubagents(activeId!, signal),
+    enabled: activeId !== null,
+    retry: false,
+    refetchInterval: isLive ? LIVE_TAIL_REFETCH_MS : false,
+  });
+
+  // Workflow runs → status lookup for the trace's per-group status icons.
+  const { data: workflowsData } = useQuery({
+    queryKey: qk.workflows,
+    queryFn: ({ signal }) => fetchWorkflows(signal),
+    refetchInterval: isLive ? 10_000 : false,
+  });
+
+  // Decision-tree + per-turn cost detail — both trackers are live,
+  // in-memory, process-scoped accumulators (no persistence), but are
+  // filtered server-side to the selected session by passing
+  // `activeId` through as `?sessionId=`, so the session-detail drawer below
+  // always reflects the session actually selected in the trace pane above
+  // it, not just whichever session this process last recorded.
+  const { data: turnCosts } = useQuery<TurnCostsResponse>({
+    queryKey: activeId ? ['turn-costs', activeId] : ['turn-costs'],
+    queryFn: ({ signal }) => fetchTurnCosts(activeId ?? undefined, signal),
+    refetchInterval: 10_000,
+  });
+  const { data: decisionTree } = useQuery<DecisionTreeResponse>({
+    queryKey: activeId ? ['decision-tree', activeId] : ['decision-tree'],
+    queryFn: ({ signal }) => fetchDecisionTree(activeId ?? undefined, signal),
+    refetchInterval: 10_000,
+  });
+  // Mirrors ContextBar's own internal query for the same sessionId — using
+  // the identical key (`['context', activeId]`) means TanStack Query dedupes
+  // this to a single network request/shared cache entry, not a second fetch.
+  const { data: contextData } = useQuery<ContextResponse>({
+    queryKey: activeId ? ['context', activeId] : qk.context,
+    queryFn: ({ signal }) => fetchContext(activeId ?? undefined, signal),
+    refetchInterval: 10_000,
+    enabled: isLive && Boolean(activeId),
+  });
+  // Unlike turnCosts/decisionTree above, ContextCompositionTracker and
+  // ContextWindowTracker (behind /api/context-efficiency) have no
+  // per-session partitioning (only DecisionTracker/TurnCostAttributor are
+  // partitioned) — these two remain live, in-memory,
+  // current-process-only accumulators. SessionDetailDialog's header caveat
+  // discloses this so the dialog doesn't imply these two sections are also
+  // scoped to the selected session.
+  const { data: contextComposition } = useQuery<ContextCompositionResponse>({
+    queryKey: ['context-composition'],
+    queryFn: ({ signal }) => fetchContextComposition(signal),
+    refetchInterval: 10_000,
+  });
+  const { data: contextEfficiency } = useQuery<ContextEfficiencyResponse>({
+    queryKey: ['context-efficiency'],
+    queryFn: ({ signal }) => fetchContextEfficiency(signal),
+    refetchInterval: 10_000,
+  });
+
+  const tailRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (isLive && tailRef.current) {
+      tailRef.current.scrollTop = tailRef.current.scrollHeight;
+    }
+  }, [replay?.timeline?.length, isLive]);
+
   const timeline = useMemo<ReplayTimelineEntry[]>(() => replay?.timeline ?? [], [replay]);
 
   // Subagents for the active session (defensive against an empty/array payload).
@@ -1007,8 +1523,13 @@ function LiveSessionPane({
       if (startMs === null || e.timestamp < startMs) startMs = e.timestamp;
       if (endMs === null || end > endMs) endMs = end;
     }
-    const sub = subagentData?.window;
-    if (sub && Number.isFinite(sub.startMs) && Number.isFinite(sub.endMs)) {
+    // Guard against the `{ startMs: 0, endMs: 0 }` sentinel returned when a
+    // session has no subagent transcripts (Number.isFinite(0) is true, so a
+    // naive finiteness check let the sentinel drag startMs down to epoch 0).
+    // Mirrors the hasAgents guard in Sessions.tsx's SessionTraceSection.
+    const hasAgents = (subagentData?.agents?.length ?? 0) > 0;
+    const sub = hasAgents ? subagentData!.window : null;
+    if (sub) {
       startMs = startMs === null ? sub.startMs : Math.min(startMs, sub.startMs);
       endMs = endMs === null ? sub.endMs : Math.max(endMs, sub.endMs);
     }
@@ -1045,53 +1566,58 @@ function LiveSessionPane({
         style={{ height: '320px' }}
       >
         {/* Session list */}
-        <div className="border-r border-border-subtle overflow-auto">
-          <Eyebrow className="p-2 border-b border-border-subtle">Session Live Tail</Eyebrow>
-          {todaySessions.map((s) => {
-            const isSessionLive = liveSessionIds.has(s.sessionId);
-            return (
-              <button
-                key={s.sessionId}
-                type="button"
-                onClick={() => setSelectedId(s.sessionId)}
-                className={
-                  'block w-full text-left p-2 border-b border-border-subtle text-xs transition-colors duration-150 hover:bg-surface-5 ' +
-                  (activeId === s.sessionId ? 'bg-surface-5' : '')
-                }
-              >
-                <div className="flex items-center gap-1.5">
-                  <span className="font-mono text-ink-base">
-                    {s.sessionName || s.sessionId.slice(0, 8)}
-                  </span>
-                  {isSessionLive ? (
-                    <LiveBadge label="live" size="sm" />
-                  ) : (
-                    <span
-                      className="text-[10px] text-ink-muted"
-                      title={s.startTime ? `Started ${fmtTimeOfDay(s.startTime)}` : undefined}
-                    >
-                      {s.startTime ? fmtTimeOfDay(s.startTime + (s.durationMs ?? 0)) : ''}
+        <div className="border-r border-border-subtle flex flex-col overflow-hidden">
+          <div className="flex items-center justify-between gap-1.5 p-2 border-b border-border-subtle shrink-0">
+            <Eyebrow>Session Live Tail</Eyebrow>
+            <InfoTooltip text="Today's sessions on the left; select one to stream its live tool-call trace on the right." />
+          </div>
+          <div className="overflow-auto flex-1">
+            {todaySessions.map((s) => {
+              const isSessionLive = liveSessionIds.has(s.sessionId);
+              return (
+                <button
+                  key={s.sessionId}
+                  type="button"
+                  onClick={() => setSelectedId(s.sessionId)}
+                  className={
+                    'block w-full text-left p-2 border-b border-border-subtle text-xs transition-colors duration-150 hover:bg-surface-5 ' +
+                    (activeId === s.sessionId ? 'bg-surface-5' : '')
+                  }
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-mono text-ink-base">
+                      {s.sessionName || s.sessionId.slice(0, 8)}
                     </span>
-                  )}
-                </div>
-                <div className="flex gap-2 mt-0.5 text-[10px] text-ink-subtle">
-                  <span>{s.toolCallCount ?? 0} calls</span>
-                  {s.estimatedCostUsd != null && s.estimatedCostUsd > 0 ? (
-                    <span>{formatUsd(s.estimatedCostUsd)}</span>
-                  ) : (
-                    <span>—</span>
-                  )}
-                </div>
-              </button>
-            );
-          })}
-          {liveSessionIds.size === 0 && todaySessions.length === 0 && (
-            <EmptyState
-              icon="code"
-              title="No sessions today"
-              subtitle="Start coding with Claude to see sessions here."
-            />
-          )}
+                    {isSessionLive ? (
+                      <LiveBadge label="live" size="sm" />
+                    ) : (
+                      <span
+                        className="text-[10px] text-ink-muted"
+                        title={s.startTime ? `Started ${fmtTimeOfDay(s.startTime)}` : undefined}
+                      >
+                        {s.startTime ? fmtTimeOfDay(s.startTime + (s.durationMs ?? 0)) : ''}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex gap-2 mt-0.5 text-[10px] text-ink-subtle">
+                    <span>{s.toolCallCount ?? 0} calls</span>
+                    {s.estimatedCostUsd != null && s.estimatedCostUsd > 0 ? (
+                      <span>{formatUsd(s.estimatedCostUsd)}</span>
+                    ) : (
+                      <span>—</span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+            {liveSessionIds.size === 0 && todaySessions.length === 0 && (
+              <EmptyState
+                icon="code"
+                title="No sessions today"
+                subtitle="Start coding with Claude to see sessions here."
+              />
+            )}
+          </div>
         </div>
 
         {/* Live tail */}
@@ -1156,7 +1682,38 @@ function LiveSessionPane({
             numbers would be stale and the SSE feed won't be updating). */}
           {isLive && activeId && (
             <div className="border-t border-bg-line px-3 py-2 shrink-0">
-              <ContextBar sessionId={activeId} />
+              <ContextBar sessionId={activeId} expandable={false} />
+            </div>
+          )}
+          {/* `turnCosts?.turns?.length` (not `turnCosts && turnCosts.turns.length`)
+            because unrelated tests' default fetch mocks resolve every
+            unmatched endpoint (including this one) to `[]`, which has no
+            `.turns` field — the plain-object shape only holds under the
+            dedicated /api/turn-costs mock. */}
+          {((decisionTree?.totalBranches ?? 0) > 0 ||
+            (turnCosts?.turns?.length ?? 0) > 0 ||
+            (contextData?.history?.length ?? 0) >= 2) && (
+            <div className="border-t border-bg-line px-3 py-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowDetail(true)}
+                className="text-[10px] text-primary hover:underline transition-colors duration-150 text-left"
+              >
+                {(() => {
+                  const parts: string[] = [];
+                  if (decisionTree && decisionTree.totalBranches > 0) {
+                    parts.push(`${decisionTree.longestFailureStreak} failure streak`);
+                  }
+                  if (turnCosts?.turns && turnCosts.turns.length > 0) {
+                    parts.push(
+                      `${turnCosts.turns.length} turns · ${formatUsd(turnCosts.totalAttributedCost)}`,
+                    );
+                  }
+                  return parts.length > 0
+                    ? `${parts.join(' · ')} — session detail →`
+                    : 'session detail →';
+                })()}
+              </button>
             </div>
           )}
         </div>
@@ -1164,119 +1721,61 @@ function LiveSessionPane({
       {openRunId != null && (
         <WorkflowRunDetail runId={openRunId} onClose={() => setOpenRunId(null)} />
       )}
+      {showDetail && (
+        <SessionDetailDialog
+          decisionTree={decisionTree}
+          turnCosts={turnCosts}
+          contextHistory={contextData?.history}
+          contextWindow={contextData?.contextWindow}
+          contextComposition={contextComposition}
+          contextEfficiency={contextEfficiency}
+          onClose={() => setShowDetail(false)}
+        />
+      )}
     </>
   );
 }
 
-// Label resolver for the per-session pill on anti-pattern
-// alerts. Falls back to the truncated session id when no friendly name is
-// known yet — sessionName is only set after the live registry has seen a
-// `cwd` from the first hook event.
+// Label resolver for the compute-waste "top session" row. Falls back to the
+// truncated session id when no friendly name is known yet — sessionName is
+// only set after the live registry has seen a `cwd` from the first hook
+// event.
 function sessionPillLabel(sessionId: string, liveSessions: LiveSessionEntry[]): string {
   const match = liveSessions.find((ls) => ls.sessionId === sessionId);
   if (match?.sessionName) return match.sessionName;
   return sessionId.slice(0, 8);
 }
 
-function RecentAlertsPanel(): JSX.Element | null {
-  // The query returns `null` when the endpoint is 404 (cloud mode — no
-  // alert engine), so callers can render an empty / hidden state instead
-  // of a permanent red error banner. retry: false avoids the 4× request
-  // multiplier React Query would otherwise produce on every refetch.
-  const { data, isLoading, error } = useQuery<readonly AlertEvent[] | null>({
-    queryKey: qk.alertsRecent,
-    queryFn: async () => {
-      try {
-        return await fetchRecentAlerts();
-      } catch (err) {
-        if (err instanceof NotFoundError) return null;
-        throw err;
-      }
-    },
-    refetchInterval: RECENT_ALERTS_REFETCH_MS,
-    retry: false,
-  });
-
-  // Cloud mode (or alerts disabled) → endpoint 404 → null. Render nothing
-  // so the panel doesn't claim there's an error when there isn't one.
-  if (data === null) return null;
-
-  const entries: readonly AlertEvent[] = data ?? [];
-  // Defensive sort — `AlertLog.readRecent` already reverses the
-  // last-N-lines slice before returning, so the API is newest-first today.
-  // Sorting again is idempotent and pins the UI ordering against any future
-  // refactor of `readRecent` that drops or reorders the .reverse() call.
-  const sortedEntries = [...entries].sort((a, b) => b.firedAt - a.firedAt);
-
-  return (
-    <Card padding="sm">
-      <Eyebrow className="mb-2">Recent Alerts</Eyebrow>
-      {isLoading && <EmptyState variant="loading" title="Loading..." />}
-      {error && <div className="text-accent-red text-xs">Error loading recent alerts.</div>}
-      {!isLoading && !error && sortedEntries.length === 0 && (
-        <div className="text-ink-muted text-xs">No alerts in recent history.</div>
-      )}
-      {!isLoading && !error && sortedEntries.length > 0 && (
-        <table className="w-full text-xs">
-          <thead className="text-ink-muted">
-            <tr>
-              <th className="text-left pb-1">when</th>
-              <th className="text-left pb-1">sev</th>
-              <th className="text-left pb-1">rule</th>
-              <th className="text-right pb-1">value / threshold</th>
-              <th className="text-left pb-1 pl-2">state</th>
-            </tr>
-          </thead>
-          <tbody>
-            {sortedEntries.slice(0, 50).map((a) => (
-              <tr key={`${a.id}-${a.firedAt}-${a.state}`} className="border-t border-border-subtle">
-                <td className="py-1 text-ink-subtle tabular-nums whitespace-nowrap">
-                  {formatRelativeTime(a.firedAt)}
-                </td>
-                <td className="py-1">
-                  <span aria-hidden="true" className={SEVERITY_DOT[a.severity]}>
-                    ●
-                  </span>{' '}
-                  <span className="text-ink-subtle uppercase tracking-wider text-[10px]">
-                    {a.severity}
-                  </span>
-                </td>
-                <td className="py-1">{a.title}</td>
-                <td className="py-1 text-right tabular-nums">
-                  {formatNumber(a.value)} / {formatNumber(a.threshold)}
-                </td>
-                <td
-                  className={
-                    'py-1 pl-2 ' + (a.state === 'firing' ? 'text-accent-amber' : 'text-ink-muted')
-                  }
-                >
-                  {a.state}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </Card>
-  );
-}
-
-function formatRelativeTime(ts: number): string {
-  const now = Date.now();
-  const diff = Math.max(0, now - ts);
-  const mins = Math.floor(diff / 60_000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
 // `isToday` is now `isSameLocalDay` from `src/lib/date.ts` — shared with the
 // dashboard server so both surfaces draw the day boundary at the same moment.
 
 const isToday = (ts: number): boolean => isSameLocalDay(ts);
+
+/**
+ * What fraction of a session's [startTime, end) window falls within today's
+ * local day, for the more limited fields the dashboard list endpoint exposes
+ * (no timeline — just startTime/endTime/durationMs). Delegates to the
+ * shared `todayPortionRatio` (src/lib/date.ts) so this client-side estimate
+ * uses the exact same elapsed-time-overlap math as the server's
+ * `todayPortionOfSessionCost`, instead of reimplementing it here.
+ *
+ * Used to prorate every "how much of this session counts toward today"
+ * metric consistently — cost and anti-pattern flags — so a
+ * cross-midnight session contributes its today-portion everywhere, not just
+ * for cost. Without this, `computeTodayFlags` would
+ * add a cross-midnight session's *entire lifetime* count once
+ * `todayPortionOfSession(s) > 0`, rather than prorating the count itself.
+ */
+function todayOverlapRatio(s: SessionSummary): number {
+  if (s.startTime == null) return 0;
+  const end =
+    typeof s.endTime === 'number'
+      ? s.endTime
+      : typeof s.durationMs === 'number'
+        ? s.startTime + s.durationMs
+        : Date.now(); // live session with no end info: assume still running
+  return todayPortionRatio({ startTime: s.startTime, endTime: end });
+}
 
 /**
  * Today-portion of a session's cost. Mirrors the server-side
@@ -1290,27 +1789,7 @@ const isToday = (ts: number): boolean => isSameLocalDay(ts);
 function todayPortionOfSession(s: SessionSummary): number {
   const cost = s.estimatedCostUsd;
   if (cost == null || cost <= 0) return 0;
-  if (s.startTime == null) return 0;
-
-  const dayStart = localStartOfDay();
-  const dayEnd = dayStart + 86_400_000;
-
-  const start = s.startTime;
-  const end =
-    typeof s.endTime === 'number'
-      ? s.endTime
-      : typeof s.durationMs === 'number'
-        ? s.startTime + s.durationMs
-        : Date.now(); // live session with no end info: assume still running
-
-  if (end < dayStart) return 0;
-  if (start >= dayEnd) return 0;
-
-  if (start >= dayStart && end < dayEnd) return cost;
-
-  const overlapMs = Math.min(end, dayEnd) - Math.max(start, dayStart);
-  const totalMs = Math.max(1, end - start);
-  return cost * (overlapMs / totalMs);
+  return cost * todayOverlapRatio(s);
 }
 
 function computeTodaySpend(sessions: SessionSummary[]): number {
@@ -1319,27 +1798,18 @@ function computeTodaySpend(sessions: SessionSummary[]): number {
   return total;
 }
 
-function computeTodayToolCalls(sessions: SessionSummary[]): number {
-  let total = 0;
-  for (const s of sessions) {
-    // isToday fast-path includes sessions that started today regardless of cost
-    // (cost may be null before token data arrives). todayPortionOfSession > 0
-    // additionally picks up cross-midnight sessions with non-null cost.
-    if ((s.startTime && isToday(s.startTime)) || todayPortionOfSession(s) > 0) {
-      total += s.toolCallCount ?? 0;
-    }
-  }
-  return total;
-}
-
 function computeTodayFlags(sessions: SessionSummary[]): number {
   let total = 0;
   for (const s of sessions) {
-    if ((s.startTime && isToday(s.startTime)) || todayPortionOfSession(s) > 0) {
-      total += s.antiPatterns?.length ?? 0;
-    }
+    const ratio = todayOverlapRatio(s);
+    if (ratio > 0) total += (s.antiPatterns?.length ?? 0) * ratio;
   }
-  return total;
+  return Math.round(total);
+}
+
+interface HourlyCostEntry {
+  readonly hour: number; // 0..23
+  readonly cost: number;
 }
 
 function buildHourlySpend(sessions: SessionSummary[]): HourlyCostEntry[] {
@@ -1349,73 +1819,88 @@ function buildHourlySpend(sessions: SessionSummary[]): HourlyCostEntry[] {
   // `sessions`, so no separate currentSessionCost addition is needed — adding
   // it separately caused the live session's cost to be counted twice.
   const buckets = new Array<number>(24).fill(0);
+  const dayStart = localStartOfDay();
+  const dayEnd = dayStart + 86_400_000;
+
   for (const s of sessions) {
-    if (!s.startTime || !isToday(s.startTime) || s.estimatedCostUsd == null) continue;
-    const hour = new Date(s.startTime).getHours();
-    buckets[hour]! += s.estimatedCostUsd;
+    if (!s.startTime || s.estimatedCostUsd == null || s.estimatedCostUsd <= 0) continue;
+    const start = s.startTime;
+    const end =
+      typeof s.endTime === 'number'
+        ? s.endTime
+        : typeof s.durationMs === 'number'
+          ? s.startTime + s.durationMs
+          : Date.now();
+
+    // Clamp the session's activity window to today's local day — a session
+    // that started yesterday and is still running now contributes its
+    // today-portion instead of being skipped entirely. A naive `continue`
+    // on any session that didn't *start* today would hide the chart even
+    // when `todayTotal > 0`.
+    const clampedStart = Math.max(start, dayStart);
+    const clampedEnd = Math.min(end, dayEnd);
+    if (clampedEnd <= clampedStart) continue;
+
+    const totalMs = Math.max(1, end - start);
+    const todayShareMs = clampedEnd - clampedStart;
+    const todayCost = s.estimatedCostUsd * (todayShareMs / totalMs);
+
+    // Spread todayCost across every hour bucket the clamped window actually
+    // touches, weighted by time-in-bucket — instead of dumping the whole
+    // amount into the session's start hour, which would make a
+    // multi-hour session appear as one artificial spike.
+    let cursor = clampedStart;
+    while (cursor < clampedEnd) {
+      const cursorDate = new Date(cursor);
+      const hour = cursorDate.getHours();
+      const nextHour = new Date(cursorDate);
+      nextHour.setMinutes(0, 0, 0);
+      nextHour.setHours(hour + 1);
+      const segmentEnd = Math.min(clampedEnd, nextHour.getTime());
+      const segmentMs = segmentEnd - cursor;
+      buckets[hour]! += todayCost * (segmentMs / todayShareMs);
+      cursor = segmentEnd;
+    }
   }
   return buckets.map((cost, hour) => ({ hour, cost }));
 }
 
-function ForecastEodCard({
-  todayTotal,
-  forecastEod,
-  hourlySpend,
-  subagentUsd = 0,
-}: {
-  todayTotal: number;
-  forecastEod: number | null;
-  hourlySpend: HourlyCostEntry[];
-  subagentUsd?: number;
-}): JSX.Element {
-  const hasForecast = forecastEod !== null && Number.isFinite(forecastEod);
-  const effectiveForecast = hasForecast ? Math.max(forecastEod, todayTotal) : 0;
-  const delta = hasForecast ? effectiveForecast - todayTotal : 0;
-  const pct = hasForecast && todayTotal > 0 ? (delta / todayTotal) * 100 : 0;
-  const hasSpend = hourlySpend.some((h) => h.cost > 0);
-  // todayTotal and subagentUsd are each a Math.max over different endpoints, so
-  // the subtraction can momentarily go negative when they pick different
-  // sources; clamp to 0 (the server clamps its own parentUsd the same way).
-  const parentUsd = subagentUsd > 0 ? Math.max(0, todayTotal - subagentUsd) : 0;
+export function buildSpendTodaySeries(
+  hourlySpend: readonly HourlyCostEntry[],
+  forecastEod: number | null,
+  nowMs: number,
+): SpendBarsDatum[] {
+  const currentHour = new Date(nowMs).getHours();
+  const lastHour = 23;
 
-  return (
-    <Card padding="sm" className="mb-3 h-full">
-      <Eyebrow className="mb-1.5">Forecast · End of Day</Eyebrow>
-      {hasForecast ? (
-        <>
-          <div className="flex items-baseline gap-3">
-            <span className="text-lg font-semibold text-ink-base tabular-nums">
-              {formatUsd(effectiveForecast)}
-            </span>
-            <span className="text-xs text-ink-muted tabular-nums">
-              {delta > 0 ? (
-                <>
-                  +{formatUsd(delta)}
-                  {todayTotal > 0 && ` (+${pct.toFixed(0)}%)`} from now
-                </>
-              ) : (
-                <>on pace</>
-              )}
-            </span>
-          </div>
-          {hasSpend && (
-            <div className="mt-2">
-              <HourlyCostBlocks hours={hourlySpend} />
-              {subagentUsd > 0 && (
-                <div className="flex gap-3 mt-1 text-[10px] text-ink-muted tabular-nums">
-                  <span>parent {formatUsd(parentUsd)}</span>
-                  <span className="text-ink-subtle">·</span>
-                  <span>subagent {formatUsd(subagentUsd)}</span>
-                </div>
-              )}
-            </div>
-          )}
-        </>
-      ) : (
-        <div className="text-ink-muted text-xs">
-          Insufficient data — forecast appears once burn rate stabilizes.
-        </div>
-      )}
-    </Card>
-  );
+  const cumulativeByHour = new Array<number>(24);
+  let running = 0;
+  for (let hour = 0; hour < 24; hour++) {
+    running += hourlySpend[hour]?.cost ?? 0;
+    cumulativeByHour[hour] = running;
+  }
+  const cumulativeAtNow = cumulativeByHour[currentHour] ?? 0;
+
+  const hasProjection =
+    forecastEod != null && Number.isFinite(forecastEod) && forecastEod > cumulativeAtNow;
+  const projectedSlope =
+    hasProjection && lastHour > currentHour
+      ? (forecastEod! - cumulativeAtNow) / (lastHour - currentHour)
+      : 0;
+
+  return Array.from({ length: 24 }, (_, hour) => {
+    const cumulativeUsd = hour <= currentHour ? cumulativeByHour[hour]! : null;
+    let projectedUsd: number | null = null;
+    if (hasProjection && hour >= currentHour) {
+      projectedUsd =
+        hour === lastHour ? forecastEod! : cumulativeAtNow + projectedSlope * (hour - currentHour);
+    }
+    return {
+      key: String(hour),
+      label: hourOfDayLabel(hour),
+      spendUsd: hourlySpend[hour]?.cost ?? 0,
+      cumulativeUsd,
+      projectedUsd,
+    };
+  });
 }

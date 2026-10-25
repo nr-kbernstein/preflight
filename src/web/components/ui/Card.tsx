@@ -31,8 +31,6 @@ export function Card({
   tone = 'default',
   className = '',
 }: CardProps): JSX.Element {
-  const classes = [TONE_CLASS[tone], PADDING_CLASS[padding], className]
-    .filter(Boolean)
-    .join(' ');
+  const classes = [TONE_CLASS[tone], PADDING_CLASS[padding], className].filter(Boolean).join(' ');
   return <div className={classes}>{children}</div>;
 }

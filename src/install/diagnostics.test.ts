@@ -28,8 +28,16 @@ jest.mock('node:os', () => {
 // Stub schedule module.
 jest.mock('./schedule.js', () => ({
   getDashboardDaemonStatus: jest.fn(() => ({ installed: false, readable: false })),
+  getScheduleStatus: jest.fn(() => ({ installed: false, readable: false })),
   resolveNodeDir: jest.fn(() => dirname(process.execPath)),
   findExecutableNodeDir: jest.fn(() => ({ dir: null, hasNonExecutable: false })),
+}));
+
+jest.mock('./update-support.js', () => ({
+  detectUpdateSupport: jest.fn(() => ({ supported: true, repoRoot: '/src/preflight' })),
+  upgradeCommandFor: jest.fn((blocker: string) =>
+    blocker === 'homebrew' ? 'brew upgrade preflight' : 'npm install -g @newrelic/preflight@latest',
+  ),
 }));
 
 // Stub config module.
@@ -39,39 +47,23 @@ jest.mock('../config.js', () => ({
     malformed: false,
     errors: [],
     warnings: [],
+    companionMode: undefined,
   })),
+  loadMcpConfig: jest.fn(() => ({ mode: 'local', companionMode: false })),
+  resolveCompanionMode: jest.fn(() => ({ value: false, source: 'default' })),
   DEFAULT_STORAGE_PATH: '/test-home/.newrelic-preflight',
 }));
 
-// Stub install-helper.
-jest.mock('./install-helper.js', () => ({
-  detectSettingsPath: jest.fn(() => '/test-home/.claude/settings.json'),
-  NR_HOOK_RE: /preflight-collector"?\s+(?:pre|post)-tool/,
-  entryContainsNrObserve: jest.fn((entry: unknown) => {
-    // Replicate minimal logic for tests that construct real hook entries
-    if (typeof entry !== 'object' || entry === null) return false;
-    const obj = entry as Record<string, unknown>;
-    const re = /preflight-collector"?\s+(?:pre|post)-tool/;
-    if (Array.isArray(obj.hooks)) {
-      return (obj.hooks as Array<Record<string, unknown>>).some(
-        (h) => typeof h.command === 'string' && re.test(h.command),
-      );
-    }
-    if (typeof obj.command === 'string') return re.test(obj.command);
-    return false;
-  }),
-  entryHasAnyCommandHook: jest.fn((entry: unknown) => {
-    if (typeof entry !== 'object' || entry === null) return false;
-    const obj = entry as Record<string, unknown>;
-    if (Array.isArray(obj.hooks)) {
-      return (obj.hooks as Array<Record<string, unknown>>).some(
-        (h) => typeof h.command === 'string' && h.command !== '',
-      );
-    }
-    if (typeof obj.command === 'string') return obj.command !== '';
-    return false;
-  }),
-}));
+// Stub install-helper: only detectSettingsPath is redirected — the matching
+// logic and hook-event vocabulary stay real so these tests can't drift from
+// what the installer actually writes.
+jest.mock('./install-helper.js', () => {
+  const real = jest.requireActual<typeof import('./install-helper.js')>('./install-helper.js');
+  return {
+    ...real,
+    detectSettingsPath: jest.fn(() => '/test-home/.claude/settings.json'),
+  };
+});
 
 // Stub platform module.
 jest.mock('./platform.js', () => ({
@@ -93,6 +85,7 @@ global.fetch = mockFetch as unknown as typeof fetch;
 
 import type { DiagnosticCheck } from './diagnostics.js';
 import * as schedule from './schedule.js';
+import * as updateSupport from './update-support.js';
 import * as config from '../config.js';
 import * as installHelper from './install-helper.js';
 import * as platform from './platform.js';
@@ -105,7 +98,10 @@ const mockedStatSync = nodeFs.statSync as jest.Mock;
 const mockedPlatform = nodeOs.platform as jest.Mock;
 const mockedGetDaemonStatus = schedule.getDashboardDaemonStatus as jest.Mock;
 const mockedFindExecutableNodeDir = schedule.findExecutableNodeDir as jest.Mock;
+const mockedGetScheduleStatus = schedule.getScheduleStatus as jest.Mock;
+const mockedDetectUpdateSupport = updateSupport.detectUpdateSupport as jest.Mock;
 const mockedValidateConfig = config.validateConfigFile as jest.Mock;
+const mockedLoadMcpConfig = config.loadMcpConfig as jest.Mock;
 const mockedDetectSettingsPath = installHelper.detectSettingsPath as jest.Mock;
 const mockedIsWsl = platform.isWsl as jest.Mock;
 
@@ -113,6 +109,13 @@ function makeOpts() {
   return {
     configPath: '/test-home/.newrelic-preflight/config.json',
     storagePath: '/test-home/.newrelic-preflight',
+  };
+}
+
+function nrHookEntry(subcommand: string) {
+  return {
+    matcher: '',
+    hooks: [{ type: 'command', command: `preflight-collector ${subcommand}` }],
   };
 }
 
@@ -136,9 +139,12 @@ describe('runDiagnostics', () => {
       errors: [],
       warnings: [],
     });
+    mockedLoadMcpConfig.mockReturnValue({ mode: 'local' });
     mockedDetectSettingsPath.mockReturnValue('/test-home/.claude/settings.json');
     mockedIsWsl.mockReturnValue(false);
-    mockFetch.mockResolvedValue({ ok: true } as Response);
+    mockFetch.mockImplementation(async () => {
+      return { ok: true, json: async () => ({ version: '0.0.0' }) } as unknown as Response;
+    });
     mockedStatSync.mockImplementation(() => {
       throw new Error('ENOENT');
     });
@@ -200,7 +206,67 @@ describe('runDiagnostics', () => {
     });
   });
 
-  describe('Check 2: Daemon installed', () => {
+  describe('Check: Telemetry mode', () => {
+    it('reports the resolved mode and env as its source', async () => {
+      process.env.NR_AI_MODE = 'both';
+      mockedLoadMcpConfig.mockReturnValue({ mode: 'both' });
+      const checks = await runDiagnostics(makeOpts());
+      delete process.env.NR_AI_MODE;
+      const c = checks.find((x) => x.check === 'Telemetry mode')!;
+      expect(c.status).toBe('ok');
+      expect(c.detail).toBe("Resolved to 'both' (source: env NR_AI_MODE)");
+    });
+
+    it('reports the config file as the source when mode came from there', async () => {
+      mockedValidateConfig.mockReturnValue({
+        fileExists: true,
+        malformed: false,
+        mode: 'cloud',
+        errors: [],
+        warnings: [],
+      });
+      mockedLoadMcpConfig.mockReturnValue({ mode: 'cloud' });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Telemetry mode')!;
+      expect(c.status).toBe('ok');
+      expect(c.detail).toBe("Resolved to 'cloud' (source: config file)");
+    });
+
+    it('reports the local default as the source when neither env nor file set a mode', async () => {
+      mockedLoadMcpConfig.mockReturnValue({ mode: 'local' });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Telemetry mode')!;
+      expect(c.status).toBe('ok');
+      expect(c.detail).toBe("Resolved to 'local' (source: default (local))");
+    });
+
+    it('surfaces the fail-closed licenseKey-without-mode error as a diagnostic finding, not a crash', async () => {
+      mockedLoadMcpConfig.mockImplementation(() => {
+        throw new Error(
+          'Config has a licenseKey but no explicit mode. Telemetry export is opt-in: ' +
+            'set "mode": "cloud" (or "both") in the config file, set NR_AI_MODE, or ' +
+            'remove the credentials for local-only use. Previous versions implicitly ' +
+            'defaulted to cloud.',
+        );
+      });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Telemetry mode')!;
+      expect(c.status).toBe('fail');
+      expect(c.detail).toContain('no explicit mode');
+      expect(c.fix).toBeTruthy();
+    });
+  });
+
+  describe('Check 2: Node version', () => {
+    it('returns ok on a supported Node version', async () => {
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Node version')!;
+      expect(c.status).toBe('ok');
+      expect(c.detail).toContain(process.version);
+    });
+  });
+
+  describe('Check 3: Daemon installed', () => {
     it('returns skip on non-macOS', async () => {
       mockedPlatform.mockReturnValue('linux');
       const checks = await runDiagnostics(makeOpts());
@@ -225,7 +291,50 @@ describe('runDiagnostics', () => {
     });
   });
 
-  describe('Check 3: Daemon node path', () => {
+  describe('Update schedule', () => {
+    const findCheck = (checks: DiagnosticCheck[]) =>
+      checks.find((x) => x.check === 'Update schedule')!;
+
+    beforeEach(() => {
+      mockedGetScheduleStatus.mockReturnValue({ installed: false, readable: false });
+      mockedDetectUpdateSupport.mockReturnValue({ supported: true, repoRoot: '/src/preflight' });
+    });
+
+    it('returns skip on non-macOS', async () => {
+      mockedPlatform.mockReturnValue('linux');
+      expect(findCheck(await runDiagnostics(makeOpts())).status).toBe('skip');
+    });
+
+    it('returns ok when no schedule is installed', async () => {
+      expect(findCheck(await runDiagnostics(makeOpts())).status).toBe('ok');
+    });
+
+    it('returns ok when a schedule is installed on a source clone', async () => {
+      mockedGetScheduleStatus.mockReturnValue({ installed: true, readable: true });
+      expect(findCheck(await runDiagnostics(makeOpts())).status).toBe('ok');
+    });
+
+    it('warns with removal and upgrade fix when a schedule is installed on a package-manager install', async () => {
+      mockedGetScheduleStatus.mockReturnValue({ installed: true, readable: true });
+      mockedDetectUpdateSupport.mockReturnValue({ supported: false, blocker: 'package-manager' });
+      const c = findCheck(await runDiagnostics(makeOpts()));
+      expect(c.status).toBe('warn');
+      expect(c.detail).toContain('com.preflight.update.plist');
+      expect(c.fix).toContain('preflight schedule --disable');
+      expect(c.fix).toContain('npm install -g @newrelic/preflight@latest');
+    });
+
+    it('names brew upgrade, not npm, when the install is Homebrew', async () => {
+      mockedGetScheduleStatus.mockReturnValue({ installed: true, readable: true });
+      mockedDetectUpdateSupport.mockReturnValue({ supported: false, blocker: 'homebrew' });
+      const c = findCheck(await runDiagnostics(makeOpts()));
+      expect(c.status).toBe('warn');
+      expect(c.fix).toContain('brew upgrade preflight');
+      expect(c.fix).not.toContain('npm install');
+    });
+  });
+
+  describe('Check 4: Daemon node path', () => {
     it('returns skip when daemon not installed', async () => {
       mockedGetDaemonStatus.mockReturnValue({ installed: false, readable: false });
       const checks = await runDiagnostics(makeOpts());
@@ -301,7 +410,7 @@ describe('runDiagnostics', () => {
     });
   });
 
-  describe('Check 4: Hooks wired', () => {
+  describe('Check 5: Hooks wired', () => {
     it('returns fail when settings file does not exist', async () => {
       mockedExistSync.mockImplementation((p) => p !== '/test-home/.claude/settings.json');
       const checks = await runDiagnostics(makeOpts());
@@ -320,23 +429,43 @@ describe('runDiagnostics', () => {
       expect(checks.find((x) => x.check === 'Hooks wired')?.status).toBe('fail');
     });
 
-    it('returns ok when both PreToolUse and PostToolUse hooks are present', async () => {
-      const hookEntry = {
-        matcher: '',
-        hooks: [{ type: 'command', command: 'preflight-collector pre-tool' }],
-      };
-      const postEntry = {
-        matcher: '',
-        hooks: [{ type: 'command', command: 'preflight-collector post-tool' }],
-      };
+    it('returns ok when all five preflight hooks are present', async () => {
       mockedExistSync.mockImplementation((p) => p === '/test-home/.claude/settings.json');
       mockedReadFileSync.mockImplementation((p) => {
         if (p === '/test-home/.claude/settings.json')
-          return JSON.stringify({ hooks: { PreToolUse: [hookEntry], PostToolUse: [postEntry] } });
+          return JSON.stringify({
+            hooks: {
+              PreToolUse: [nrHookEntry('pre-tool')],
+              PostToolUse: [nrHookEntry('post-tool')],
+              PermissionRequest: [nrHookEntry('permission-request')],
+              PermissionDenied: [nrHookEntry('permission-denied')],
+              StopFailure: [nrHookEntry('stop-failure')],
+            },
+          });
         return '{}';
       });
       const checks = await runDiagnostics(makeOpts());
       expect(checks.find((x) => x.check === 'Hooks wired')?.status).toBe('ok');
+    });
+
+    it('returns fail naming the permission hooks for a pre-upgrade install', async () => {
+      mockedExistSync.mockImplementation((p) => p === '/test-home/.claude/settings.json');
+      mockedReadFileSync.mockImplementation((p) => {
+        if (p === '/test-home/.claude/settings.json')
+          return JSON.stringify({
+            hooks: {
+              PreToolUse: [nrHookEntry('pre-tool')],
+              PostToolUse: [nrHookEntry('post-tool')],
+            },
+          });
+        return '{}';
+      });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Hooks wired')!;
+      expect(c.status).toBe('fail');
+      expect(c.detail).toContain('PermissionRequest');
+      expect(c.detail).toContain('PermissionDenied');
+      expect(c.fix).toContain('preflight install');
     });
 
     it('includes malformed-file note when one path parses and another fails JSON.parse', async () => {
@@ -384,37 +513,41 @@ describe('runDiagnostics', () => {
       mockedDetectSettingsPath
         .mockReturnValueOnce('/test-home/.claude/settings.json') // Linux path (no hooks)
         .mockReturnValueOnce(`${winHome}/.claude/settings.json`); // Windows path (has hooks)
-      const hookEntry = {
-        matcher: '',
-        hooks: [{ type: 'command', command: 'preflight-collector pre-tool' }],
-      };
-      const postEntry = {
-        matcher: '',
-        hooks: [{ type: 'command', command: 'preflight-collector post-tool' }],
-      };
       mockedExistSync.mockImplementation((p) => p === `${winHome}/.claude/settings.json`);
       mockedReadFileSync.mockImplementation((p) => {
         if (p === `${winHome}/.claude/settings.json`)
-          return JSON.stringify({ hooks: { PreToolUse: [hookEntry], PostToolUse: [postEntry] } });
+          return JSON.stringify({
+            hooks: {
+              PreToolUse: [nrHookEntry('pre-tool')],
+              PostToolUse: [nrHookEntry('post-tool')],
+              PermissionRequest: [nrHookEntry('permission-request')],
+              PermissionDenied: [nrHookEntry('permission-denied')],
+              StopFailure: [nrHookEntry('stop-failure')],
+            },
+          });
         return '{}';
       });
       const checks = await runDiagnostics(makeOpts());
       expect(checks.find((x) => x.check === 'Hooks wired')?.status).toBe('ok');
     });
 
-    it('returns warn when both PreToolUse and PostToolUse have custom (non-NR) commands', async () => {
-      const preEntry = {
+    it('returns warn when every hook event has a custom (non-NR) command', async () => {
+      const customEntry = (sub: string) => ({
         matcher: '',
-        hooks: [{ type: 'command', command: '/home/user/wrapper.sh pre-tool' }],
-      };
-      const postEntry = {
-        matcher: '',
-        hooks: [{ type: 'command', command: '/home/user/wrapper.sh post-tool' }],
-      };
+        hooks: [{ type: 'command', command: `/home/user/wrapper.sh ${sub}` }],
+      });
       mockedExistSync.mockImplementation((p) => p === '/test-home/.claude/settings.json');
       mockedReadFileSync.mockImplementation((p) => {
         if (p === '/test-home/.claude/settings.json')
-          return JSON.stringify({ hooks: { PreToolUse: [preEntry], PostToolUse: [postEntry] } });
+          return JSON.stringify({
+            hooks: {
+              PreToolUse: [customEntry('pre-tool')],
+              PostToolUse: [customEntry('post-tool')],
+              PermissionRequest: [customEntry('permission-request')],
+              PermissionDenied: [customEntry('permission-denied')],
+              StopFailure: [customEntry('stop-failure')],
+            },
+          });
         return '{}';
       });
       const checks = await runDiagnostics(makeOpts());
@@ -426,10 +559,6 @@ describe('runDiagnostics', () => {
     });
 
     it('returns warn when one event has the NR hook and the other has a custom command', async () => {
-      const preNrEntry = {
-        matcher: '',
-        hooks: [{ type: 'command', command: 'preflight-collector pre-tool' }],
-      };
       const postCustomEntry = {
         matcher: '',
         hooks: [{ type: 'command', command: '/home/user/wrapper.sh post-tool' }],
@@ -438,7 +567,13 @@ describe('runDiagnostics', () => {
       mockedReadFileSync.mockImplementation((p) => {
         if (p === '/test-home/.claude/settings.json')
           return JSON.stringify({
-            hooks: { PreToolUse: [preNrEntry], PostToolUse: [postCustomEntry] },
+            hooks: {
+              PreToolUse: [nrHookEntry('pre-tool')],
+              PostToolUse: [postCustomEntry],
+              PermissionRequest: [nrHookEntry('permission-request')],
+              PermissionDenied: [nrHookEntry('permission-denied')],
+              StopFailure: [nrHookEntry('stop-failure')],
+            },
           });
         return '{}';
       });
@@ -494,7 +629,81 @@ describe('runDiagnostics', () => {
     });
   });
 
-  describe('Check 5: Storage writable', () => {
+  describe('Check 6: Hook node path', () => {
+    function settingsWithHookCommand(command: string) {
+      mockedExistSync.mockImplementation((p) => p === '/test-home/.claude/settings.json');
+      mockedReadFileSync.mockImplementation((p) => {
+        if (p === '/test-home/.claude/settings.json') {
+          return JSON.stringify({
+            hooks: {
+              PreToolUse: [{ matcher: '', hooks: [{ type: 'command', command }] }],
+              PostToolUse: [{ matcher: '', hooks: [{ type: 'command', command }] }],
+            },
+          });
+        }
+        return '{}';
+      });
+    }
+
+    it('skips when no NR hook is installed', async () => {
+      mockedExistSync.mockImplementation((p) => p === '/test-home/.claude/settings.json');
+      mockedReadFileSync.mockImplementation(() => JSON.stringify({ hooks: {} }));
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Hook node path')!;
+      expect(c.status).toBe('skip');
+    });
+
+    it('skips when the installed hook uses a bare command name (no absolute path)', async () => {
+      settingsWithHookCommand('preflight-collector pre-tool');
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Hook node path')!;
+      expect(c.status).toBe('skip');
+      expect(c.detail).toContain('bare command name');
+    });
+
+    it('fails when no node binary is found next to the installed hook', async () => {
+      settingsWithHookCommand('"/opt/stale-node/bin/preflight-collector" pre-tool');
+      mockedFindExecutableNodeDir.mockReturnValue({ dir: null, hasNonExecutable: false });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Hook node path')!;
+      expect(c.status).toBe('fail');
+      expect(c.fix).toBeDefined();
+    });
+
+    it('fails with permission error when node binary exists but is not executable', async () => {
+      settingsWithHookCommand('"/opt/node/bin/preflight-collector" pre-tool');
+      mockedFindExecutableNodeDir.mockReturnValue({ dir: null, hasNonExecutable: true });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Hook node path')!;
+      expect(c.status).toBe('fail');
+      expect(c.detail).toContain('not executable');
+      expect(c.fix).toContain('chmod +x');
+    });
+
+    it('returns ok when the colocated node binary matches the current Node install', async () => {
+      const currentNodeDir = dirname(process.execPath);
+      settingsWithHookCommand(`"${currentNodeDir}/preflight-collector" pre-tool`);
+      mockedFindExecutableNodeDir.mockReturnValue({ dir: currentNodeDir, hasNonExecutable: false });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Hook node path')!;
+      expect(c.status).toBe('ok');
+    });
+
+    it('warns when the colocated node binary differs from the current Node install', async () => {
+      settingsWithHookCommand('"/opt/other-node/bin/preflight-collector" pre-tool');
+      mockedFindExecutableNodeDir.mockReturnValue({
+        dir: '/opt/other-node/bin',
+        hasNonExecutable: false,
+      });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Hook node path')!;
+      expect(c.status).toBe('warn');
+      expect(c.detail).toContain('/opt/other-node/bin');
+      expect(c.fix).toBeDefined();
+    });
+  });
+
+  describe('Check 7: Storage writable', () => {
     it('returns fail when directory does not exist', async () => {
       mockedExistSync.mockImplementation((p) => p !== '/test-home/.newrelic-preflight');
       const checks = await runDiagnostics(makeOpts());
@@ -533,7 +742,7 @@ describe('runDiagnostics', () => {
     });
   });
 
-  describe('Check 6: NR reachable', () => {
+  describe('Check 10: NR reachable', () => {
     beforeEach(() => {
       mockedValidateConfig.mockReturnValue({
         fileExists: true,
@@ -662,7 +871,7 @@ describe('runDiagnostics', () => {
     });
   });
 
-  describe('Check 7: Local instances', () => {
+  describe('Check 8: Local instances', () => {
     it('reports ok with no --local processes running', async () => {
       (LocalStore as unknown as jest.Mock).mockImplementation(() => ({
         getLiveLocalDashboardProcess: jest.fn(() => null),
@@ -719,9 +928,9 @@ describe('runDiagnostics', () => {
         throw new Error('registry file is corrupt');
       });
       const checks = await runDiagnostics({ configPath: '/tmp/does-not-exist.json' });
-      // All 7 checks must still be present — one throwing dependency must not
+      // Every check must still be present — one throwing dependency must not
       // take down the rest of the diagnostic run.
-      expect(checks).toHaveLength(7);
+      expect(checks).toHaveLength(13);
       const check = checks.find((c) => c.check === 'Local instances');
       expect(check?.status).toBe('warn');
       expect(check?.detail).toContain('registry file is corrupt');
@@ -729,8 +938,49 @@ describe('runDiagnostics', () => {
     });
   });
 
-  it('returns exactly 7 checks on macOS', async () => {
+  describe('Check 9: Preflight version', () => {
+    it('returns ok when the installed version is the latest', async () => {
+      const mod = await import('../version.js');
+      mockFetch.mockImplementation(async (url: string | URL | Request) => {
+        if (new URL(String(url)).hostname === 'registry.npmjs.org') {
+          return { ok: true, json: async () => ({ version: mod.VERSION }) } as unknown as Response;
+        }
+        return { ok: true, json: async () => ({}) } as unknown as Response;
+      });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Preflight version')!;
+      expect(c.status).toBe('ok');
+    });
+
+    it('returns warn with an upgrade fix command when a newer version is on npm', async () => {
+      mockFetch.mockImplementation(async (url: string | URL | Request) => {
+        if (new URL(String(url)).hostname === 'registry.npmjs.org') {
+          return { ok: true, json: async () => ({ version: '99.0.0' }) } as unknown as Response;
+        }
+        return { ok: true, json: async () => ({}) } as unknown as Response;
+      });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Preflight version')!;
+      expect(c.status).toBe('warn');
+      expect(c.detail).toContain('99.0.0');
+      expect(c.fix).toBe('npm install -g @newrelic/preflight@latest');
+    });
+
+    it('returns skip when the npm registry is unreachable', async () => {
+      mockFetch.mockImplementation(async (url: string | URL | Request) => {
+        if (new URL(String(url)).hostname === 'registry.npmjs.org') {
+          return { ok: false } as unknown as Response;
+        }
+        return { ok: true, json: async () => ({}) } as unknown as Response;
+      });
+      const checks = await runDiagnostics(makeOpts());
+      const c = checks.find((x) => x.check === 'Preflight version')!;
+      expect(c.status).toBe('skip');
+    });
+  });
+
+  it('returns every check on macOS', async () => {
     const checks = await runDiagnostics(makeOpts());
-    expect(checks).toHaveLength(7);
+    expect(checks).toHaveLength(13);
   });
 });

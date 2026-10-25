@@ -104,6 +104,24 @@ export class InstructionDriftTracker {
     if (!filePath) return;
 
     // Only track reads of instruction files
+    this.hashAndSetPromptHash(filePath);
+  }
+
+  /**
+   * Authoritative counterpart to the `Read`-tool-call heuristic in
+   * `recordToolCall()`: Claude Code's `InstructionsLoaded` hook fires at the
+   * actual moment a file is loaded into context, including at session start
+   * (`loadReason === 'session_start'`) — a moment `recordToolCall()` can
+   * never observe, since eager loads happen with no visible `Read` call at
+   * all. `loadReason` is accepted but not yet used for anything beyond this
+   * doc comment's context; the file-hash-based correlation below is
+   * identical regardless of why the load happened.
+   */
+  recordInstructionsLoaded(filePath: string, _loadReason?: string): void {
+    this.hashAndSetPromptHash(filePath);
+  }
+
+  private hashAndSetPromptHash(filePath: string): void {
     if (!matchesInstructionFile(filePath, this.instructionFilePaths)) return;
 
     let hash: string;
@@ -112,8 +130,7 @@ export class InstructionDriftTracker {
     } catch (err) {
       // File gone/unreadable by the time we process this event — no signal,
       // but log at debug level since this can also mean permission-denied
-      // or an EISDIR (unlike the pre-fix code, which never touched the
-      // filesystem here at all).
+      // or an EISDIR, not just a missing file.
       logger.debug('Could not hash instruction file', { filePath, error: String(err) });
       return;
     }

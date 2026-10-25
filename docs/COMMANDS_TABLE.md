@@ -1,3 +1,8 @@
+---
+title: MCP Commands Reference
+description: Every MCP tool Preflight exposes, what it returns, and which trackers it queries.
+---
+
 # NR AI Coding Observability: Preflight — MCP Commands Reference
 
 Every MCP tool exposed by the `preflight`, what it returns, how it computes each finding, and which trackers it queries.
@@ -25,13 +30,15 @@ Check server health and connection status.
   "connected_at": "2026-06-03T10:00:00.000Z",
   "uptime_seconds": 3600,
   "hooks_installed": true,
-  "setup_required": false
+  "setup_required": false,
+  "event_send_status": "ok",
+  "consecutive_event_send_failures": 0
 }
 ```
 
 **Data source:** Server startup metadata
 
-**How it works:** Returns the current server version, the resolved developer name, how long the server has been running (`uptime_seconds`), the current session ID, and the ISO timestamp of when the MCP connection was established. Use this to confirm the MCP server is responsive and to verify the expected developer identity is being used. When a hook-detection function is available (e.g. in a Claude Code environment), also reports `hooks_installed` and `setup_required` so the caller can detect an incomplete setup — for example, right after a Smithery-driven install that only wired up the MCP server — and prompt to call `nr_observe_install_hooks`. Both fields are omitted when hook detection isn't wired up for the current server mode.
+**How it works:** Returns the current server version, the resolved developer name, how long the server has been running (`uptime_seconds`), the current session ID, and the ISO timestamp of when the MCP connection was established. Use this to confirm the MCP server is responsive and to verify the expected developer identity is being used. When a hook-detection function is available (e.g. in a Claude Code environment), also reports `hooks_installed` and `setup_required` so the caller can detect an incomplete setup — for example, right after a Smithery-driven install that only wired up the MCP server — and prompt to call `nr_observe_install_hooks`. Both fields are omitted when hook detection isn't wired up for the current server mode. When event-send health tracking is available, also reports `event_send_status` (`'ok'` or `'failing'`) and `consecutive_event_send_failures` — the number of consecutive failed attempts to send telemetry events to New Relic — so the caller can detect a broken ingest path. Both fields are omitted when event-send health tracking isn't wired up for the current server mode.
 
 **Requires:** Always available
 
@@ -242,7 +249,8 @@ Session cost breakdown by task, model, and efficiency.
   "cost_per_line_of_code": 0.003,
   "cost_per_file_modified": 0.065,
   "cost_per_million_tokens": 7.43,
-  "tokens": { "input": 50000, "output": 20000, "thinking": 10000 }
+  "tokens": { "input": 50000, "output": 20000, "thinking": 10000 },
+  "rate_multiplier_applied": 1
 }
 ```
 
@@ -257,6 +265,7 @@ Session cost breakdown by task, model, and efficiency.
 - `cost_per_file_modified` — `totalCost / uniqueFilesWritten` (null if no files modified)
 - `cost_per_million_tokens` — blended session rate: `(totalCost / totalTokens) * 1_000_000`, summed across input, output, thinking, cache-read, and cache-creation tokens (null if no tokens reported). Not shipped as its own NR metric — it's a pure ratio of `ai.cost.session_total_usd` and the `ai.cost.tokens_*` counts already emitted, so it's more flexibly computed in NRQL at query time (`sum(cost)/sum(tokens)*1e6`, facetable by any dimension) than as a pre-baked gauge.
 - `tokens` — running totals by token type from all reports
+- `rate_multiplier_applied` — `1` unless `costRateMultiplier`/`dataResidencyPremium` are configured (see [ADVANCED.md](./ADVANCED.md#cost--pricing-corrections)), in which case every dollar figure above already reflects that correction. Preflight's cost figures are always its own estimate from token counts × a pricing table, never a real invoice — this field only tells you whether that estimate has been adjusted toward an org's actual contracted rate.
 
 **Requires:** `CostTracker`; `TaskDetector` for per-task breakdown
 
@@ -502,7 +511,8 @@ Paginated list of past sessions with summary metrics.
       "estimated_cost_usd": 0.35,
       "task_count": 3,
       "outcome": "completed",
-      "model": "claude-sonnet-4-20250514"
+      "model": "claude-sonnet-4-20250514",
+      "skills": ["simplify", "pstack:how"]
     }
   ],
   "count": 1
@@ -992,7 +1002,7 @@ Source: `src/tools/cost-tools.ts`
 
 ### `nr_observe_get_cost_forecast`
 
-Projects future spend based on current session burn rate.
+Projects future spend based on current session burn rate. When this session was resumed after being stale, the response also includes a `resumeContext` field (`resumeCount`, `totalEstimatedCacheWriteUsd`, `lastResume`) — Claude Code's own SessionStart report of how long it had been and its estimated cost to re-warm the prompt cache, sourced from `SessionResumeTracker`. Riding alongside the forecast as extra JSON; it never changes the forecast fields themselves.
 
 **Parameters:** None
 
@@ -1153,7 +1163,7 @@ Source: `src/tools/analytics-tools.ts`, `src/metrics/task-completion-tracker.ts`
 
 ### `nr_observe_get_model_usage`
 
-Which AI model was used per request and cost-efficiency per model.
+Which AI model was used per request, cost-efficiency per model, and any model switches during the session.
 
 **Parameters:** None
 
@@ -1166,45 +1176,142 @@ Which AI model was used per request and cost-efficiency per model.
       "requestCount": 25,
       "totalInputTokens": 120000,
       "totalOutputTokens": 45000,
+      "totalCacheReadTokens": 15000,
+      "totalCacheCreationTokens": 5000,
+      "totalThinkingTokens": 0,
       "totalCostUsd": 0.42,
-      "costPerOutputToken": 0.0000093,
-      "costPerMillionTokens": 2.55,
+      "costPerMillionTokens": 2.27,
       "avgOutputTokensPerRequest": 1800
     },
     "claude-opus-4-7": {
       "requestCount": 3,
       "totalInputTokens": 20000,
       "totalOutputTokens": 8000,
+      "totalCacheReadTokens": 2000,
+      "totalCacheCreationTokens": 1000,
+      "totalThinkingTokens": 0,
       "totalCostUsd": 0.18,
-      "costPerOutputToken": 0.0000225,
-      "costPerMillionTokens": 6.43,
+      "costPerMillionTokens": 5.81,
       "avgOutputTokensPerRequest": 2666.67
     }
   },
   "mostUsedModel": "claude-sonnet-4-6",
-  "mostEfficientModel": "claude-sonnet-4-6",
-  "totalModelsUsed": 2
+  "totalModelsUsed": 2,
+  "switchCount": 2,
+  "automaticSwitchCount": 1,
+  "recentSwitches": [
+    {
+      "timestamp": 1767225600000,
+      "fromModel": "claude-sonnet-4-6",
+      "toModel": "claude-opus-4-7",
+      "source": "command",
+      "requestedModel": "opus"
+    },
+    {
+      "timestamp": 1767225660000,
+      "fromModel": "claude-opus-4-7",
+      "toModel": "claude-sonnet-4-6",
+      "source": "auto",
+      "requestedModel": null
+    }
+  ]
 }
 ```
 
 **Field notes:**
 
-- `costPerOutputToken` — `totalCostUsd / totalOutputTokens` (null if no output tokens)
-- `costPerMillionTokens` — per-model rate: `(totalCostUsd / (totalInputTokens + totalOutputTokens)) * 1_000_000` (null if no tokens). Only counts input+output tokens — narrower than `nr_observe_get_cost_breakdown`'s session-blended `cost_per_million_tokens`, which also folds in thinking/cache-read/cache-creation tokens. The two figures are not directly comparable.
+- `costPerMillionTokens` — per-model rate: `(totalCostUsd / (totalInputTokens + totalOutputTokens + totalThinkingTokens + totalCacheReadTokens + totalCacheCreationTokens)) * 1_000_000` (null if no tokens). Counts every billed token, so it is comparable with list prices and with `nr_observe_get_cost_breakdown`'s session-blended `cost_per_million_tokens`.
 - `mostUsedModel` — the model with the highest `requestCount`
-- `mostEfficientModel` — the model with the lowest `costPerOutputToken`
+- `switchCount` / `automaticSwitchCount` — total `PostModelSwitch` events seen this session, and the subset where `source === 'auto'` (a persistent automatic change, e.g. a sustained fallback — not a one-turn fallback-chain substitution, which Claude Code doesn't fire this hook for)
+- `recentSwitches` — the most recent switches (newest last, bounded to 100); `requestedModel` is `null` for an automatic switch or session-resume restore
 
 **Data source:** `ModelUsageTracker`
 
 **How it works:**
 
 - Tracks `model` field from each request (e.g., "claude-sonnet-4-6")
-- Aggregates request count, input/output tokens, and cost per model
-- Picks `mostUsedModel` (highest request count) and `mostEfficientModel` (lowest `costPerOutputToken`)
+- Aggregates request count, input/output/thinking/cache tokens, and cost per model
+- Picks `mostUsedModel` (highest request count)
+- Records each Claude Code `PostModelSwitch` hook event as a discrete switch (deliberate `/model` change, persistent automatic fallback, or resume) via `recordModelSwitch()`
 
 **Requires:** `ModelUsageTracker`
 
 Source: `src/tools/analytics-tools.ts`, `src/metrics/model-usage-tracker.ts`
+
+---
+
+### `nr_observe_get_model_recommendation`
+
+Data-driven model recommendation ranked by historical efficiency score, cost, and task success rate across past sessions, both overall and broken down by task outcome type.
+
+**Parameters:**
+
+- `developer` (optional) — Developer name to scope the ranking to; aggregate across all developers if omitted.
+- `since` (optional) — ISO date string; only consider sessions on or after this date.
+
+**Returns:**
+
+```json
+{
+  "ranked": [
+    {
+      "model": "claude-sonnet-4-20250514",
+      "sessionCount": 25,
+      "avgCostUsd": 0.04,
+      "avgEfficiencyScore": 0.82,
+      "avgTaskSuccessRate": 0.95
+    },
+    {
+      "model": "claude-opus-4-20250805",
+      "sessionCount": 12,
+      "avgCostUsd": 0.08,
+      "avgEfficiencyScore": 0.78,
+      "avgTaskSuccessRate": 0.92
+    }
+  ],
+  "recommendedModel": "claude-sonnet-4-20250514",
+  "confidence": "high",
+  "byOutcome": [
+    {
+      "outcome": "bug_fix",
+      "ranked": [
+        {
+          "model": "claude-sonnet-4-20250514",
+          "sessionCount": 15,
+          "avgCostUsd": 0.03,
+          "avgEfficiencyScore": 0.85,
+          "avgTaskSuccessRate": 0.97
+        }
+      ],
+      "recommendedModel": "claude-sonnet-4-20250514",
+      "confidence": "high"
+    }
+  ],
+  "generatedAt": 1746345600000
+}
+```
+
+**Field notes:**
+
+- `ranked` — All models ranked by efficiency score (descending), with ties broken by lower cost. Models with no scored sessions (`avgEfficiencyScore: null`) sort last.
+- `recommendedModel` — Top-ranked model, or `null` if insufficient data.
+- `confidence` — `insufficient_data` unless there's a runner-up model with at least 3 sessions of its own AND the gap between the top and runner-up average efficiency scores is at least 0.05; otherwise gated by the top model's own session count: `high` (≥20 sessions), `medium` (≥8), `low` (≥3).
+- `byOutcome` — Rankings broken down by task outcome type (bug_fix, feature, refactor, investigation, configuration, documentation, failed_attempt).
+- `avgTaskSuccessRate` — `testPassCount / testRunCount` for sessions of that outcome, 0 if no tests run.
+
+**Data source:** `TrendAnalyzer.rankModelsByOutcome()`
+
+**How it works:**
+
+- Loads all sessions (optionally filtered by `developer` and/or `since`).
+- Groups by model and outcome type (using `classifySessionOutcome`).
+- Computes per-model averages (cost, efficiency, task success).
+- Ranks by efficiency descending, cost ascending on ties, null-efficiency last.
+- Assigns confidence tier based on the top-ranked model's session count.
+
+**Requires:** `TrendAnalyzer`
+
+Source: `src/metrics/trend-analyzer.ts`, `src/tools/cross-session-tools.ts`
 
 ---
 
@@ -1279,7 +1386,30 @@ Cost attribution per tool type — approximate, based on turn-level token correl
   ],
   "costByToolType": {
     "Read": { "totalCost": 0.012, "callCount": 15, "avgCost": 0.0008 },
-    "Edit": { "totalCost": 0.025, "callCount": 8, "avgCost": 0.003 }
+    "Edit": { "totalCost": 0.025, "callCount": 8, "avgCost": 0.003 },
+    "Skill": { "totalCost": 0.042, "callCount": 4, "avgCost": 0.0105 }
+  },
+  "costBySkill": {
+    "code-review": {
+      "callCount": 2,
+      "attributedCallCount": 2,
+      "totalCost": 0.025,
+      "avgCost": 0.0125,
+      "inputTokens": 3500,
+      "outputTokens": 280,
+      "cacheReadTokens": 15000,
+      "totalDurationMs": 4200
+    },
+    "pstack:how": {
+      "callCount": 2,
+      "attributedCallCount": 2,
+      "totalCost": 0.017,
+      "avgCost": 0.0085,
+      "inputTokens": 2100,
+      "outputTokens": 120,
+      "cacheReadTokens": 8000,
+      "totalDurationMs": 2800
+    }
   },
   "totalAttributedCost": 0.042,
   "attributionRate": 0.85
@@ -1289,6 +1419,18 @@ Cost attribution per tool type — approximate, based on turn-level token correl
 **Data source:** `TurnCostAttributor`
 
 **How it works:** Attributes token costs reported via `nr_observe_report_tokens` to the tool calls that occurred within the same conversation turn. Each turn's cost is split evenly across its tool calls, then aggregated by tool type. `attributionRate` is the fraction of total session cost that could be attributed (turns with no token report are excluded). Results are approximate — cost is correlated at the turn level, not the individual call level.
+
+`costBySkill` has one row per invoked skill name (`code-review`, `pstack:how`). `callCount` and `totalDurationMs` are measured on every call. `totalCost`, `inputTokens`, `outputTokens`, and `cacheReadTokens` are the same even split across the turn's tool calls that `costByToolType` uses, and they cover only the `attributedCallCount` calls whose turn received a token report. `costByToolType.Skill` equals the sum of the skill rows. Skill calls that arrive without a skill name (some non-Claude-Code adapters) count under `costByToolType.Skill` and get no row here. Calls and duration per skill over any window are also available in New Relic, since `skillName` rides on every `AiToolCall`:
+
+```sql
+FROM AiToolCall SELECT count(*), sum(duration_ms)/3.6e6 AS hours WHERE tool = 'Skill' FACET skillName SINCE 1 week ago
+```
+
+Cost and tokens per skill over any window come from `AiTurnCost`:
+
+```sql
+FROM AiTurnCost SELECT sum(cost_usd) WHERE tool = 'Skill' FACET skillName SINCE 1 week ago
+```
 
 **Requires:** `TurnCostAttributor`
 
@@ -1416,7 +1558,7 @@ Thrashing and retry detection alerts within a sliding window.
 
 **Data source:** `RetryDetector`
 
-**How it works:** Tracks repeated tool calls with identical or highly similar inputs (Levenshtein similarity ≥ 0.8) within a rolling window (default: 5 calls). Fires an alert when the same input appears 3+ times consecutively. `totalTokensWasted` estimates tokens consumed on redundant calls (`inputSize / 4`).
+**How it works:** Tracks repeated tool calls with identical or highly similar inputs (similarity ≥ 0.8, via Levenshtein distance or exact input-hash match) within a rolling window (default: 5 calls). Fires an alert when the same input appears 3+ times consecutively. `totalTokensWasted` estimates tokens consumed on redundant calls (`inputSize / 4`).
 
 **Requires:** `RetryDetector`
 

@@ -459,36 +459,275 @@ describe('Blind editing detection', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Cross-agent false positives (agent partitioning)
+// ---------------------------------------------------------------------------
+
+describe('Agent partitioning', () => {
+  it('does not flag re-reading when 3 different agents each read the same file once', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', agentId: 'agent-2' }),
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', agentId: 'agent-3' }),
+    ];
+
+    const result = detector.analyze(calls);
+    const reReading = result.patterns.filter((p) => p.type === 're_reading');
+    expect(reReading).toHaveLength(0);
+  });
+
+  it('still flags re-reading when the same agent reads the file 3 times', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', agentId: 'agent-2' }),
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', agentId: 'agent-1' }),
+    ];
+
+    const result = detector.analyze(calls);
+    const reReading = result.patterns.filter((p) => p.type === 're_reading');
+    expect(reReading).toHaveLength(1);
+    expect(reReading[0].readCount).toBe(3);
+  });
+
+  it('does not flag a stuck loop when 3 different agents each run the same Bash command once', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-2' }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-3' }),
+    ];
+
+    const result = detector.analyze(calls);
+    const stuck = result.patterns.filter((p) => p.type === 'stuck_loop');
+    expect(stuck).toHaveLength(0);
+  });
+
+  it('still flags a stuck loop when one agent runs the same command 4 times consecutively', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-2' }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', agentId: 'agent-1' }),
+    ];
+
+    const result = detector.analyze(calls);
+    const stuck = result.patterns.filter((p) => p.type === 'stuck_loop');
+    expect(stuck).toHaveLength(1);
+    expect(stuck[0].repeatCount).toBe(4);
+  });
+
+  it('does not flag blind editing when 2 agents interleave 2 unverified edits each on the same file', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts', agentId: 'agent-2' }),
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts', agentId: 'agent-2' }),
+    ];
+
+    const result = detector.analyze(calls);
+    const blind = result.patterns.filter((p) => p.type === 'blind_editing');
+    expect(blind).toHaveLength(0);
+  });
+
+  it('still flags blind editing for a single agent editing without verification, even amid other agents', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Read', filePath: '/b.ts', agentId: 'agent-2' }),
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts', agentId: 'agent-1' }),
+      makeRecord({ toolName: 'Edit', filePath: '/b.ts', agentId: 'agent-2' }),
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts', agentId: 'agent-1' }),
+    ];
+
+    const result = detector.analyze(calls);
+    const blind = result.patterns.filter((p) => p.type === 'blind_editing');
+    expect(blind).toHaveLength(1);
+    expect(blind[0].file).toBe('/a.ts');
+    expect(blind[0].editCount).toBe(3);
+  });
+
+  it("computes tokensWasted for a per-agent pattern from that agent's calls only", () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      // agent-1 reads /a.ts 4 times — flagged, wasted tokens from its own reads only
+      makeRecord({
+        toolName: 'Read',
+        filePath: '/a.ts',
+        agentId: 'agent-1',
+        inputTokens: 10,
+        outputTokens: 100,
+      }),
+      // agent-2 reads /a.ts once, interleaved — must not contribute to agent-1's waste
+      makeRecord({
+        toolName: 'Read',
+        filePath: '/a.ts',
+        agentId: 'agent-2',
+        inputTokens: 10,
+        outputTokens: 9999,
+      }),
+      makeRecord({
+        toolName: 'Read',
+        filePath: '/a.ts',
+        agentId: 'agent-1',
+        inputTokens: 10,
+        outputTokens: 100,
+      }),
+      makeRecord({
+        toolName: 'Read',
+        filePath: '/a.ts',
+        agentId: 'agent-1',
+        inputTokens: 10,
+        outputTokens: 100,
+      }),
+      makeRecord({
+        toolName: 'Read',
+        filePath: '/a.ts',
+        agentId: 'agent-1',
+        inputTokens: 10,
+        outputTokens: 100,
+      }),
+    ];
+
+    const result = detector.analyze(calls);
+    const reReading = result.patterns.filter((p) => p.type === 're_reading');
+    expect(reReading).toHaveLength(1);
+    // 4 reads by agent-1 at 110 tokens each; annotateTokenWaste treats only the
+    // first read as "free", so reads #2-4 (330 tokens) are wasted. agent-2's
+    // 9999-token read must not leak into this total.
+    expect(reReading[0].tokensWasted).toBe(330);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Over-delegation detection
 // ---------------------------------------------------------------------------
 
 describe('Over-delegation detection', () => {
-  it('detects 5 Agent calls', () => {
+  it('does NOT fire when 5 Agent calls all succeed', () => {
     const detector = new AntiPatternDetector();
 
     const calls: ToolCallRecord[] = [];
     for (let i = 0; i < 5; i++) {
-      calls.push(makeRecord({ toolName: 'Agent', agentDescription: `task-${i}` }));
+      calls.push(makeRecord({ toolName: 'Agent', agentDescription: `task-${i}`, success: true }));
     }
 
     const result = detector.analyze(calls);
     const overDelegation = result.patterns.filter((p) => p.type === 'over_delegation');
 
-    expect(overDelegation).toHaveLength(1);
-    expect(overDelegation[0].agentCount).toBe(5);
+    expect(overDelegation).toHaveLength(0);
   });
 
-  it('detects exactly 3 Agent calls (at threshold, >= comparison)', () => {
+  it('fires when exactly 3 Agent calls fail (at threshold, >= comparison)', () => {
     const detector = new AntiPatternDetector();
 
     const calls: ToolCallRecord[] = [];
     for (let i = 0; i < 3; i++) {
-      calls.push(makeRecord({ toolName: 'Agent' }));
+      calls.push(makeRecord({ toolName: 'Agent', success: false }));
     }
 
     const result = detector.analyze(calls);
     const overDelegation = result.patterns.filter((p) => p.type === 'over_delegation');
     expect(overDelegation).toHaveLength(1);
+    expect(overDelegation[0].agentCount).toBe(3);
+  });
+
+  it('fires when Agent calls are interrupted, even if success is true', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [];
+    for (let i = 0; i < 3; i++) {
+      calls.push(makeRecord({ toolName: 'Agent', success: true, agentInterrupted: true }));
+    }
+
+    const result = detector.analyze(calls);
+    const overDelegation = result.patterns.filter((p) => p.type === 'over_delegation');
+    expect(overDelegation).toHaveLength(1);
+    expect(overDelegation[0].agentCount).toBe(3);
+  });
+
+  it('does NOT fire with only 2 failed spawns (threshold-1)', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Agent', success: false }),
+      makeRecord({ toolName: 'Agent', success: false }),
+    ];
+
+    const result = detector.analyze(calls);
+    expect(result.patterns.filter((p) => p.type === 'over_delegation')).toHaveLength(0);
+  });
+
+  it('only counts failed/interrupted spawns toward the threshold, ignoring successful ones', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Agent', success: true }),
+      makeRecord({ toolName: 'Agent', success: true }),
+      makeRecord({ toolName: 'Agent', success: false }),
+      makeRecord({ toolName: 'Agent', success: false }),
+      makeRecord({ toolName: 'Agent', success: false }),
+    ];
+
+    const result = detector.analyze(calls);
+    const overDelegation = result.patterns.filter((p) => p.type === 'over_delegation');
+    expect(overDelegation).toHaveLength(1);
+    expect(overDelegation[0].agentCount).toBe(3);
+  });
+
+  it('does NOT fire when agentInterrupted is explicitly false or a non-boolean value', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      makeRecord({ toolName: 'Agent', success: true, agentInterrupted: false }),
+      makeRecord({ toolName: 'Agent', success: true, agentInterrupted: false }),
+      // A truthy-but-non-boolean value must not satisfy the strict `=== true` check.
+      makeRecord({
+        toolName: 'Agent',
+        success: true,
+        agentInterrupted: 'true' as unknown as boolean,
+      }),
+    ];
+
+    const result = detector.analyze(calls);
+    expect(result.patterns.filter((p) => p.type === 'over_delegation')).toHaveLength(0);
+  });
+
+  it('does not interfere with an unrelated pattern (thrashing) detected in the same call sequence', () => {
+    const detector = new AntiPatternDetector();
+
+    const calls: ToolCallRecord[] = [
+      // 3 thrash cycles on /a.ts
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts' }),
+      makeRecord({ toolName: 'Bash', isTestCommand: true, success: false }),
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts' }),
+      makeRecord({ toolName: 'Bash', isTestCommand: true, success: false }),
+      makeRecord({ toolName: 'Edit', filePath: '/a.ts' }),
+      makeRecord({ toolName: 'Bash', isTestCommand: true, success: false }),
+      // 3 interrupted (but "successful") agent spawns
+      makeRecord({ toolName: 'Agent', success: true, agentInterrupted: true }),
+      makeRecord({ toolName: 'Agent', success: true, agentInterrupted: true }),
+      makeRecord({ toolName: 'Agent', success: true, agentInterrupted: true }),
+    ];
+
+    const result = detector.analyze(calls);
+    const types = result.patterns.map((p) => p.type);
+    expect(types).toContain('thrashing');
+    expect(types).toContain('over_delegation');
+
+    const overDelegation = result.patterns.filter((p) => p.type === 'over_delegation');
+    expect(overDelegation[0].agentCount).toBe(3);
   });
 });
 
@@ -585,11 +824,11 @@ describe('threshold boundary tests', () => {
 
   // ---- Over-delegation ----
 
-  it('over_delegation: 4 agents (first count that fires, since threshold is >3) fires with agentCount=4', () => {
+  it('over_delegation: 4 failed agents (first count that fires, since threshold is >3) fires with agentCount=4', () => {
     const detector = new AntiPatternDetector();
     const calls: ToolCallRecord[] = [];
     for (let i = 0; i < 4; i++) {
-      calls.push(makeRecord({ toolName: 'Agent', agentDescription: `task-${i}` }));
+      calls.push(makeRecord({ toolName: 'Agent', agentDescription: `task-${i}`, success: false }));
     }
     const result = detector.analyze(calls);
     const over = result.patterns.filter((p) => p.type === 'over_delegation');
@@ -695,9 +934,9 @@ describe('emitMetrics()', () => {
     const detector = new AntiPatternDetector();
 
     const calls: ToolCallRecord[] = [];
-    // Trigger over-delegation (5 agents)
+    // Trigger over-delegation (5 failed agent spawns)
     for (let i = 0; i < 5; i++) {
-      calls.push(makeRecord({ toolName: 'Agent' }));
+      calls.push(makeRecord({ toolName: 'Agent', success: false }));
     }
 
     const result = detector.analyze(calls);
@@ -777,11 +1016,11 @@ describe('Edge cases', () => {
       makeRecord({ toolName: 'Edit', filePath: '/b.ts' }),
       makeRecord({ toolName: 'Edit', filePath: '/b.ts' }),
       makeRecord({ toolName: 'Edit', filePath: '/b.ts' }),
-      // Over-delegation (4 agents)
-      makeRecord({ toolName: 'Agent' }),
-      makeRecord({ toolName: 'Agent' }),
-      makeRecord({ toolName: 'Agent' }),
-      makeRecord({ toolName: 'Agent' }),
+      // Over-delegation (4 failed agent spawns)
+      makeRecord({ toolName: 'Agent', success: false }),
+      makeRecord({ toolName: 'Agent', success: false }),
+      makeRecord({ toolName: 'Agent', success: false }),
+      makeRecord({ toolName: 'Agent', success: false }),
     ];
 
     const result = detector.analyze(calls);
@@ -837,5 +1076,70 @@ describe('Edge cases', () => {
     detector.reset('sess-001');
 
     expect(detector.getCurrentPatterns()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token waste annotation
+// ---------------------------------------------------------------------------
+
+describe('Token waste annotation', () => {
+  it('estimates tokensWasted for stuck_loop (skips first occurrence)', () => {
+    const detector = new AntiPatternDetector({ stuckLoopThreshold: 3 });
+    const calls = [
+      makeRecord({ toolName: 'Bash', command: 'npm test', inputTokens: 100, outputTokens: 50 }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', inputTokens: 110, outputTokens: 60 }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', inputTokens: 120, outputTokens: 70 }),
+    ];
+    const { patterns } = detector.analyze(calls);
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].type).toBe('stuck_loop');
+    // calls[0] is the first occurrence (not waste); calls[1] + calls[2] are waste
+    expect(patterns[0].tokensWasted).toBe(110 + 60 + (120 + 70)); // 360
+  });
+
+  it('estimates tokensWasted for re_reading (skips first read)', () => {
+    const detector = new AntiPatternDetector({ reReadThreshold: 3 });
+    const calls = [
+      makeRecord({ toolName: 'Read', filePath: '/src/foo.ts', inputTokens: 200, outputTokens: 0 }),
+      makeRecord({ toolName: 'Read', filePath: '/src/foo.ts', inputTokens: 210, outputTokens: 0 }),
+      makeRecord({ toolName: 'Read', filePath: '/src/foo.ts', inputTokens: 220, outputTokens: 0 }),
+      makeRecord({ toolName: 'Read', filePath: '/src/foo.ts', inputTokens: 230, outputTokens: 0 }),
+    ];
+    const { patterns } = detector.analyze(calls);
+    expect(patterns).toHaveLength(1);
+    expect(patterns[0].type).toBe('re_reading');
+    // calls[0] is the first (necessary) read; calls[1-3] are waste
+    expect(patterns[0].tokensWasted).toBe(210 + 220 + 230); // 660
+  });
+
+  it('estimates tokensWasted for over_delegation (counts every failed spawn, not just overflow)', () => {
+    const detector = new AntiPatternDetector();
+    const calls = [
+      makeRecord({ toolName: 'Agent', success: true, inputTokens: 999, outputTokens: 999 }),
+      makeRecord({ toolName: 'Agent', success: false, inputTokens: 100, outputTokens: 50 }),
+      makeRecord({ toolName: 'Agent', success: false, inputTokens: 110, outputTokens: 60 }),
+      makeRecord({ toolName: 'Agent', success: false, inputTokens: 120, outputTokens: 70 }),
+    ];
+    const { patterns } = detector.analyze(calls);
+    const overDelegation = patterns.filter((p) => p.type === 'over_delegation');
+    expect(overDelegation).toHaveLength(1);
+    // All 3 failed spawns are wasted (unlike repeat-based patterns, there's no
+    // "first one is free" — the successful spawn's tokens must not be included.
+    expect(overDelegation[0].tokensWasted).toBe(100 + 50 + 110 + 60 + 120 + 70); // 510
+  });
+
+  it('getTotalAntiPatternWaste() sums tokensWasted across all patterns', () => {
+    const detector = new AntiPatternDetector({ stuckLoopThreshold: 2, reReadThreshold: 2 });
+    const calls = [
+      // stuck_loop on 'npm test' — calls[0] necessary, calls[1] waste (80 + 40 = 120)
+      makeRecord({ toolName: 'Bash', command: 'npm test', inputTokens: 50, outputTokens: 30 }),
+      makeRecord({ toolName: 'Bash', command: 'npm test', inputTokens: 80, outputTokens: 40 }),
+      // re_reading on '/a.ts' — calls[2] necessary, calls[3] waste (200 + 0 = 200)
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', inputTokens: 150, outputTokens: 0 }),
+      makeRecord({ toolName: 'Read', filePath: '/a.ts', inputTokens: 200, outputTokens: 0 }),
+    ];
+    detector.analyze(calls);
+    expect(detector.getTotalAntiPatternWaste()).toBe(120 + 200); // 320
   });
 });

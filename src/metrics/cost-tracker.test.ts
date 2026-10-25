@@ -1,10 +1,11 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 import { CostTracker } from './cost-tracker.js';
-import type { TokenRecordContext } from './cost-tracker.js';
+import { makeUsage } from '../__test-utils__/token-usage.js';
+import { estimatedFromOf } from '../__test-utils__/estimated-from.js';
+import type { TokenRecordContext, CostTrackerSeed } from './cost-tracker.js';
 import { localDateKey } from '../lib/date.js';
 import { SessionTracker } from './session-tracker.js';
 import { MetricAggregator } from '../shared/index.js';
-import type { TokenUsage } from '../shared/index.js';
 import type { ToolCallRecord } from '../storage/types.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
@@ -20,18 +21,6 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
-
-function makeUsage(overrides?: Partial<TokenUsage>): TokenUsage {
-  return {
-    inputTokens: 0,
-    outputTokens: 0,
-    thinkingTokens: 0,
-    cacheReadTokens: 0,
-    cacheCreationTokens: 0,
-    totalTokens: 0,
-    ...overrides,
-  };
-}
 
 function makeRecord(overrides?: Partial<ToolCallRecord>): ToolCallRecord {
   return {
@@ -290,6 +279,58 @@ describe('CostTracker', () => {
     });
   });
 
+  describe('getMetrics() per-day cost buckets', () => {
+    // These maps are persisted onto the session summary so the dashboard's
+    // "Spend Today" can sum a session's real today-bucket instead of pro-rating
+    // its lifetime total. They must reflect the same day-attribution the live
+    // getCostForDay()/getSubagentCostForDay() accessors use.
+    it('exposes costByDayUsd / subagentCostByDayUsd bucketed by transcript timestamp', () => {
+      const tracker = new CostTracker();
+      const now = Date.now();
+      const todayKey = localDateKey(now);
+      // A day well within the 48h late-arrival window so it is NOT dropped.
+      const earlierMs = now - 12 * 60 * 60 * 1000;
+      const earlierKey = localDateKey(earlierMs);
+
+      // Parent spend today.
+      tracker.recordTokenUsage(
+        makeUsage({ inputTokens: 100_000, totalTokens: 100_000 }),
+        'claude-sonnet-4',
+        { timestampMs: now } satisfies TokenRecordContext,
+      );
+      // Subagent spend today.
+      tracker.recordTokenUsage(
+        makeUsage({ inputTokens: 50_000, outputTokens: 50_000, totalTokens: 100_000 }),
+        'claude-sonnet-4',
+        { agentId: 'agent-1', timestampMs: now } satisfies TokenRecordContext,
+      );
+      // Parent spend earlier (distinct day when run near midnight; otherwise
+      // same key — either way the accessor and the map must agree).
+      tracker.recordTokenUsage(
+        makeUsage({ inputTokens: 30_000, totalTokens: 30_000 }),
+        'claude-sonnet-4',
+        { timestampMs: earlierMs } satisfies TokenRecordContext,
+      );
+
+      const m = tracker.getMetrics();
+      // The serialized map must agree with the live per-day accessors.
+      expect(m.costByDayUsd[todayKey]).toBeCloseTo(tracker.getCostForDay(todayKey), 6);
+      expect(m.costByDayUsd[earlierKey]).toBeCloseTo(tracker.getCostForDay(earlierKey), 6);
+      expect(m.subagentCostByDayUsd[todayKey]).toBeCloseTo(
+        tracker.getSubagentCostForDay(todayKey),
+        6,
+      );
+      // Subagent bucket is strictly less than the all-in bucket for the same day.
+      expect(m.subagentCostByDayUsd[todayKey]).toBeLessThan(m.costByDayUsd[todayKey]!);
+    });
+
+    it('returns empty day maps for a tracker with no activity', () => {
+      const m = new CostTracker().getMetrics();
+      expect(m.costByDayUsd).toEqual({});
+      expect(m.subagentCostByDayUsd).toEqual({});
+    });
+  });
+
   describe('costPerFileModified', () => {
     it('computes $0.50/file for $2.00 cost and 4 files', () => {
       const sessionTracker = new SessionTracker('test-session');
@@ -394,7 +435,6 @@ describe('CostTracker', () => {
       expect(metrics.costPerLineOfCode).toBeNull();
       expect(metrics.costPerFileModified).toBeNull();
       expect(metrics.costPerMillionTokens).toBeNull();
-      expect(metrics.costByTask).toBeNull();
       expect(metrics.model).toBeNull();
       expect(metrics.latestCostBreakdown).toBeNull();
       expect(metrics.reportCount).toBe(0);
@@ -521,6 +561,151 @@ describe('CostTracker', () => {
       // Estimation counts as hasData → sessionTotalCostUsd must be non-null
       expect(metrics.sessionTotalCostUsd).not.toBeNull();
       expect(metrics.sessionTotalCostUsd).toBeGreaterThan(0);
+    });
+  });
+
+  describe('unpricedByModel', () => {
+    it('counts calls and tokens for a model with no price, across repeated records', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(
+        makeUsage({ inputTokens: 100, outputTokens: 50, totalTokens: 150 }),
+        'claude-foo-9-9',
+      );
+      tracker.recordTokenUsage(
+        makeUsage({ inputTokens: 10, cacheReadTokens: 5, totalTokens: 15 }),
+        'claude-foo-9-9',
+      );
+      expect(tracker.getMetrics().unpricedByModel['claude-foo-9-9']).toEqual({
+        calls: 2,
+        tokens: 165,
+      });
+    });
+
+    it('also counts a late-arrival event for an unpriced model', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(
+        makeUsage({ inputTokens: 100, totalTokens: 100 }),
+        'claude-foo-9-9',
+        { timestampMs: Date.now() - 72 * 60 * 60 * 1000 },
+      );
+      expect(tracker.getMetrics().unpricedByModel['claude-foo-9-9']).toEqual({
+        calls: 1,
+        tokens: 100,
+      });
+    });
+
+    it('does not flag a Bedrock ARN or provider-prefixed id that resolves to a priced model', () => {
+      const tracker = new CostTracker();
+      for (const model of [
+        'arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-6',
+        'us.anthropic.claude-sonnet-4-6',
+      ]) {
+        tracker.recordTokenUsage(
+          makeUsage({ inputTokens: 100, outputTokens: 50, totalTokens: 150 }),
+          model,
+        );
+      }
+      expect(tracker.getMetrics().unpricedByModel).toEqual({});
+    });
+
+    it('is empty for a priced model', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(
+        makeUsage({ inputTokens: 100, outputTokens: 50, totalTokens: 150 }),
+        'claude-sonnet-5',
+      );
+      expect(tracker.getMetrics().unpricedByModel).toEqual({});
+    });
+
+    it('does not count an unpriced call that carries no tokens', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(makeUsage(), 'claude-foo-9-9');
+      expect(tracker.getMetrics().unpricedByModel).toEqual({});
+    });
+
+    it('returns a fresh record each call', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-foo-9-9');
+      const first = tracker.getMetrics().unpricedByModel;
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-foo-9-9');
+      expect(first['claude-foo-9-9']?.calls).toBe(1);
+    });
+
+    it('reset() clears it', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-foo-9-9');
+      tracker.reset('s');
+      expect(tracker.getMetrics().unpricedByModel).toEqual({});
+    });
+
+    it('emits ai.cost.unpriced_calls per model with a model attribute', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-foo-9-9');
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-foo-9-9');
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-sonnet-5');
+      const aggregator = new MetricAggregator();
+      tracker.emitMetrics(aggregator);
+      const unpriced = aggregator
+        .harvest(60_000)
+        .filter((m) => m.name === 'ai.cost.unpriced_calls');
+      expect(unpriced).toHaveLength(1);
+      expect(unpriced[0]?.attributes?.model).toBe('claude-foo-9-9');
+      expect(JSON.stringify(unpriced[0])).toContain('2');
+    });
+  });
+
+  describe('estimatedByModel', () => {
+    it('counts a family-priced model, still adds its cost, and keeps it out of unpriced', () => {
+      const tracker = new CostTracker();
+      const usage = makeUsage({ inputTokens: 100, outputTokens: 50, totalTokens: 150 });
+      tracker.recordTokenUsage(usage, 'claude-opus-5-9');
+      tracker.recordTokenUsage(usage, 'claude-opus-5-9');
+      const metrics = tracker.getMetrics();
+      expect(metrics.estimatedByModel['claude-opus-5-9']).toEqual({
+        calls: 2,
+        tokens: 300,
+        estimatedFrom: estimatedFromOf('claude-opus-5-9'),
+      });
+      expect(metrics.unpricedByModel).toEqual({});
+      expect(metrics.sessionTotalCostUsd).toBeGreaterThan(0);
+    });
+
+    it('is empty for a table-priced model', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-sonnet-5');
+      expect(tracker.getMetrics().estimatedByModel).toEqual({});
+    });
+
+    it('seeds additively and reset() clears it', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 10, totalTokens: 10 }), 'claude-opus-5-9');
+      tracker.seedFromPersisted(
+        makeSeed({
+          totalInputTokens: 500,
+          estimatedByModel: {
+            'claude-opus-5-9': { calls: 3, tokens: 400, estimatedFrom: 'claude-opus-5' },
+          },
+        }),
+      );
+      expect(tracker.getMetrics().estimatedByModel).toEqual({
+        'claude-opus-5-9': { calls: 4, tokens: 410, estimatedFrom: 'claude-opus-5' },
+      });
+      tracker.reset('s');
+      expect(tracker.getMetrics().estimatedByModel).toEqual({});
+    });
+
+    it('emits ai.cost.estimated_calls with model and estimatedFrom attributes', () => {
+      const tracker = new CostTracker();
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-opus-5-9');
+      tracker.recordTokenUsage(makeUsage({ inputTokens: 1, totalTokens: 1 }), 'claude-sonnet-5');
+      const aggregator = new MetricAggregator();
+      tracker.emitMetrics(aggregator);
+      const estimated = aggregator
+        .harvest(60_000)
+        .filter((m) => m.name === 'ai.cost.estimated_calls');
+      expect(estimated).toHaveLength(1);
+      expect(estimated[0]?.attributes?.model).toBe('claude-opus-5-9');
+      expect(estimated[0]?.attributes?.estimatedFrom).toBe(estimatedFromOf('claude-opus-5-9'));
     });
   });
 
@@ -916,6 +1101,70 @@ describe('CostTracker', () => {
   });
 });
 
+describe('rateMultiplier option', () => {
+  it('defaults to no correction — costRateMultiplierApplied is 1', () => {
+    const tracker = new CostTracker();
+    expect(tracker.getMetrics().costRateMultiplierApplied).toBe(1);
+  });
+
+  it('scales every dollar field of the breakdown by the configured multiplier', () => {
+    const tracker = new CostTracker(undefined, { rateMultiplier: 0.85 });
+
+    const usage = makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 });
+    const breakdown = tracker.recordTokenUsage(usage, 'claude-sonnet-4');
+
+    // Unscaled: input=0.03, output=0.03, total=0.06 (see the base test above)
+    expect(breakdown.inputUsd).toBeCloseTo(0.03 * 0.85, 6);
+    expect(breakdown.outputUsd).toBeCloseTo(0.03 * 0.85, 6);
+    expect(breakdown.totalUsd).toBeCloseTo(0.06 * 0.85, 6);
+  });
+
+  it('applies the same factor to accumulated session totals and costByModel', () => {
+    const tracker = new CostTracker(undefined, { rateMultiplier: 0.5 });
+
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 }),
+      'claude-sonnet-4',
+    );
+
+    const metrics = tracker.getMetrics();
+    expect(metrics.sessionTotalCostUsd).toBeCloseTo(0.03, 6); // 0.06 * 0.5
+    expect(metrics.costByModel['claude-sonnet-4']).toBeCloseTo(0.03, 6);
+    expect(metrics.costRateMultiplierApplied).toBe(0.5);
+  });
+
+  it('scales savingsFromCacheUsd by the same factor', () => {
+    const unscaled = new CostTracker();
+    const scaled = new CostTracker(undefined, { rateMultiplier: 0.4 });
+
+    const usage = makeUsage({
+      inputTokens: 1_000,
+      outputTokens: 500,
+      cacheReadTokens: 10_000,
+      totalTokens: 1_500,
+    });
+
+    const unscaledBreakdown = unscaled.recordTokenUsage(usage, 'claude-sonnet-4');
+    const scaledBreakdown = scaled.recordTokenUsage(usage, 'claude-sonnet-4');
+
+    expect(unscaledBreakdown.savingsFromCacheUsd).toBeGreaterThan(0);
+    expect(scaledBreakdown.savingsFromCacheUsd).toBeCloseTo(
+      unscaledBreakdown.savingsFromCacheUsd * 0.4,
+      6,
+    );
+  });
+
+  it('a multiplier of 1 behaves identically to the default (no scaling branch)', () => {
+    const tracker = new CostTracker(undefined, { rateMultiplier: 1 });
+    const usage = makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 });
+
+    const breakdown = tracker.recordTokenUsage(usage, 'claude-sonnet-4');
+
+    expect(breakdown.totalUsd).toBeCloseTo(0.06, 6);
+    expect(tracker.getMetrics().costRateMultiplierApplied).toBe(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Subagent token support
 // ---------------------------------------------------------------------------
@@ -1060,6 +1309,216 @@ describe('subagent token support', () => {
     expect(metrics.subagentCostUsd).toBe(0);
   });
 
+  it('ctx.agentId + ctx.agentType set → cost/tokens/count accumulate in subagentByAgentType[agentType]', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 }),
+      'claude-sonnet-4',
+      { agentId: 'agent-abc', agentType: 'general-purpose' },
+    );
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 5_000, outputTokens: 1_000, totalTokens: 6_000 }),
+      'claude-sonnet-4',
+      { agentId: 'agent-def', agentType: 'general-purpose' },
+    );
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 1_000, outputTokens: 500, totalTokens: 1_500 }),
+      'claude-sonnet-4',
+      { agentId: 'agent-ghi', agentType: 'Explore' },
+    );
+
+    const metrics = tracker.getMetrics();
+    expect(metrics.subagentByAgentType).toHaveProperty('general-purpose');
+    expect(metrics.subagentByAgentType).toHaveProperty('Explore');
+    expect(metrics.subagentByAgentType['general-purpose']!.count).toBe(2);
+    expect(metrics.subagentByAgentType['general-purpose']!.tokens).toBe(18_000);
+    expect(metrics.subagentByAgentType['general-purpose']!.durationMs).toBe(0);
+    expect(metrics.subagentByAgentType['general-purpose']!.costUsd).toBeGreaterThan(
+      metrics.subagentByAgentType['Explore']!.costUsd,
+    );
+  });
+
+  it('subagentByAgentType[agentType].breakdown accumulates per-category tokens across calls', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({
+        inputTokens: 10_000,
+        outputTokens: 2_000,
+        cacheReadTokens: 500,
+        cacheCreationTokens: 300,
+        totalTokens: 12_000,
+      }),
+      'claude-sonnet-4',
+      { agentId: 'agent-abc', agentType: 'general-purpose' },
+    );
+    tracker.recordTokenUsage(
+      makeUsage({
+        inputTokens: 5_000,
+        outputTokens: 1_000,
+        cacheReadTokens: 100,
+        cacheCreationTokens: 50,
+        totalTokens: 6_000,
+      }),
+      'claude-sonnet-4',
+      { agentId: 'agent-def', agentType: 'general-purpose' },
+    );
+
+    const entry = tracker.getMetrics().subagentByAgentType['general-purpose']!;
+    const breakdown = entry.breakdown;
+    expect(breakdown).toEqual({
+      inputTokens: 15_000,
+      outputTokens: 3_000,
+      cacheReadTokens: 600,
+      cacheCreationTokens: 350,
+    });
+    expect(
+      breakdown!.inputTokens +
+        breakdown!.outputTokens +
+        breakdown!.cacheReadTokens +
+        breakdown!.cacheCreationTokens,
+    ).toBe(entry.tokens);
+  });
+
+  it('ctx.agentId set but ctx.agentType absent → no entry added to subagentByAgentType', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 }),
+      'claude-sonnet-4',
+      { agentId: 'agent-abc' },
+    );
+
+    const metrics = tracker.getMetrics();
+    expect(metrics.subagentByAgentType).toEqual({});
+    expect(metrics.subagentCostUsd).toBeGreaterThan(0);
+  });
+
+  it('late arrival (>48h) with ctx.agentType: subagentByAgentType still accumulates', () => {
+    const tracker = new CostTracker();
+    const oldTs = Date.now() - 49 * 60 * 60 * 1000; // 49h ago
+
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 }),
+      'claude-sonnet-4',
+      { timestampMs: oldTs, agentId: 'agent-abc', agentType: 'general-purpose' },
+    );
+
+    const metrics = tracker.getMetrics();
+    expect(metrics.subagentByAgentType['general-purpose']!.costUsd).toBeGreaterThan(0);
+  });
+
+  it('reset() clears subagentByAgentType', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 }),
+      'claude-sonnet-4',
+      { agentId: 'agent-abc', agentType: 'general-purpose' },
+    );
+    expect(tracker.getMetrics().subagentByAgentType).toHaveProperty('general-purpose');
+
+    tracker.reset('session-1');
+
+    expect(tracker.getMetrics().subagentByAgentType).toEqual({});
+  });
+
+  it('prompt of exactly HIGH_CONTEXT_TOKENS is NOT high context', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 150_000, outputTokens: 100, totalTokens: 150_100 }),
+      'claude-sonnet-4',
+    );
+
+    expect(tracker.getMetrics().highContextCostUsd).toBe(0);
+  });
+
+  it('prompt of HIGH_CONTEXT_TOKENS + 1 IS high context', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 150_001, outputTokens: 100, totalTokens: 150_101 }),
+      'claude-sonnet-4',
+    );
+
+    const metrics = tracker.getMetrics();
+    expect(metrics.highContextCostUsd).toBeGreaterThan(0);
+    expect(metrics.highContextCostUsd).toBe(metrics.sessionTotalCostUsd);
+  });
+
+  it('high-context threshold sums cacheReadTokens and cacheCreationTokens with inputTokens', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({
+        inputTokens: 100_000,
+        cacheReadTokens: 30_000,
+        cacheCreationTokens: 20_001,
+        outputTokens: 100,
+        totalTokens: 150_101,
+      }),
+      'claude-sonnet-4',
+    );
+
+    expect(tracker.getMetrics().highContextCostUsd).toBeGreaterThan(0);
+  });
+
+  it('reset() clears highContextCostUsd', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 150_001, outputTokens: 100, totalTokens: 150_101 }),
+      'claude-sonnet-4',
+    );
+    expect(tracker.getMetrics().highContextCostUsd).toBeGreaterThan(0);
+
+    tracker.reset('session-1');
+
+    expect(tracker.getMetrics().highContextCostUsd).toBe(0);
+  });
+
+  it('apiDurationMs is null until the first ctx.responseMs observation, then sums', () => {
+    const tracker = new CostTracker();
+    expect(tracker.getMetrics().apiDurationMs).toBeNull();
+
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 100, outputTokens: 100, totalTokens: 200 }),
+      'claude-sonnet-4',
+      { responseMs: 4_000 },
+    );
+    expect(tracker.getMetrics().apiDurationMs).toBe(4_000);
+
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 100, outputTokens: 100, totalTokens: 200 }),
+      'claude-sonnet-4',
+      { responseMs: 2_500 },
+    );
+    expect(tracker.getMetrics().apiDurationMs).toBe(6_500);
+  });
+
+  it('apiDurationMs stays unchanged when a token event carries no responseMs', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 100, outputTokens: 100, totalTokens: 200 }),
+      'claude-sonnet-4',
+      { responseMs: 4_000 },
+    );
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 100, outputTokens: 100, totalTokens: 200 }),
+      'claude-sonnet-4',
+    );
+
+    expect(tracker.getMetrics().apiDurationMs).toBe(4_000);
+  });
+
+  it('reset() clears apiDurationMs back to null', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 100, outputTokens: 100, totalTokens: 200 }),
+      'claude-sonnet-4',
+      { responseMs: 4_000 },
+    );
+    expect(tracker.getMetrics().apiDurationMs).toBe(4_000);
+
+    tracker.reset('session-1');
+
+    expect(tracker.getMetrics().apiDurationMs).toBeNull();
+  });
+
   it('ctx.workflowRunId set → cost appears in costByWorkflowRunId[runId][dayKey]', () => {
     const tracker = new CostTracker();
     const ts = Date.now() - 30 * 60 * 1000; // 30 min ago
@@ -1099,5 +1558,340 @@ describe('subagent token support', () => {
     // 0.06 / (0.06 + 0.03) * 100 ≈ 66.7%
     expect(sub.subagentSharePct).toBeCloseTo(66.67, 1);
     expect(sub.reconciliationDeltaPct).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// seedFromPersisted() — restart data-loss fix
+// ---------------------------------------------------------------------------
+
+function makeSeed(overrides?: Partial<CostTrackerSeed>): CostTrackerSeed {
+  return {
+    totalCostUsd: 0,
+    subagentCostUsd: 0,
+    parentCostUsd: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalThinkingTokens: 0,
+    totalCacheReadTokens: 0,
+    totalCacheCreationTokens: 0,
+    totalCacheSavingsUsd: 0,
+    costByModel: {},
+    dayKey: localDateKey(),
+    dayCostUsd: 0,
+    daySubagentCostUsd: 0,
+    costByWorkflowRunId: {},
+    ...overrides,
+  };
+}
+
+describe('seedFromPersisted()', () => {
+  it('restores a fresh tracker from a persisted checkpoint at realistic multi-day scale', () => {
+    const tracker = new CostTracker();
+
+    tracker.seedFromPersisted(
+      makeSeed({
+        totalCostUsd: 56.02,
+        subagentCostUsd: 0,
+        parentCostUsd: 56.02,
+        totalInputTokens: 143_758,
+        totalOutputTokens: 383_743,
+        totalCacheReadTokens: 171_800_083,
+        totalCacheCreationTokens: 3_409_635,
+        totalThinkingTokens: 0,
+        costByModel: { 'claude-sonnet-5': 56.02 },
+        dayCostUsd: 56.02,
+      }),
+    );
+
+    const metrics = tracker.getMetrics();
+    expect(metrics.sessionTotalCostUsd).toBeCloseTo(56.02, 4);
+    expect(metrics.totalInputTokens).toBe(143_758);
+    expect(metrics.totalOutputTokens).toBe(383_743);
+    expect(metrics.totalCacheReadTokens).toBe(171_800_083);
+    expect(metrics.totalCacheCreationTokens).toBe(3_409_635);
+    expect(metrics.costByModel['claude-sonnet-5']).toBeCloseTo(56.02, 4);
+    expect(tracker.getCostForDay(localDateKey())).toBeCloseTo(56.02, 4);
+  });
+
+  it('seeds unpricedByModel additively on top of live counts', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(makeUsage({ inputTokens: 10, totalTokens: 10 }), 'claude-foo-9-9');
+    tracker.seedFromPersisted(
+      makeSeed({
+        totalInputTokens: 500,
+        unpricedByModel: {
+          'claude-foo-9-9': { calls: 3, tokens: 400 },
+          'claude-bar-1': { calls: 1, tokens: 100 },
+        },
+      }),
+    );
+    expect(tracker.getMetrics().unpricedByModel).toEqual({
+      'claude-foo-9-9': { calls: 4, tokens: 410 },
+      'claude-bar-1': { calls: 1, tokens: 100 },
+    });
+  });
+
+  it('adds on top of totals already recorded by this process, rather than overwriting', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 1_000, outputTokens: 500, totalTokens: 1_500 }),
+      'claude-sonnet-4',
+    );
+    const beforeSeed = tracker.getMetrics().sessionTotalCostUsd!;
+
+    tracker.seedFromPersisted(makeSeed({ totalCostUsd: 10, dayCostUsd: 10 }));
+
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeCloseTo(beforeSeed + 10, 4);
+  });
+
+  it('books dayCostUsd/daySubagentCostUsd separately from the session-cumulative totals', () => {
+    const tracker = new CostTracker();
+    const yesterday = localDateKey(Date.now() - 86_400_000);
+
+    // A persisted session whose $10 total is entirely from a prior day — the
+    // caller (buildCostTrackerSeed) is expected to compute dayCostUsd as the
+    // *today* portion only (0 here), even though the session-cumulative
+    // total must still reflect the full $10.
+    tracker.seedFromPersisted(
+      makeSeed({
+        totalCostUsd: 10,
+        subagentCostUsd: 4,
+        parentCostUsd: 6,
+        dayKey: yesterday,
+        dayCostUsd: 0,
+        daySubagentCostUsd: 0,
+      }),
+    );
+
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeCloseTo(10, 4);
+    expect(tracker.getSubagentMetrics().subagentUsd).toBeCloseTo(4, 4);
+    expect(tracker.getCostForDay(yesterday)).toBe(0);
+    expect(tracker.getCostForDay(localDateKey())).toBe(0);
+  });
+
+  it('is a no-op for an all-zero seed (no persisted session found)', () => {
+    const tracker = new CostTracker();
+    tracker.seedFromPersisted(makeSeed());
+
+    const metrics = tracker.getMetrics();
+    expect(metrics.sessionTotalCostUsd).toBeNull();
+    expect(metrics.reportCount).toBe(0);
+  });
+
+  it('makes sessionTotalCostUsd non-null even if no real activity has been recorded yet this process', () => {
+    const tracker = new CostTracker();
+    tracker.seedFromPersisted(makeSeed({ totalCostUsd: 3.1, dayCostUsd: 3.1 }));
+
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeCloseTo(3.1, 4);
+  });
+
+  it('additively seeds costByWorkflowRunId from a persisted checkpoint', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 1_000, outputTokens: 500, totalTokens: 1_500 }),
+      'claude-sonnet-4',
+      { workflowRunId: 'wf_live_run' },
+    );
+
+    tracker.seedFromPersisted(
+      makeSeed({
+        totalCostUsd: 10,
+        dayCostUsd: 10,
+        costByWorkflowRunId: {
+          wf_persisted_run: { '2026-08-13': 0.5, '2026-08-14': 1.25 },
+        },
+      }),
+    );
+
+    // The run this process already observed live is untouched...
+    expect(tracker.getCostForWorkflowRun('wf_live_run')).toBeGreaterThan(0);
+    // ...and the persisted run's total is restored, summed across its days.
+    expect(tracker.getCostForWorkflowRun('wf_persisted_run')).toBeCloseTo(1.75, 4);
+    expect(tracker.hasCostForWorkflowRun('wf_persisted_run')).toBe(true);
+  });
+
+  it('merges costByWorkflowRunId day-buckets for a run already partially observed by this process, same day', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 1_000, outputTokens: 500, totalTokens: 1_500 }),
+      'claude-sonnet-4',
+      { workflowRunId: 'wf_resumed_run' },
+    );
+    const liveCostBefore = tracker.getCostForWorkflowRun('wf_resumed_run');
+    const today = localDateKey();
+
+    tracker.seedFromPersisted(
+      makeSeed({
+        totalCostUsd: 2,
+        dayCostUsd: 2,
+        costByWorkflowRunId: { wf_resumed_run: { [today]: 2 } },
+      }),
+    );
+
+    expect(tracker.getCostForWorkflowRun('wf_resumed_run')).toBeCloseTo(liveCostBefore + 2, 4);
+    // Assert the actual day-bucket placement, not just the summed total —
+    // a merge bug that filed the seeded amount under the wrong dayKey would
+    // still pass the assertion above, since getCostForWorkflowRun() sums
+    // across every day.
+    const entries = [...tracker.iterCostByWorkflowRun()].filter(
+      (e) => e.runId === 'wf_resumed_run',
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.dayKey).toBe(today);
+    expect(entries[0]!.usd).toBeCloseTo(liveCostBefore + 2, 4);
+  });
+
+  it('keeps a persisted run day-bucket separate from a different day already live-observed by this process', () => {
+    const tracker = new CostTracker();
+    const today = localDateKey();
+    const otherDay = '2020-01-01'; // fixed past date used ONLY as a distinct key, not as "today" — never asserted to be relative to now
+
+    tracker.recordTokenUsage(
+      makeUsage({ inputTokens: 1_000, outputTokens: 500, totalTokens: 1_500 }),
+      'claude-sonnet-4',
+      { workflowRunId: 'wf_cross_day_run' },
+    );
+    const liveCostToday = tracker.getCostForWorkflowRun('wf_cross_day_run');
+
+    tracker.seedFromPersisted(
+      makeSeed({
+        totalCostUsd: 5,
+        dayCostUsd: 0, // the seed's day-portion for TODAY's costByDayUsd bucket is unrelated to this test
+        costByWorkflowRunId: { wf_cross_day_run: { [otherDay]: 5 } },
+      }),
+    );
+
+    const entries = [...tracker.iterCostByWorkflowRun()].filter(
+      (e) => e.runId === 'wf_cross_day_run',
+    );
+    expect(entries).toHaveLength(2);
+    const todayEntry = entries.find((e) => e.dayKey === today);
+    const otherEntry = entries.find((e) => e.dayKey === otherDay);
+    expect(todayEntry?.usd).toBeCloseTo(liveCostToday, 4);
+    expect(otherEntry?.usd).toBeCloseTo(5, 4);
+    // Total across both days still sums correctly.
+    expect(tracker.getCostForWorkflowRun('wf_cross_day_run')).toBeCloseTo(liveCostToday + 5, 4);
+  });
+});
+
+describe('priceUsage()', () => {
+  const usage = makeUsage({ inputTokens: 10_000, outputTokens: 2_000, totalTokens: 12_000 });
+
+  it('returns the same breakdown as recordTokenUsage without recording anything', () => {
+    const tracker = new CostTracker();
+
+    const priced = tracker.priceUsage(usage, 'claude-sonnet-4');
+
+    expect(priced.totalUsd).toBeCloseTo(0.06, 6);
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeNull();
+    expect(tracker.getMetrics().reportCount).toBe(0);
+  });
+
+  it('applies the rate multiplier', () => {
+    const tracker = new CostTracker(undefined, { rateMultiplier: 0.5 });
+
+    expect(tracker.priceUsage(usage, 'claude-sonnet-4').totalUsd).toBeCloseTo(0.03, 6);
+  });
+});
+
+describe('byte-estimate ledger', () => {
+  const real = makeUsage({ inputTokens: 1_000, outputTokens: 500, totalTokens: 1_500 });
+  const MODEL = 'claude-sonnet-4';
+  const REPLAY = { replacesEstimates: true };
+
+  it('removes the estimated share when the first real parent report arrives', () => {
+    const tracker = new CostTracker();
+    tracker.recordEstimatedTokens(4_000, 2_000, MODEL);
+    tracker.recordEstimatedTokens(4_000, 2_000, MODEL);
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeGreaterThan(0);
+
+    const exact = tracker.recordTokenUsage(real, MODEL, REPLAY);
+
+    const m = tracker.getMetrics();
+    expect(m.sessionTotalCostUsd).toBeCloseTo(exact.totalUsd, 9);
+    expect(m.parentCostUsd).toBeCloseTo(exact.totalUsd, 9);
+    expect(m.totalInputTokens).toBe(1_000);
+    expect(m.totalOutputTokens).toBe(500);
+    expect(m.costByModel[MODEL]).toBeCloseTo(exact.totalUsd, 9);
+    expect(Object.values(m.costByDayUsd).reduce((a, b) => a + b, 0)).toBeCloseTo(exact.totalUsd, 9);
+  });
+
+  it('keeps the estimate when no real report ever arrives', () => {
+    const tracker = new CostTracker();
+    const est = tracker.recordEstimatedTokens(4_000, 2_000, MODEL);
+
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeCloseTo(est.totalUsd, 9);
+  });
+
+  it('keeps earlier estimates when a self-report arrives without the replay flag', () => {
+    const tracker = new CostTracker();
+    const est = tracker.recordEstimatedTokens(4_000, 2_000, MODEL);
+
+    const reported = tracker.recordTokenUsage(real, MODEL);
+
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeCloseTo(
+      est.totalUsd + reported.totalUsd,
+      9,
+    );
+  });
+
+  it('does not discard parent estimates on a subagent report', () => {
+    const tracker = new CostTracker();
+    const est = tracker.recordEstimatedTokens(4_000, 2_000, MODEL);
+
+    const sub = tracker.recordTokenUsage(real, MODEL, { agentId: 'agent-1' });
+
+    expect(tracker.getMetrics().sessionTotalCostUsd).toBeCloseTo(est.totalUsd + sub.totalUsd, 9);
+  });
+
+  it('reports an all-zero ledger after a real report so a persisted copy is overwritten', () => {
+    const tracker = new CostTracker();
+    tracker.recordEstimatedTokens(4_000, 2_000, MODEL);
+    tracker.recordTokenUsage(real, MODEL, REPLAY);
+
+    expect(tracker.getMetrics().byteEstimates).toEqual({
+      costUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      costByModel: {},
+      costByDayUsd: {},
+    });
+  });
+
+  it('omits the ledger for a session that never estimated', () => {
+    const tracker = new CostTracker();
+    tracker.recordTokenUsage(real, MODEL);
+
+    expect(tracker.getMetrics().byteEstimates).toBeUndefined();
+  });
+
+  it('restores the ledger across a restart so the next real report still removes it', () => {
+    const first = new CostTracker();
+    const est = first.recordEstimatedTokens(4_000, 2_000, MODEL);
+    const before = first.getMetrics();
+
+    const second = new CostTracker();
+    second.seedFromPersisted({
+      totalCostUsd: est.totalUsd,
+      subagentCostUsd: 0,
+      parentCostUsd: est.totalUsd,
+      totalInputTokens: before.totalInputTokens,
+      totalOutputTokens: before.totalOutputTokens,
+      totalThinkingTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreationTokens: 0,
+      totalCacheSavingsUsd: 0,
+      costByModel: { [MODEL]: est.totalUsd },
+      dayKey: Object.keys(before.costByDayUsd)[0] as string,
+      dayCostUsd: est.totalUsd,
+      daySubagentCostUsd: 0,
+      costByWorkflowRunId: {},
+      ...(before.byteEstimates && { byteEstimates: before.byteEstimates }),
+    });
+
+    const exact = second.recordTokenUsage(real, MODEL, REPLAY);
+
+    expect(second.getMetrics().sessionTotalCostUsd).toBeCloseTo(exact.totalUsd, 9);
   });
 });

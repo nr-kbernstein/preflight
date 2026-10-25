@@ -17,6 +17,8 @@ import type {
 } from '../alerts/types.js';
 import { DEFAULT_PERSONAL_THRESHOLDS } from '../alerts/types.js';
 import { normalizeDeveloperName } from '../config.js';
+import { getRegionByDeployFlags } from '../install/regions.js';
+import { stagingHost } from '../shared/transport/http-client.js';
 import { resolveDataDir } from './data-paths.js';
 
 export const CREATE_POLICY_MUTATION = `
@@ -138,7 +140,9 @@ export interface AlertsDeployOptions {
   readonly dryRun: boolean;
   readonly teardown: boolean;
   readonly update: boolean;
+  readonly staging: boolean;
   readonly eu: boolean;
+  readonly jp: boolean;
   readonly developer: string | null;
   /**
    * Override the alerts data dir. Used by tests so they can point at a fixture
@@ -409,8 +413,7 @@ async function syncConditions(
 
 function pickNerdgraphUrl(opts: AlertsDeployOptions): string {
   if (opts.nerdgraphUrlOverride) return opts.nerdgraphUrlOverride;
-  if (opts.eu) return 'https://api.eu.newrelic.com/graphql';
-  return 'https://api.newrelic.com/graphql';
+  return getRegionByDeployFlags(opts).nerdgraphUrl;
 }
 
 /**
@@ -421,13 +424,22 @@ export async function runDeployAlerts(opts: AlertsDeployOptions): Promise<number
   const out: OutputStream = opts.stdout ?? process.stdout;
   const fetchImpl: typeof fetch = opts.fetchImpl ?? fetch;
 
+  if ([opts.staging, opts.eu, opts.jp].filter(Boolean).length > 1) {
+    out.write('Error: --staging, --eu, and --jp are mutually exclusive.\n');
+    return 1;
+  }
+
   if ([opts.dryRun, opts.teardown, opts.update].filter(Boolean).length > 1) {
     out.write('Error: --dry-run, --teardown, and --update are mutually exclusive.\n');
     return 1;
   }
 
-  if (opts.eu) {
+  if (opts.staging) {
+    out.write(`Targeting staging API: https://${stagingHost('api')}/graphql\n`);
+  } else if (opts.eu) {
     out.write('Targeting EU API: https://api.eu.newrelic.com/graphql\n');
+  } else if (opts.jp) {
+    out.write('Targeting Japan API: https://api.jp.newrelic.com/graphql\n');
   }
 
   const developer: string | null = opts.developer ? normalizeDeveloperName(opts.developer) : null;

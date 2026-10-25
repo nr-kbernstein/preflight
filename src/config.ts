@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { z } from 'zod';
 import { createLogger } from './shared/index.js';
@@ -11,8 +11,61 @@ import type { PersonalAlertThresholds } from './alerts/types.js';
 import { DEFAULT_PERSONAL_THRESHOLDS } from './alerts/types.js';
 import { REDACTION_PATTERNS as DEFAULT_REDACTION_PATTERNS } from './redaction-patterns.js';
 import { resolveRecordContent } from './record-content-gate.js';
+import { projectIdFromRemote, stripRemoteCredentials } from './lib/git-remote.js';
+import { validateTiers, DEFAULT_TIER_NAME, WILDCARD_EVENT_TYPE } from './transport/tier-types.js';
+import type { ResolvedTier } from './transport/tier-types.js';
 
 const logger = createLogger('mcp-config');
+
+export const VALID_MODES = ['cloud', 'local', 'both'] as const;
+export type Mode = (typeof VALID_MODES)[number];
+
+export type CompanionModeSource =
+  'env NR_AI_COMPANION_MODE' | 'config file' | 'detected Claude Code OTel export' | 'default';
+
+export interface ResolvedCompanionMode {
+  readonly value: boolean;
+  readonly source: CompanionModeSource;
+}
+
+function otlpEndpointIsNewRelic(endpoint: string | undefined): boolean {
+  if (!endpoint) return false;
+  try {
+    const url = new URL(endpoint.includes('://') ? endpoint : `https://${endpoint}`);
+    return url.hostname === 'nr-data.net' || url.hostname.endsWith('.nr-data.net');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Companion mode only prevents double-counting when Claude Code's own OTel
+ * metrics also land in New Relic. Detection requires an nr-data.net endpoint:
+ * turning it on for an export that goes elsewhere would drop Preflight's cost
+ * gauges from New Relic with nothing replacing them.
+ */
+export function resolveCompanionMode(
+  env: NodeJS.ProcessEnv,
+  fileValue: boolean | undefined,
+): ResolvedCompanionMode {
+  const envValue = parseEnvBool(env.NR_AI_COMPANION_MODE);
+  if (envValue !== undefined) return { value: envValue, source: 'env NR_AI_COMPANION_MODE' };
+  if (fileValue !== undefined) return { value: fileValue, source: 'config file' };
+
+  const exporters = (env.OTEL_METRICS_EXPORTER ?? '')
+    .split(',')
+    .map((e) => e.trim())
+    .filter((e) => e !== '' && e !== 'none');
+  const endpoint = env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT || env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  if (
+    parseEnvBool(env.CLAUDE_CODE_ENABLE_TELEMETRY) === true &&
+    exporters.includes('otlp') &&
+    otlpEndpointIsNewRelic(endpoint)
+  ) {
+    return { value: true, source: 'detected Claude Code OTel export' };
+  }
+  return { value: false, source: 'default' };
+}
 
 export interface McpServerConfig {
   readonly licenseKey?: string;
@@ -24,10 +77,21 @@ export interface McpServerConfig {
   readonly teamId: string | null;
   readonly projectId: string | null;
   readonly orgId: string | null;
+  readonly repoUrl: string | null;
+  /** Dedicated opt-out for `repoUrl`, independent of `projectId`'s. Defaults true. */
+  readonly repoUrlEnabled: boolean;
   readonly model: string;
   readonly enabled: boolean;
   readonly highSecurity: boolean;
   readonly recordContent: boolean;
+  /** Background fetch of LiteLLM prices for models the bundled table lacks. Forced false by highSecurity. */
+  readonly pricingRefresh: boolean;
+  /**
+   * Set when this org also enables Claude Code's built-in OTel export, so the
+   * same session isn't ingested twice into a blended "org AI spend" dashboard
+   * (session_id === OTel's session.id). See docs/ADVANCED.md § Companion mode.
+   */
+  readonly companionMode: boolean;
   readonly redactionPatterns: readonly RegExp[];
   readonly hookBufferPath: string;
   readonly storagePath: string;
@@ -40,12 +104,46 @@ export interface McpServerConfig {
   readonly collectorHost: string | null;
   readonly proxyUpstreams: readonly UpstreamConfig[];
   readonly nrApiKey: string | null;
+  /** Path to a custom pricing JSON file, applied via `initPricing()`. See `NEW_RELIC_AI_CUSTOM_PRICING_FILE`. */
+  readonly customPricingFile: string | null;
+  /**
+   * Flat discount multiplier (0 < x ≤ 1) applied to every dollar figure
+   * `CostTracker` computes, so an org's contracted rate is reflected instead
+   * of list price. Mirrors Claude Code's own `modelPricing.multiplier`
+   * semantics without reading Claude Code's managed settings directly —
+   * those are delivered through several mechanisms (server-managed,
+   * MDM, a `managed-settings.json` file, a policy helper), only one of which
+   * is a static file, and only the winning source is actually in effect, so
+   * auto-discovery would risk silently applying a stale/overridden rate.
+   * `null`/unset: no correction. See `NEW_RELIC_AI_COST_RATE_MULTIPLIER`.
+   */
+  readonly costRateMultiplier: number | null;
+  /**
+   * Applies the 1.1x US-only-inference premium Claude Code itself applies
+   * for data-residency workspaces (see
+   * https://platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing),
+   * multiplicatively combined with `costRateMultiplier` when both are set.
+   * Preflight cannot detect residency-billed responses on its own (no hook
+   * or event exposes it), so this is an explicit opt-in, not automatic.
+   * See `NEW_RELIC_AI_DATA_RESIDENCY_PREMIUM`.
+   */
+  readonly dataResidencyPremium: boolean;
   readonly digestWebhookUrl: string | null;
   readonly digestSchedule: string; // cron expression, default: "0 9 * * 1" (Monday 9am)
   /** Default: 90. `null` disables retention (only reachable via an explicit `null` in config.json). */
   readonly retainSessionsDays: number | null;
   readonly personalAlertThresholds: PersonalAlertThresholds;
-  readonly mode: 'cloud' | 'local' | 'both';
+  readonly mode: Mode;
+  /**
+   * Multi-tier telemetry routing. Resolved in-memory at load time
+   * and never persisted. When the config file has no `tiers` array, the flat
+   * `licenseKey`/`accountId` wrap into a single implicit tier
+   * (`name: 'default'`, `eventTypes: ['*']`), so existing single-account
+   * deployments need no migration. Always `[]` when `mode === 'local'`; an
+   * explicit `tiers` array under `mode: 'local'` is a config-load error.
+   * See docs/ADVANCED.md § Multi-Tier Telemetry Routing.
+   */
+  readonly tiers: readonly ResolvedTier[];
   readonly platformTarget?: PlatformTarget;
   /**
    * OTLP-related config, grouped to match the `dashboard`/`alerts` nesting
@@ -93,6 +191,12 @@ export interface McpServerConfig {
     readonly logRetentionMb: number;
     readonly rulesPath: string;
   };
+  readonly homelabServerUrl: string | null;
+  readonly homelabToken: string | null;
+  readonly homelabServer: {
+    readonly port: number;
+    readonly bindAddress: string;
+  };
 }
 
 export const DEFAULT_STORAGE_PATH = resolve(homedir(), '.newrelic-preflight');
@@ -123,10 +227,14 @@ export const ConfigFileSchema = z
     teamId: z.string().nullable().optional(),
     projectId: z.string().nullable().optional(),
     orgId: z.string().nullable().optional(),
+    repoUrl: z.string().nullable().optional(),
+    repoUrlEnabled: z.boolean().optional(),
     model: z.string().optional(),
     enabled: z.boolean().optional(),
     highSecurity: z.boolean().optional(),
     recordContent: z.boolean().optional(),
+    pricingRefresh: z.boolean().optional(),
+    companionMode: z.boolean().optional(),
     storagePath: z.string().optional(),
     hookBufferPath: z.string().optional(),
     harvestEventsMs: z.number().optional(),
@@ -138,7 +246,15 @@ export const ConfigFileSchema = z
     logLevel: z.enum(['debug', 'info', 'warn', 'error']).optional(),
     collectorHost: z.string().nullable().optional(),
     proxyUpstreams: z.array(z.unknown()).optional(),
+    // Shape validation lives in validateTiers() (transport/tier-types.ts), not
+    // here — same split as `proxyUpstreams` above. Zod would otherwise
+    // pre-empt validateTiers()'s specific, actionable error messages with a
+    // generic union-mismatch issue.
+    tiers: z.array(z.unknown()).optional(),
     nrApiKey: z.string().nullable().optional(),
+    customPricingFile: z.string().nullable().optional(),
+    costRateMultiplier: z.number().nullable().optional(),
+    dataResidencyPremium: z.boolean().optional(),
     digestWebhookUrl: z.string().nullable().optional(),
     digestSchedule: z.string().optional(),
     retainSessionsDays: z.number().nullable().optional(),
@@ -153,7 +269,7 @@ export const ConfigFileSchema = z
     otlpReceiverBindAddress: z.string().optional(),
     otlpForwardEndpoint: z.string().nullable().optional(),
     otlpForwardHeaders: z.record(z.string(), z.string()).optional(),
-    mode: z.enum(['cloud', 'local', 'both']).optional(),
+    mode: z.enum(VALID_MODES).optional(),
     platformTarget: z.enum(['native', 'wsl-windows-cc', 'wsl-linux-cc']).optional(),
     otlp: z
       .object({
@@ -193,6 +309,15 @@ export const ConfigFileSchema = z
         port: z.number().int().min(1).max(65535).optional(),
         host: z.string().optional(),
         openOnStart: z.boolean().optional(),
+      })
+      .passthrough()
+      .optional(),
+    homelabServerUrl: z.string().nullable().optional(),
+    homelabToken: z.string().nullable().optional(),
+    homelabServer: z
+      .object({
+        port: z.number().int().min(1).max(65535).optional(),
+        bindAddress: z.string().optional(),
       })
       .passthrough()
       .optional(),
@@ -261,28 +386,36 @@ function inferDeveloper(): string {
   }
 }
 
-function inferProjectId(): string | null {
+function getGitRemoteUrl(): string | null {
   try {
-    const remote = execSync('git remote get-url origin', {
+    return execSync('git remote get-url origin', {
       encoding: 'utf-8',
       timeout: 2000,
-      env: { ...process.env },
+      // GIT_DIR/GIT_WORK_TREE (set by git for hook subprocesses, e.g. this
+      // process running under husky's pre-push) override the cwd-implied
+      // repo, silently redirecting this call to whatever repo the ambient
+      // env points at. See local-session-aggregator.ts's GIT_OPTS for the
+      // same guard.
+      env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined },
     }).trim();
-    // Extract "org/repo" from HTTPS or SSH remotes:
-    // https://github.com/org/repo.git  → org/repo
-    // git@github.com:org/repo.git      → org/repo
-    const match = remote.match(/[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?$/);
-    return match ? match[1] : null;
   } catch {
     return null;
   }
 }
 
-function envBool(key: string, defaultValue: boolean): boolean {
-  const val = process.env[key]?.trim().toLowerCase();
+function inferProjectId(): string | null {
+  return projectIdFromRemote(getGitRemoteUrl());
+}
+
+function parseEnvBool(raw: string | undefined): boolean | undefined {
+  const val = raw?.trim().toLowerCase();
   if (val === 'true' || val === '1' || val === 'yes' || val === 'y' || val === 'on') return true;
   if (val === 'false' || val === '0' || val === 'no' || val === 'n' || val === 'off') return false;
-  return defaultValue;
+  return undefined;
+}
+
+function envBool(key: string, defaultValue: boolean): boolean {
+  return parseEnvBool(process.env[key]) ?? defaultValue;
 }
 
 // Applied to every return path of envInt (not just the parsed-env-var one) so
@@ -429,10 +562,12 @@ function validateRulesPath(rawPath: string, storagePath: string): string {
   }
   const resolved = resolve(rawPath);
   const storageResolved = resolve(storagePath);
-  // Match prefix only on full path segments to avoid `/foo/bar` matching
-  // `/foo/barbaz`.
-  const prefix = storageResolved.endsWith('/') ? storageResolved : storageResolved + '/';
-  if (resolved !== storageResolved && !resolved.startsWith(prefix)) {
+  // path.relative() + isAbsolute() is separator-agnostic (see static-handler.ts,
+  // fixed for the same bug class) — a hand-rolled prefix check hardcodes
+  // '/' and silently fails every containment check on Windows, where resolve()
+  // returns backslash-separated paths.
+  const rel = relative(storageResolved, resolved);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
     logger.warn('alerts.rulesPath resolves outside storagePath — falling back to default', {
       rawPath,
       resolved,
@@ -456,6 +591,24 @@ function validateFilePositiveNumber(value: number, fieldName: string): boolean {
     fieldName,
     value,
   });
+  return false;
+}
+
+// costRateMultiplier is a discount factor, not an arbitrary positive number —
+// mirrors the bound Claude Code itself enforces on modelPricing.multiplier
+// (docs/settings-reference#modelpricing: "greater than 0 and at most 1").
+// A value above 1 would silently inflate every cost figure, the opposite of
+// this field's purpose, so it gets its own validator rather than reusing
+// validateFilePositiveNumber.
+function validateFileRatio(value: number, fieldName: string): boolean {
+  if (Number.isFinite(value) && value > 0 && value <= 1) return true;
+  logger.warn(
+    `${fieldName} in config file must be a number greater than 0 and at most 1 — ignoring value`,
+    {
+      fieldName,
+      value,
+    },
+  );
   return false;
 }
 
@@ -499,6 +652,29 @@ function parseProxyUpstreams(
     return valid as UpstreamConfig[];
   }
   return [];
+}
+
+/**
+ * Thrown by `loadMcpConfig()` when the mode exports to New Relic but a
+ * credential it needs is unset. `--local` falls back to local mode on this
+ * type (#479), so the message can change without breaking that fallback.
+ */
+export class MissingCloudCredentialError extends Error {
+  readonly missingField: 'licenseKey' | 'accountId';
+  readonly mode: Mode;
+
+  constructor(missingField: 'licenseKey' | 'accountId', mode: Mode, configFilePath: string) {
+    const envVar = missingField === 'licenseKey' ? 'NEW_RELIC_LICENSE_KEY' : 'NEW_RELIC_ACCOUNT_ID';
+    super(
+      `Missing required configuration: ${missingField} (mode='${mode}'). ` +
+        `Set the ${envVar} environment variable or add "${missingField}" to ` +
+        configFilePath +
+        ", or switch to mode='local' to skip cloud transport.",
+    );
+    this.name = 'MissingCloudCredentialError';
+    this.missingField = missingField;
+    this.mode = mode;
+  }
 }
 
 export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpServerConfig> {
@@ -589,30 +765,39 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
     }
   }
 
+  // --- licenseKey: CLI has no flag for this, so env > file ---
+  // Hoisted ahead of mode resolution: an ambiguous licenseKey-without-mode
+  // config must fail closed instead of silently defaulting to 'cloud'.
+  const licenseKeyRaw =
+    process.env.NEW_RELIC_LICENSE_KEY ??
+    (typeof file.licenseKey === 'string' ? file.licenseKey : undefined);
+
   // --- Resolve mode early so we can gate licenseKey/accountId requirements ---
   // File mode is already validated by the zod schema in loadConfigFile.
-  const VALID_MODES = ['cloud', 'local', 'both'] as const;
-  type Mode = (typeof VALID_MODES)[number];
   const isValidMode = (v: string | undefined): v is Mode =>
     v !== undefined && (VALID_MODES as readonly string[]).includes(v);
   const envMode = process.env.NR_AI_MODE;
   if (envMode !== undefined && envMode !== '' && !isValidMode(envMode)) {
     throw new Error(`Invalid NR_AI_MODE='${envMode}'. Must be one of: ${VALID_MODES.join(', ')}.`);
   }
-  const mode: Mode =
-    (isValidMode(envMode) ? envMode : undefined) ?? (file.mode as Mode | undefined) ?? 'cloud';
-
-  // --- licenseKey: CLI has no flag for this, so env > file ---
-  const licenseKeyRaw =
-    process.env.NEW_RELIC_LICENSE_KEY ??
-    (typeof file.licenseKey === 'string' ? file.licenseKey : undefined);
-  if (mode !== 'local' && !licenseKeyRaw) {
+  const fileMode = file.mode as Mode | undefined;
+  let mode: Mode;
+  if (isValidMode(envMode)) {
+    mode = envMode;
+  } else if (fileMode !== undefined) {
+    mode = fileMode;
+  } else if (licenseKeyRaw) {
+    // Local-first default (README): telemetry export is opt-in, so a config
+    // with credentials but no explicit mode must not silently export.
     throw new Error(
-      `Missing required configuration: licenseKey (mode='${mode}'). ` +
-        'Set the NEW_RELIC_LICENSE_KEY environment variable or add "licenseKey" to ' +
-        configFilePath +
-        ", or switch to mode='local' to skip cloud transport.",
+      'Config has a licenseKey but no explicit mode. Telemetry export is opt-in: set "mode": "cloud" (or "both") in the config file, set NR_AI_MODE, or remove the credentials for local-only use. Previous versions implicitly defaulted to cloud.',
     );
+  } else {
+    mode = 'local';
+  }
+
+  if (mode !== 'local' && !licenseKeyRaw) {
+    throw new MissingCloudCredentialError('licenseKey', mode, configFilePath);
   }
   // Reject the literal string "null" — it's truthy but not a valid key
   // and would cause silent auth failures at transport time.
@@ -630,12 +815,7 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
     process.env.NEW_RELIC_ACCOUNT_ID ??
     (typeof file.accountId === 'string' ? file.accountId : undefined);
   if (mode !== 'local' && !accountIdRaw) {
-    throw new Error(
-      `Missing required configuration: accountId (mode='${mode}'). ` +
-        'Set the NEW_RELIC_ACCOUNT_ID environment variable or add "accountId" to ' +
-        configFilePath +
-        ", or switch to mode='local' to skip cloud transport.",
-    );
+    throw new MissingCloudCredentialError('accountId', mode, configFilePath);
   }
   if (accountIdRaw && !/^\d{1,12}$/.test(accountIdRaw)) {
     throw new Error(
@@ -645,6 +825,35 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
   }
   // In local mode, undefined if accountId is missing (NR transport won't be used)
   const accountId = accountIdRaw;
+
+  // --- tiers: config file only (no env var / CLI flag equivalent exists) ---
+  // Fail closed on tiers-under-local BEFORE validating tier shape, so the
+  // mode conflict is always the reported error even for a malformed array.
+  const rawTiers: readonly unknown[] | undefined = Array.isArray(file.tiers)
+    ? file.tiers
+    : undefined;
+  let resolvedTiers: readonly ResolvedTier[];
+  if (rawTiers !== undefined) {
+    if (mode === 'local') {
+      throw new Error(
+        `Config at ${configFilePath} defines a "tiers" array but mode='local'. ` +
+          'Multi-tier telemetry routing fans out the cloud export path, so it requires ' +
+          "mode='cloud' or mode='both'. Remove the tiers array for local-only use, or set the mode.",
+      );
+    }
+    resolvedTiers = validateTiers(rawTiers);
+  } else if (mode !== 'local' && licenseKey !== undefined && accountId !== undefined) {
+    // Implicit single tier — byte-identical to the existing single-tier default.
+    resolvedTiers = [
+      {
+        name: DEFAULT_TIER_NAME,
+        destination: { type: 'nr', licenseKey, accountId },
+        eventTypes: [WILDCARD_EVENT_TYPE],
+      },
+    ];
+  } else {
+    resolvedTiers = [];
+  }
 
   // --- Build config with priority: CLI > env > file > defaults ---
   const storagePath =
@@ -656,6 +865,44 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
     'NEW_RELIC_AI_HIGH_SECURITY',
     typeof file.highSecurity === 'boolean' ? file.highSecurity : false,
   );
+
+  const resolvedProjectId = sanitizeOrgField(
+    process.env.NEW_RELIC_AI_PROJECT_ID ??
+      (typeof file.projectId === 'string' ? file.projectId : inferProjectId()),
+  );
+
+  // Dedicated opt-out, independent of projectId's — repo_url can carry an
+  // internal git host that org/repo alone doesn't, so it gets its own toggle
+  // rather than riding along on projectId's. Defaults on; the setup wizard
+  // prompts for it explicitly (see setup-wizard.ts) so sending it is an
+  // informed choice, not a silent default.
+  const repoUrlEnabled = envBool(
+    'NEW_RELIC_AI_REPO_URL_ENABLED',
+    typeof file.repoUrlEnabled === 'boolean' ? file.repoUrlEnabled : true,
+  );
+
+  // Credential redaction applies uniformly regardless of source — an
+  // explicit override (env var or config file) can carry embedded
+  // credentials just as easily as an inferred git remote (e.g. a URL
+  // copy-pasted from an authenticated `git remote -v`).
+  const rawRepoUrl =
+    process.env.NEW_RELIC_AI_REPO_URL ??
+    (typeof file.repoUrl === 'string' ? file.repoUrl : getGitRemoteUrl());
+  // stripRemoteCredentials drops URL userinfo and query strings;
+  // redactSensitive then catches any token elsewhere in the value.
+  const strippedRepoUrl = stripRemoteCredentials(rawRepoUrl);
+  const resolvedRepoUrl = sanitizeOrgField(
+    strippedRepoUrl === null ? null : redactSensitive(strippedRepoUrl),
+  );
+
+  const resolvedCompanionMode = resolveCompanionMode(
+    process.env,
+    typeof file.companionMode === 'boolean' ? file.companionMode : undefined,
+  );
+  logger.info('Companion mode resolved', {
+    value: resolvedCompanionMode.value,
+    source: resolvedCompanionMode.source,
+  });
 
   const config: McpServerConfig = {
     licenseKey,
@@ -681,10 +928,11 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
       process.env.NEW_RELIC_AI_TEAM_ID ?? (typeof file.teamId === 'string' ? file.teamId : null),
     ),
 
-    projectId: sanitizeOrgField(
-      process.env.NEW_RELIC_AI_PROJECT_ID ??
-        (typeof file.projectId === 'string' ? file.projectId : inferProjectId()),
-    ),
+    projectId: resolvedProjectId,
+
+    repoUrlEnabled,
+
+    repoUrl: repoUrlEnabled ? resolvedRepoUrl : null,
 
     orgId: sanitizeOrgField(
       process.env.NEW_RELIC_AI_ORG_ID ?? (typeof file.orgId === 'string' ? file.orgId : null),
@@ -704,6 +952,15 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
         typeof file.recordContent === 'boolean' ? file.recordContent : false,
       ),
     ),
+
+    pricingRefresh: highSecurity
+      ? false
+      : envBool(
+          'NEW_RELIC_AI_PRICING_REFRESH',
+          typeof file.pricingRefresh === 'boolean' ? file.pricingRefresh : true,
+        ),
+
+    companionMode: resolvedCompanionMode.value,
 
     redactionPatterns: DEFAULT_REDACTION_PATTERNS,
 
@@ -800,6 +1057,27 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
     nrApiKey:
       process.env.NEW_RELIC_API_KEY ?? (typeof file.nrApiKey === 'string' ? file.nrApiKey : null),
 
+    customPricingFile:
+      process.env.NEW_RELIC_AI_CUSTOM_PRICING_FILE ??
+      (typeof file.customPricingFile === 'string' ? file.customPricingFile : null),
+
+    costRateMultiplier: (() => {
+      const raw = process.env.NEW_RELIC_AI_COST_RATE_MULTIPLIER;
+      if (raw !== undefined && raw !== '') {
+        const v = parseFloat(raw);
+        if (Number.isFinite(v) && v > 0 && v <= 1) return v;
+      }
+      if (typeof file.costRateMultiplier !== 'number') return null;
+      return validateFileRatio(file.costRateMultiplier, 'costRateMultiplier')
+        ? file.costRateMultiplier
+        : null;
+    })(),
+
+    dataResidencyPremium: envBool(
+      'NEW_RELIC_AI_DATA_RESIDENCY_PREMIUM',
+      typeof file.dataResidencyPremium === 'boolean' ? file.dataResidencyPremium : false,
+    ),
+
     digestWebhookUrl:
       process.env.NEW_RELIC_AI_DIGEST_WEBHOOK_URL ??
       (typeof file.digestWebhookUrl === 'string' ? file.digestWebhookUrl : null),
@@ -830,6 +1108,7 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
     })(),
 
     mode,
+    tiers: resolvedTiers,
 
     // The 8 OTLP-related fields are grouped here (matching the dashboard/alerts
     // nesting precedent). Each still accepts the legacy flat top-level key for
@@ -1069,6 +1348,33 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
       };
     })(),
 
+    homelabServerUrl:
+      process.env.NEW_RELIC_AI_HOMELAB_URL ??
+      (typeof file.homelabServerUrl === 'string' ? file.homelabServerUrl : null),
+
+    homelabToken:
+      process.env.NEW_RELIC_AI_HOMELAB_TOKEN ??
+      (typeof file.homelabToken === 'string' ? file.homelabToken : null),
+
+    homelabServer: {
+      port: envInt(
+        'NEW_RELIC_AI_HOMELAB_SERVER_PORT',
+        typeof (file.homelabServer as Record<string, unknown>)?.port === 'number'
+          ? ((file.homelabServer as Record<string, unknown>).port as number)
+          : 7777,
+        { min: 1, max: 65535 },
+      ),
+      bindAddress: (() => {
+        const envVal = process.env.NEW_RELIC_AI_HOMELAB_BIND_ADDRESS;
+        if (envVal !== undefined && envVal !== '') return envVal;
+        const fileServer = file.homelabServer as Record<string, unknown>;
+        if (typeof fileServer?.bindAddress === 'string' && fileServer.bindAddress !== '') {
+          return fileServer.bindAddress;
+        }
+        return '0.0.0.0';
+      })(),
+    },
+
     platformTarget: file.platformTarget as PlatformTarget | undefined,
 
     alerts: (() => {
@@ -1129,6 +1435,26 @@ export function loadMcpConfig(cliOptions?: Partial<CliOptions>): Readonly<McpSer
     })(),
   };
 
+  if (config.homelabServerUrl && !config.homelabToken) {
+    throw new Error(
+      'homelabServerUrl is set but homelabToken is missing. Set NEW_RELIC_AI_HOMELAB_TOKEN.',
+    );
+  }
+
+  if (config.homelabServerUrl) {
+    let parsedHomelabUrl: URL;
+    try {
+      parsedHomelabUrl = new URL(config.homelabServerUrl);
+    } catch {
+      throw new Error(`homelabServerUrl is not a valid URL: "${config.homelabServerUrl}"`);
+    }
+    if (parsedHomelabUrl.protocol !== 'http:' && parsedHomelabUrl.protocol !== 'https:') {
+      throw new Error(
+        `homelabServerUrl must use http: or https:. Got: "${parsedHomelabUrl.protocol}"`,
+      );
+    }
+  }
+
   logger.debug('Configuration loaded', {
     appName: config.appName,
     developer: config.developer,
@@ -1162,6 +1488,8 @@ export interface ConfigValidationResult {
   readonly mode?: string;
   /** The `storagePath` field from the parsed config, if present and a string. */
   readonly storagePath?: string;
+  /** The `companionMode` field from the parsed config, if present and a boolean. */
+  readonly companionMode?: boolean;
   /** True when a non-blank licenseKey is present in the parsed config. Raw value is intentionally not exposed. */
   readonly hasLicenseKey: boolean;
   /** Fatal problems that will prevent the MCP server from starting. */
@@ -1291,6 +1619,7 @@ export function validateConfigFile(filePath: string): ConfigValidationResult {
     malformed: false,
     mode: typeof file.mode === 'string' ? file.mode : undefined,
     storagePath: typeof file.storagePath === 'string' ? file.storagePath : undefined,
+    companionMode: typeof file.companionMode === 'boolean' ? file.companionMode : undefined,
     hasLicenseKey: typeof file.licenseKey === 'string' && file.licenseKey.trim().length > 0,
     errors,
     warnings,

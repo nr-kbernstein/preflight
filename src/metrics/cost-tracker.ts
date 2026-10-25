@@ -5,14 +5,18 @@
  *   1. Self-reporting via the `nr_observe_report_tokens` MCP tool (primary)
  *   2. Estimation from hook input/output byte sizes (fallback)
  *
- * Cost calculation delegates to `calculateCost()` from the shared package.
+ * Cost calculation delegates to `calculateModelCost()` (pricing-overlay.ts), which normalizes the model id and wraps the shared `calculateCost()`.
  */
 
 import type { TokenUsage, CostBreakdown, MetricAggregator } from '../shared/index.js';
-import { calculateCost, createLogger } from '../shared/index.js';
+import { createLogger } from '../shared/index.js';
+import { addCallUsage } from './call-usage.js';
+import { priceModelUsage } from './pricing-overlay.js';
 import { localDateKey } from '../lib/date.js';
 import type { SessionTracker } from './session-tracker.js';
 import type { Resettable } from './tracker-contracts.js';
+import { HIGH_CONTEXT_TOKENS } from '../storage/types.js';
+import type { AttributionBucket } from '../storage/types.js';
 
 const logger = createLogger('cost-tracker');
 
@@ -42,24 +46,104 @@ export interface TokenRecordContext {
   readonly timestampMs?: number;
   readonly workflowRunId?: string | null;
   readonly agentId?: string;
+  /**
+   * Best-effort subagent type for this `agentId`, supplied by the caller from
+   * the subagent transcript's `agent-<id>.meta.json` sidecar, the hook
+   * envelope of one of that subagent's tool calls, or, failing those, the
+   * parent's `Agent` tool call (see `SubagentAttributionIndex`). Absent when
+   * none has been seen yet for this `agentId`.
+   */
+  readonly agentType?: string;
+  /**
+   * Time (ms) spent waiting on the model API for this turn, from
+   * `ParentTranscriptWatcher`'s gap between the assistant transcript line
+   * and the line before it (see `TokenHookEvent.responseMs`). Absent when
+   * no transcript was observed for this token event. Accumulates into
+   * `CostMetrics.apiDurationMs`, which stays `null` until the first
+   * observation.
+   */
+  readonly responseMs?: number;
+  /**
+   * Set by `onTokenEvent`, i.e. by the usage watchers (the Claude Code
+   * transcript watcher, `CopilotUsageWatcher`, `CopilotAppUsageWatcher`, and
+   * the Copilot SDK extension), whose reports replay history and so cover the
+   * turns the byte estimates stood in for. `CopilotAppUsageWatcher` skips an
+   * over-threshold first-seen backlog, so its next delta can drop estimates
+   * for turns that are never reported. A self-report
+   * (`nr_observe_report_tokens`) describes one response and must leave the
+   * estimates for earlier turns in place.
+   */
+  readonly replacesEstimates?: boolean;
 }
 
 const LATE_ARRIVAL_REJECTION_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * Scales every dollar field of a `CostBreakdown` by `factor`, leaving token
+ * counts and everything else untouched. Used to correct Preflight's own
+ * list-price computation to an org's real contracted rate (see
+ * `CostTrackerOptions.rateMultiplier`) — `calculateCost()` itself lives in
+ * `src/shared/`, a vendored snapshot this repo must not edit, so the
+ * correction is applied to its output here instead of inside it.
+ */
+function scaleCostBreakdown(breakdown: CostBreakdown, factor: number): CostBreakdown {
+  return {
+    inputUsd: breakdown.inputUsd * factor,
+    outputUsd: breakdown.outputUsd * factor,
+    thinkingUsd: breakdown.thinkingUsd * factor,
+    cacheReadUsd: breakdown.cacheReadUsd * factor,
+    cacheCreationUsd: breakdown.cacheCreationUsd * factor,
+    totalUsd: breakdown.totalUsd * factor,
+    savingsFromCacheUsd: breakdown.savingsFromCacheUsd * factor,
+  };
+}
+
+function subtractFromMap(target: Map<string, number>, amounts: ReadonlyMap<string, number>): void {
+  for (const [key, usd] of amounts) {
+    const remaining = (target.get(key) ?? 0) - usd;
+    if (remaining > 1e-12) target.set(key, remaining);
+    else target.delete(key);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+export interface UnpricedModelUsage {
+  readonly calls: number;
+  /** input + output + thinking + cache-read + cache-creation tokens of the unpriced calls */
+  readonly tokens: number;
+}
+
+export interface EstimatedModelUsage extends UnpricedModelUsage {
+  /** Table id whose price stood in for this model's missing one. */
+  readonly estimatedFrom: string;
+}
+
+/**
+ * The part of the session total that came from byte-size estimates
+ * (`recordEstimatedTokens`) rather than a real token report. Kept as its own
+ * ledger so the first real report can take it back out: the same turns arrive
+ * again as exact usage once the transcript watcher reads from byte 0.
+ */
+export interface ByteEstimateLedger {
+  readonly costUsd: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly costByModel: Readonly<Record<string, number>>;
+  readonly costByDayUsd: Readonly<Record<string, number>>;
+}
+
 export interface CostMetrics {
   readonly sessionTotalCostUsd: number | null;
-  readonly costByTask: null; // stub — task boundary detection is not yet implemented
   readonly costByModel: Record<string, number>;
   readonly costPerLineOfCode: number | null;
   readonly costPerFileModified: number | null;
   /**
    * Blended session cost rate: totalCostUsd / totalTokens (all types) * 1M.
-   * Broader than ModelUsageTracker's per-model `costPerMillionTokens`, which
-   * only counts input+output tokens — the two are not directly comparable.
+   * ModelUsageTracker's per-model `costPerMillionTokens` uses the same
+   * denominator, so the two are comparable.
    */
   readonly costPerMillionTokens: number | null;
   readonly model: string | null;
@@ -72,6 +156,13 @@ export interface CostMetrics {
   readonly totalCacheSavingsUsd: number;
   readonly reportCount: number;
   readonly estimationCount: number;
+  /**
+   * Byte-estimated share of the totals still awaiting a real report. Present
+   * once any estimate has been recorded or seeded; all-zero after a real
+   * report took the estimates back out, so a persisted copy is overwritten
+   * rather than left stale.
+   */
+  readonly byteEstimates?: ByteEstimateLedger;
   readonly latestCostBreakdown: CostBreakdown | null;
   /** Cumulative cost attributed to subagent calls (ctx.agentId was set). */
   readonly subagentCostUsd: number;
@@ -82,6 +173,94 @@ export interface CostMetrics {
    * Shape: `{ [runId]: { [dayKey]: usd } }`
    */
   readonly costByWorkflowRunId: Record<string, Record<string, number>>;
+  /**
+   * Total cost bucketed by local-day key (`YYYY-MM-DD`). Each token event is
+   * attributed to the day it was actually recorded in (by transcript
+   * timestamp, not read time), so this is the authoritative "how much did this
+   * session spend on day X" source. Persisted onto the session summary so the
+   * dashboard's "Spend Today" can sum a session's real today-bucket instead of
+   * pro-rating its lifetime `sessionTotalCostUsd` by a tool-call timeline —
+   * which mis-attributes a resumed multi-day session's whole cumulative cost to
+   * a single day when it has no timeline to pro-rate against.
+   */
+  readonly costByDayUsd: Record<string, number>;
+  /** Subagent-attributed cost bucketed by local-day key; today-scoped
+   * counterpart to `subagentCostUsd`. Same rationale as `costByDayUsd`. */
+  readonly subagentCostByDayUsd: Record<string, number>;
+  /**
+   * Calls whose model had no price (recorded as $0), keyed by the model id as
+   * reported. Spend is understated by exactly these calls.
+   */
+  readonly unpricedByModel: Record<string, UnpricedModelUsage>;
+  /**
+   * Calls priced from a sibling model of the same family. Their cost is in the
+   * totals but is an estimate.
+   */
+  readonly estimatedByModel: Record<string, EstimatedModelUsage>;
+  /**
+   * Subagent-attributed spend bucketed by `ctx.agentType` (best-effort — see
+   * `TokenRecordContext.agentType`). Only token events whose `agentId` had a
+   * known type when recorded land here; the rest are counted in
+   * `subagentCostUsd` but not broken out by type. `count` is the number of
+   * token events attributed to that agent type; `durationMs` is always 0 (no
+   * per-call duration signal reaches this tracker). In-memory only — unlike
+   * `costByModel`, this does NOT survive a process restart.
+   */
+  readonly subagentByAgentType: Record<string, AttributionBucket>;
+  /**
+   * Cumulative cost of every token event whose prompt (input + cache-read +
+   * cache-creation tokens) exceeded {@link HIGH_CONTEXT_TOKENS}.
+   */
+  readonly highContextCostUsd: number;
+  /**
+   * Sum of every token event's `ctx.responseMs` (see `TokenRecordContext`) —
+   * an estimate of cumulative time spent waiting on the model API. `null`
+   * until the first token event that carries a `responseMs`.
+   */
+  readonly apiDurationMs: number | null;
+  /**
+   * The combined correction factor (`rateMultiplier` × the 1.1 data-residency
+   * premium when configured — see `CostTrackerOptions`) applied to every
+   * dollar figure above. `1` means no correction: every figure is Preflight's
+   * own list-price computation, same as before this field existed. Surfaced
+   * so a consumer (MCP tool response, dashboard) can label the numbers
+   * accordingly instead of implying they match an invoice.
+   */
+  readonly costRateMultiplierApplied: number;
+}
+
+/**
+ * Cumulative totals to seed into a freshly-constructed tracker, derived from
+ * a previous process's last checkpoint for the SAME session — see
+ * `seedFromPersisted()` for why this exists.
+ */
+export interface CostTrackerSeed {
+  readonly totalCostUsd: number;
+  readonly subagentCostUsd: number;
+  readonly parentCostUsd: number;
+  readonly totalInputTokens: number;
+  readonly totalOutputTokens: number;
+  readonly totalThinkingTokens: number;
+  readonly totalCacheReadTokens: number;
+  readonly totalCacheCreationTokens: number;
+  readonly totalCacheSavingsUsd: number;
+  readonly costByModel: Readonly<Record<string, number>>;
+  /** Local-day key (see `localDateKey`) `dayCostUsd`/`daySubagentCostUsd` book against. */
+  readonly dayKey: string;
+  /** Portion of `totalCostUsd`/`subagentCostUsd` attributable to `dayKey` (see `todayPortionOfSessionCost`). */
+  readonly dayCostUsd: number;
+  readonly daySubagentCostUsd: number;
+  /**
+   * Per-workflow-run cost, split by local-day, from the persisted checkpoint
+   * — see `seedFromPersisted()`'s doc comment for why this is seeded (unlike
+   * `reset()`, which still clears this map for the unrelated "wrong session
+   * id" correction case).
+   */
+  readonly costByWorkflowRunId: Readonly<Record<string, Readonly<Record<string, number>>>>;
+  readonly unpricedByModel?: Readonly<Record<string, UnpricedModelUsage>>;
+  readonly estimatedByModel?: Readonly<Record<string, EstimatedModelUsage>>;
+  /** Restored separately because `seedFromPersisted` counts as a report. See `ByteEstimateLedger`. */
+  readonly byteEstimates?: ByteEstimateLedger;
 }
 
 export interface SubagentMetrics {
@@ -113,8 +292,17 @@ export class CostTracker implements Resettable {
   private currentModel: string | null = null;
   private reportCount = 0;
   private estimationCount = 0;
+  private byteEstimateCostUsd = 0;
+  private byteEstimateInputTokens = 0;
+  private byteEstimateOutputTokens = 0;
+  private byteEstimateCostByModel = new Map<string, number>();
+  private byteEstimateCostByDay = new Map<string, number>();
+  /** True once a ledger exists to report, even if a real report has since emptied it. */
+  private hasByteEstimateHistory = false;
   private latestCostBreakdown: CostBreakdown | null = null;
   private costByModel = new Map<string, number>();
+  private unpricedByModel = new Map<string, UnpricedModelUsage>();
+  private estimatedByModel = new Map<string, EstimatedModelUsage>();
   // Per-day cost attribution. Each token event is bucketed into the local-day
   // it was recorded in, so consumers asking "how much did this session spend
   // today" can get a real answer when a session crosses midnight. Without
@@ -125,9 +313,9 @@ export class CostTracker implements Resettable {
   /**
    * Per-workflow-run cost attribution split by local-day so a run that crosses
    * midnight contributes to each day's bucket independently. Two-level map:
-   * `costByWorkflowRunId.get(runId).get(dayKey) → usd`. Restart-resets to empty
-   * (intentional: per-day totals remain correct even if run-level attribution
-   * is lost across restarts).
+   * `costByWorkflowRunId.get(runId).get(dayKey) → usd`. Restart-resets to
+   * empty UNLESS `seedFromPersisted()` restores it from a persisted
+   * checkpoint for this same session (see that method's doc comment).
    */
   private costByWorkflowRunId = new Map<string, Map<string, number>>();
   /** Per-day mutation counter so dashboards can invalidate cached day cards. */
@@ -140,8 +328,15 @@ export class CostTracker implements Resettable {
 
   /** Subagent-attributed spend per local-day key, for a today-scoped KPI. */
   private subagentCostByDayUsd = new Map<string, number>();
+  /** Subagent-attributed spend per `ctx.agentType` — see `CostMetrics.subagentByAgentType`. */
+  private subagentByAgentType = new Map<string, AttributionBucket>();
+  /** See `CostMetrics.highContextCostUsd`. */
+  private highContextCostUsd = 0;
+  /** See `CostMetrics.apiDurationMs`; null until the first `ctx.responseMs` observation. */
+  private apiDurationMs: number | null = null;
   private parentCostUsd = 0;
   private totalLinesChanged = 0;
+  private readonly rateMultiplier: number;
 
   /**
    * @param sessionTracker Optional. When provided, `getMetrics().costPerFileModified`
@@ -150,9 +345,29 @@ export class CostTracker implements Resettable {
    *   CostTracker — if the two are reset independently (e.g. one on a
    *   session boundary and the other not), the ratio silently blends two
    *   different session histories.
+   * @param options.rateMultiplier Combined correction factor for an org's
+   *   contracted rate and/or the data-residency premium (see `src/config.ts`'s
+   *   `costRateMultiplier`/`dataResidencyPremium` — this constructor takes
+   *   their product, already resolved, not the two raw config fields).
+   *   Validated at config load (`0 < x`); trusted as-is here. Defaults to `1`
+   *   (no correction — list price, same as before this option existed).
    */
-  constructor(sessionTracker?: SessionTracker) {
+  constructor(sessionTracker?: SessionTracker, options?: { rateMultiplier?: number }) {
     this.sessionTracker = sessionTracker ?? null;
+    this.rateMultiplier = options?.rateMultiplier ?? 1;
+  }
+
+  /**
+   * Prices a usage without recording it, applying this tracker's rate
+   * multiplier. For events that belong to another session: the caller still
+   * needs the dollar figure for that session's own rollup, but must not fold it
+   * into this process-wide total.
+   */
+  priceUsage(usage: TokenUsage, model: string): CostBreakdown {
+    const { breakdown } = priceModelUsage(model, usage);
+    return this.rateMultiplier === 1
+      ? breakdown
+      : scaleCostBreakdown(breakdown, this.rateMultiplier);
   }
 
   /**
@@ -165,6 +380,7 @@ export class CostTracker implements Resettable {
    */
   recordTokenUsage(usage: TokenUsage, model: string, ctx?: TokenRecordContext): CostBreakdown {
     this.reportCount++;
+    if (ctx?.replacesEstimates === true && ctx.agentId === undefined) this.discardByteEstimates();
     return this.accumulateTokens(usage, model, ctx);
   }
 
@@ -185,7 +401,86 @@ export class CostTracker implements Resettable {
     };
 
     this.estimationCount++;
-    return this.accumulateTokens(usage, model);
+    const nowMs = Date.now();
+    const breakdown = this.accumulateTokens(usage, model, { timestampMs: nowMs });
+    this.hasByteEstimateHistory = true;
+    this.byteEstimateCostUsd += breakdown.totalUsd;
+    this.byteEstimateInputTokens += inputTokens;
+    this.byteEstimateOutputTokens += outputTokens;
+    this.byteEstimateCostByModel.set(
+      model,
+      (this.byteEstimateCostByModel.get(model) ?? 0) + breakdown.totalUsd,
+    );
+    const dayKey = localDateKey(nowMs);
+    this.byteEstimateCostByDay.set(
+      dayKey,
+      (this.byteEstimateCostByDay.get(dayKey) ?? 0) + breakdown.totalUsd,
+    );
+    return breakdown;
+  }
+
+  /**
+   * Takes the byte-estimated share back out of the totals. Subtraction clamps
+   * at zero because a seeded ledger can name a day or model the seeded totals
+   * bucketed differently.
+   */
+  private discardByteEstimates(): void {
+    if (this.byteEstimateCostUsd === 0 && this.byteEstimateInputTokens === 0) return;
+    this.totalCostUsd = Math.max(0, this.totalCostUsd - this.byteEstimateCostUsd);
+    this.parentCostUsd = Math.max(0, this.parentCostUsd - this.byteEstimateCostUsd);
+    this.totalInputTokens = Math.max(0, this.totalInputTokens - this.byteEstimateInputTokens);
+    this.totalOutputTokens = Math.max(0, this.totalOutputTokens - this.byteEstimateOutputTokens);
+    subtractFromMap(this.costByModel, this.byteEstimateCostByModel);
+    subtractFromMap(this.costByDayUsd, this.byteEstimateCostByDay);
+    this.byteEstimateCostUsd = 0;
+    this.byteEstimateInputTokens = 0;
+    this.byteEstimateOutputTokens = 0;
+    this.byteEstimateCostByModel = new Map();
+    this.byteEstimateCostByDay = new Map();
+  }
+
+  /**
+   * Shared by both the late-arrival and normal paths of `accumulateTokens`:
+   * per-agent-type subagent bucketing, high-context spend, and API-duration
+   * accumulation. All three are session-level totals like `subagentCostUsd`/
+   * `parentCostUsd` above, so — like those — they still accumulate on a late
+   * arrival even though day bucketing is skipped for one.
+   */
+  private recordAttributionSideEffects(
+    usage: TokenUsage,
+    ctx: TokenRecordContext | undefined,
+    breakdown: CostBreakdown,
+  ): void {
+    if (ctx?.agentId !== undefined && ctx.agentType !== undefined) {
+      const tokens =
+        usage.inputTokens + usage.outputTokens + usage.cacheReadTokens + usage.cacheCreationTokens;
+      const existing = this.subagentByAgentType.get(ctx.agentType);
+      const existingBreakdown = existing?.breakdown;
+      this.subagentByAgentType.set(ctx.agentType, {
+        costUsd: (existing?.costUsd ?? 0) + breakdown.totalUsd,
+        tokens: (existing?.tokens ?? 0) + tokens,
+        count: (existing?.count ?? 0) + 1,
+        durationMs: 0,
+        breakdown: {
+          inputTokens: (existingBreakdown?.inputTokens ?? 0) + usage.inputTokens,
+          outputTokens: (existingBreakdown?.outputTokens ?? 0) + usage.outputTokens,
+          cacheReadTokens: (existingBreakdown?.cacheReadTokens ?? 0) + usage.cacheReadTokens,
+          cacheCreationTokens:
+            (existingBreakdown?.cacheCreationTokens ?? 0) + usage.cacheCreationTokens,
+        },
+      });
+    }
+
+    if (
+      usage.inputTokens + usage.cacheReadTokens + usage.cacheCreationTokens >
+      HIGH_CONTEXT_TOKENS
+    ) {
+      this.highContextCostUsd += breakdown.totalUsd;
+    }
+
+    if (ctx?.responseMs !== undefined) {
+      this.apiDurationMs = (this.apiDurationMs ?? 0) + ctx.responseMs;
+    }
   }
 
   private accumulateTokens(
@@ -193,7 +488,28 @@ export class CostTracker implements Resettable {
     model: string,
     ctx?: TokenRecordContext,
   ): CostBreakdown {
-    const breakdown = calculateCost(model, usage);
+    const { breakdown: rawBreakdown, resolution } = priceModelUsage(model, usage);
+    const tokens =
+      usage.inputTokens +
+      usage.outputTokens +
+      usage.thinkingTokens +
+      usage.cacheReadTokens +
+      usage.cacheCreationTokens;
+    if (tokens > 0) {
+      if (resolution.kind === 'unpriced') {
+        addCallUsage(this.unpricedByModel, model, { calls: 1, tokens });
+      } else if (resolution.source === 'estimated') {
+        addCallUsage(this.estimatedByModel, model, {
+          calls: 1,
+          tokens,
+          estimatedFrom: resolution.estimatedFrom,
+        });
+      }
+    }
+    const breakdown =
+      this.rateMultiplier === 1
+        ? rawBreakdown
+        : scaleCostBreakdown(rawBreakdown, this.rateMultiplier);
     const wallNowMs = Date.now();
 
     // Late-arrival rejection: a `ctx.timestampMs` more than 48h before now is
@@ -226,6 +542,7 @@ export class CostTracker implements Resettable {
       } else {
         this.parentCostUsd += breakdown.totalUsd;
       }
+      this.recordAttributionSideEffects(usage, ctx, breakdown);
       return breakdown;
     }
 
@@ -246,6 +563,7 @@ export class CostTracker implements Resettable {
     } else {
       this.parentCostUsd += breakdown.totalUsd;
     }
+    this.recordAttributionSideEffects(usage, ctx, breakdown);
 
     // Day bucketing
     const dayKey = localDateKey(tsMs);
@@ -272,6 +590,102 @@ export class CostTracker implements Resettable {
     }
 
     return breakdown;
+  }
+
+  /**
+   * Seeds cumulative totals from a previous process's last checkpoint for
+   * this same session. Adds to current state rather than overwriting, so
+   * callers must invoke this at most once per (re)adopted session id, before
+   * any real activity for that id has been recorded here — see the call
+   * sites in `index.ts` for the once-per-id guard.
+   *
+   * Restart data-loss fix: `ParentTranscriptWatcher`'s transcript-read cursor
+   * is durably persisted across process restarts so a resumed session never
+   * re-reads old transcript lines — but this tracker's totals are pure
+   * in-memory state with no equivalent persistence. Without this seed, every
+   * dollar/token attributed to lines a now-dead prior process already
+   * consumed is silently and permanently lost the moment a session gets
+   * paused and resumed (sleep, closing a terminal, `claude --resume`,
+   * a crash) — the longer/more-interrupted the session, the worse the loss.
+   *
+   * `costByWorkflowRunId` IS seeded (additively, per run+day) — this used to
+   * be the one dimension left to reset on restart, but `WorkflowStore`'s
+   * `cost_unknown` flag (see its doc comment in `src/dashboard/workflow-store.ts`)
+   * depends on `hasCostForWorkflowRun()` staying accurate across a restart
+   * too, so it gets the same treatment as everything else here.
+   */
+  seedFromPersisted(seed: CostTrackerSeed): void {
+    const hasAnyTotal =
+      seed.totalCostUsd !== 0 ||
+      seed.totalInputTokens !== 0 ||
+      seed.totalOutputTokens !== 0 ||
+      seed.totalThinkingTokens !== 0 ||
+      seed.totalCacheReadTokens !== 0 ||
+      seed.totalCacheCreationTokens !== 0;
+    if (!hasAnyTotal) return;
+
+    this.totalCostUsd += seed.totalCostUsd;
+    this.subagentCostUsd += seed.subagentCostUsd;
+    this.parentCostUsd += seed.parentCostUsd;
+    this.totalInputTokens += seed.totalInputTokens;
+    this.totalOutputTokens += seed.totalOutputTokens;
+    this.totalThinkingTokens += seed.totalThinkingTokens;
+    this.totalCacheReadTokens += seed.totalCacheReadTokens;
+    this.totalCacheCreationTokens += seed.totalCacheCreationTokens;
+    this.totalCacheSavingsUsd += seed.totalCacheSavingsUsd;
+    this.reportCount += 1;
+    if (seed.byteEstimates !== undefined) {
+      this.hasByteEstimateHistory = true;
+      this.byteEstimateCostUsd += seed.byteEstimates.costUsd;
+      this.byteEstimateInputTokens += seed.byteEstimates.inputTokens;
+      this.byteEstimateOutputTokens += seed.byteEstimates.outputTokens;
+      for (const [model, usd] of Object.entries(seed.byteEstimates.costByModel)) {
+        this.byteEstimateCostByModel.set(
+          model,
+          (this.byteEstimateCostByModel.get(model) ?? 0) + usd,
+        );
+      }
+      for (const [day, usd] of Object.entries(seed.byteEstimates.costByDayUsd)) {
+        this.byteEstimateCostByDay.set(day, (this.byteEstimateCostByDay.get(day) ?? 0) + usd);
+      }
+    }
+
+    for (const [model, usd] of Object.entries(seed.costByModel)) {
+      this.costByModel.set(model, (this.costByModel.get(model) ?? 0) + usd);
+    }
+
+    for (const [model, entry] of Object.entries(seed.unpricedByModel ?? {})) {
+      addCallUsage(this.unpricedByModel, model, entry);
+    }
+    for (const [model, entry] of Object.entries(seed.estimatedByModel ?? {})) {
+      addCallUsage(this.estimatedByModel, model, entry);
+    }
+
+    if (seed.dayCostUsd !== 0) {
+      this.costByDayUsd.set(
+        seed.dayKey,
+        (this.costByDayUsd.get(seed.dayKey) ?? 0) + seed.dayCostUsd,
+      );
+      this.lastMutationMsByDay.set(seed.dayKey, Date.now());
+      const existingFirst = this.firstActivityMsByDay.get(seed.dayKey);
+      if (existingFirst === undefined) {
+        this.firstActivityMsByDay.set(seed.dayKey, Date.now());
+      }
+    }
+    if (seed.daySubagentCostUsd !== 0) {
+      this.subagentCostByDayUsd.set(
+        seed.dayKey,
+        (this.subagentCostByDayUsd.get(seed.dayKey) ?? 0) + seed.daySubagentCostUsd,
+      );
+    }
+
+    for (const [runId, days] of Object.entries(seed.costByWorkflowRunId)) {
+      const runMap = this.costByWorkflowRunId.get(runId) ?? new Map<string, number>();
+      for (const [dayKey, usd] of Object.entries(days)) {
+        runMap.set(dayKey, (runMap.get(dayKey) ?? 0) + usd);
+      }
+      this.costByWorkflowRunId.set(runId, runMap);
+    }
   }
 
   private computeCacheHitRate(): number | null {
@@ -330,6 +744,24 @@ export class CostTracker implements Resettable {
     return total;
   }
 
+  /**
+   * Whether THIS process's live CostTracker has ever observed a token event
+   * for `runId` at all, distinct from `getCostForWorkflowRun()` returning 0.
+   * That 0 is ambiguous: it means either "confirmed $0 spend" or "this
+   * process never personally observed this run's cost" — e.g. in a
+   * `--local` standalone dashboard reading rollups from disk for a run a
+   * different, concurrently-running `--stdio` process is the one actually
+   * paying for. (A sequential process restart for the SAME session no
+   * longer hits this ambiguity — `seedFromPersisted()` rehydrates
+   * `costByWorkflowRunId` from the session's own last checkpoint.)
+   * `WorkflowStore` uses this to distinguish the two so the "Workflow
+   * spend" KPI can flag a total as partial instead of silently treating
+   * "unknown" as "zero".
+   */
+  hasCostForWorkflowRun(runId: string): boolean {
+    return this.costByWorkflowRunId.has(runId);
+  }
+
   /** Iterable view of every (runId, dayKey, usd) tuple — for dashboard joins. */
   *iterCostByWorkflowRun(): IterableIterator<{ runId: string; dayKey: string; usd: number }> {
     for (const [runId, m] of this.costByWorkflowRunId) {
@@ -386,7 +818,6 @@ export class CostTracker implements Resettable {
 
     return {
       sessionTotalCostUsd: hasData ? this.totalCostUsd : null,
-      costByTask: null,
       costByModel: Object.fromEntries(this.costByModel),
       costPerLineOfCode:
         hasData && this.totalLinesChanged > 0 ? this.totalCostUsd / this.totalLinesChanged : null,
@@ -406,10 +837,27 @@ export class CostTracker implements Resettable {
       totalCacheSavingsUsd: this.totalCacheSavingsUsd,
       reportCount: this.reportCount,
       estimationCount: this.estimationCount,
+      ...(this.hasByteEstimateHistory && {
+        byteEstimates: {
+          costUsd: this.byteEstimateCostUsd,
+          inputTokens: this.byteEstimateInputTokens,
+          outputTokens: this.byteEstimateOutputTokens,
+          costByModel: Object.fromEntries(this.byteEstimateCostByModel),
+          costByDayUsd: Object.fromEntries(this.byteEstimateCostByDay),
+        },
+      }),
       latestCostBreakdown: this.latestCostBreakdown,
       subagentCostUsd: this.subagentCostUsd,
       parentCostUsd: this.parentCostUsd,
       costByWorkflowRunId,
+      costByDayUsd: Object.fromEntries(this.costByDayUsd),
+      unpricedByModel: Object.fromEntries(this.unpricedByModel),
+      estimatedByModel: Object.fromEntries(this.estimatedByModel),
+      subagentCostByDayUsd: Object.fromEntries(this.subagentCostByDayUsd),
+      subagentByAgentType: Object.fromEntries(this.subagentByAgentType),
+      highContextCostUsd: this.highContextCostUsd,
+      apiDurationMs: this.apiDurationMs,
+      costRateMultiplierApplied: this.rateMultiplier,
     };
   }
 
@@ -458,6 +906,15 @@ export class CostTracker implements Resettable {
     aggregator.record('ai.cost.estimation_count', this.estimationCount, attrs);
     aggregator.record('ai.cost.subagent_usd', this.subagentCostUsd, attrs);
     aggregator.record('ai.cost.parent_usd', this.parentCostUsd, attrs);
+    for (const [model, entry] of this.unpricedByModel) {
+      aggregator.record('ai.cost.unpriced_calls', entry.calls, { model });
+    }
+    for (const [model, entry] of this.estimatedByModel) {
+      aggregator.record('ai.cost.estimated_calls', entry.calls, {
+        model,
+        estimatedFrom: entry.estimatedFrom,
+      });
+    }
   }
 
   reset(_sessionId: string): void {
@@ -471,10 +928,21 @@ export class CostTracker implements Resettable {
     this.currentModel = null;
     this.reportCount = 0;
     this.estimationCount = 0;
+    this.byteEstimateCostUsd = 0;
+    this.byteEstimateInputTokens = 0;
+    this.byteEstimateOutputTokens = 0;
+    this.byteEstimateCostByModel = new Map();
+    this.byteEstimateCostByDay = new Map();
+    this.hasByteEstimateHistory = false;
     this.latestCostBreakdown = null;
     this.costByModel = new Map();
+    this.unpricedByModel = new Map();
+    this.estimatedByModel = new Map();
     this.costByDayUsd = new Map();
     this.subagentCostByDayUsd = new Map();
+    this.subagentByAgentType = new Map();
+    this.highContextCostUsd = 0;
+    this.apiDurationMs = null;
     this.firstActivityMsByDay = new Map();
     this.costByWorkflowRunId = new Map();
     this.lastMutationMsByDay = new Map();

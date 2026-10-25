@@ -12,19 +12,57 @@
  * task-level data into a single FullSessionSummary.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { createLogger } from '../shared/index.js';
 import { redactSensitive } from '../config.js';
-import { isSyntheticSessionId } from '../hooks/session-resolver.js';
-import type { SessionSummary, ReplayTimelineEntry } from './types.js';
+import { isSyntheticSessionId, type SessionNameSource } from '../hooks/session-resolver.js';
+import { GENERIC_MCP_PLATFORM_NAME } from '../platforms/generic-mcp-adapter.js';
+import type {
+  SessionSummary,
+  ReplayTimelineEntry,
+  SessionAttribution,
+  AttributionFacet,
+  AttributionBucket,
+  TokenBreakdown,
+} from './types.js';
 import type { SessionTracker } from '../metrics/session-tracker.js';
-import type { CostTracker } from '../metrics/cost-tracker.js';
+import type {
+  CostTracker,
+  CostMetrics,
+  ByteEstimateLedger,
+  EstimatedModelUsage,
+  UnpricedModelUsage,
+} from '../metrics/cost-tracker.js';
+import { mergeCallUsageMax, parseCallUsageRecord } from '../metrics/call-usage.js';
+import type {
+  TurnCostAttributor,
+  CostAttributionMetrics,
+} from '../metrics/turn-cost-attributor.js';
 import type { TaskDetector } from '../metrics/task-detector.js';
 import type { AntiPatternDetector } from '../metrics/anti-patterns.js';
-import type { EfficiencyScorer } from '../metrics/efficiency-score.js';
+import type { EfficiencyScorer, EfficiencyScoreComponents } from '../metrics/efficiency-score.js';
 import type { TranscriptMessageTracker } from '../metrics/transcript-message-tracker.js';
 import type { SessionOutcomeRecord } from '../metrics/instruction-drift-tracker.js';
+import type { AntiPattern } from '../metrics/anti-patterns.js';
+import {
+  ToolSelectionScorer,
+  toToolSelectionSummary,
+  type ToolSelectionSummary,
+} from '../metrics/tool-selection-scorer.js';
+import type { ModelUsageTracker, ModelBreakdownEntry } from '../metrics/model-usage-tracker.js';
+import type { QualityProxyTracker } from '../metrics/quality-proxy-tracker.js';
+import {
+  type QualityProxyRawCounts,
+  ZERO_QUALITY_PROXY_COUNTS,
+} from '../metrics/quality-proxy-tracker.js';
 
 const logger = createLogger('session-store');
 
@@ -32,11 +70,55 @@ const logger = createLogger('session-store');
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * One detected anti-pattern occurrence, persisted per incident rather than
+ * grouped by type — the target (`file`/`command`) and the detector's own
+ * per-incident occurrence count (`iterations`/`readCount`/etc., matching
+ * `AntiPattern`) both survive the round-trip to disk.
+ */
+export interface PersistedAntiPattern {
+  readonly type: string;
+  readonly file?: string;
+  readonly command?: string;
+  readonly iterations?: number;
+  readonly readCount?: number;
+  readonly repeatCount?: number;
+  readonly editCount?: number;
+  readonly agentCount?: number;
+}
+
+/**
+ * Maps detector-reported anti-pattern incidents into the persisted/API shape,
+ * redacting `file`/`command` targets the same way other persisted fields are.
+ */
+export function toPersistedAntiPatterns(patterns: readonly AntiPattern[]): PersistedAntiPattern[] {
+  return patterns.map((p) => ({
+    type: p.type,
+    file: p.file !== undefined ? redactSensitive(p.file) : undefined,
+    command: p.command !== undefined ? redactSensitive(p.command) : undefined,
+    iterations: p.iterations,
+    readCount: p.readCount,
+    repeatCount: p.repeatCount,
+    editCount: p.editCount,
+    agentCount: p.agentCount,
+  }));
+}
+
 export interface FullSessionSummary extends SessionSummary {
   readonly sessionName: string | null;
+  /** Which source produced `sessionName` (see SessionNameSource), or null. */
+  readonly sessionNameSource: SessionNameSource | null;
+  /**
+   * The session's originating intent (first user prompt), redacted, or null.
+   * SENSITIVE content: only ever non-null when recordContent was enabled at
+   * capture time (force-disabled under highSecurity). See SessionMetrics.
+   */
+  readonly sessionIntent: string | null;
   readonly repoName: string | null;
   readonly model: string | null;
   readonly toolBreakdown: Record<string, number>;
+  /** Invocation count per skill name, both Skill tool calls and slash commands. */
+  readonly skillBreakdown: Record<string, number>;
   readonly filesRead: string[];
   readonly filesModified: string[];
   readonly linesAdded: number;
@@ -47,6 +129,48 @@ export interface FullSessionSummary extends SessionSummary {
   readonly buildRunCount: number;
   readonly buildPassCount: number;
   readonly estimatedCostUsd: number | null;
+  /**
+   * Portion of estimatedCostUsd attributed to subagent (ctx.agentId) calls —
+   * see CostMetrics.subagentCostUsd. 0 for an older session summary written
+   * before subagent cost was tracked, and for sessions with no subagent
+   * activity.
+   */
+  readonly subagentCostUsd: number;
+  /**
+   * Total cost bucketed by local-day key (`YYYY-MM-DD`), mirrored from
+   * `CostMetrics.costByDayUsd`. The dashboard's "Spend Today" aggregate sums
+   * `costByDayUsd[todayKey]` across sessions — the authoritative today-figure —
+   * instead of pro-rating `estimatedCostUsd` (a lifetime cumulative total) by a
+   * tool-call timeline, which over-attributes a resumed multi-day session's
+   * whole cost to one day. Optional: absent on a session summary written
+   * before this field existed, which falls back to the timeline pro-rate
+   * path in the aggregate route.
+   */
+  readonly costByDayUsd?: Record<string, number>;
+  /** Subagent-attributed cost by local-day key; today-scoped counterpart to
+   * `subagentCostUsd`. Optional for the same backward-compat reason as
+   * `costByDayUsd`. */
+  readonly subagentCostByDayUsd?: Record<string, number>;
+  /**
+   * Calls priced at $0 because the model had no price, per model id. Absent
+   * when every call was priced and on summaries written before this field.
+   */
+  readonly unpricedByModel?: Record<string, UnpricedModelUsage>;
+  /** Calls priced from a sibling model; their cost is in the totals as an estimate. */
+  readonly estimatedByModel?: Record<string, EstimatedModelUsage>;
+  /**
+   * Byte-estimated share of the cost and token totals that a real token report
+   * has not yet replaced (see `ByteEstimateLedger`). Written all-zero once the
+   * report arrives so it overwrites an earlier non-zero copy on merge.
+   */
+  readonly byteEstimates?: ByteEstimateLedger;
+  /**
+   * The totals above without the ledger. `mergeSummaries` max-merges these and
+   * adds the latest ledger back, so a shrinking ledger never competes with
+   * another writer's larger exact total. Absent on summaries written before
+   * this field, where it is derived as total minus ledger.
+   */
+  readonly exactTotals?: ExactTotals;
   readonly tokensInput: number;
   readonly tokensOutput: number;
   readonly tokensThinking: number;
@@ -54,7 +178,31 @@ export interface FullSessionSummary extends SessionSummary {
   readonly tokensCacheCreation: number;
   readonly cacheSavingsUsd: number;
   readonly efficiencyScore: number | null;
-  readonly antiPatterns: Array<{ type: string; count: number }>;
+  /**
+   * Number of individual task scores that fed `efficiencyScore` at save
+   * time — captured from `EfficiencyScorer.getSessionSampleCount()`, which
+   * includes any weight seeded from an earlier restart's checkpoint (not
+   * just fresh-this-process scores). Lets a resumed session re-seed a
+   * weighted average via `EfficiencyScorer.seedFromPersisted()` instead of
+   * losing every pre-restart task's contribution to it. Optional (unlike
+   * most fields on this interface) so the many existing test factories
+   * building `FullSessionSummary` literals don't all need updating for an
+   * additive field — read with `?? 0` at the point of use. 0/absent for an
+   * older session summary written before this field existed, and for
+   * sessions with no scored tasks.
+   */
+  readonly efficiencyScoreSampleCount?: number;
+  /**
+   * Component breakdown backing `efficiencyScore` at save time, captured
+   * from `EfficiencyScorer.getSessionAverage()?.components`. Persisted
+   * alongside `efficiencyScoreSampleCount` so a re-seeded average's
+   * component breakdown is exact, not just its top-level score. Optional
+   * for the same reason as `efficiencyScoreSampleCount` above. null/absent
+   * for an older session summary written before this field existed, and
+   * for sessions with no scored tasks.
+   */
+  readonly efficiencyScoreComponents?: EfficiencyScoreComponents | null;
+  readonly antiPatterns: PersistedAntiPattern[];
   readonly taskCount: number;
   readonly taskSuccessRate: number | null;
   readonly toolSuccessRate: number | null;
@@ -67,6 +215,101 @@ export interface FullSessionSummary extends SessionSummary {
   readonly platform?: string;
   readonly instructionPromptHash?: string | null;
   readonly timeline?: ReplayTimelineEntry[];
+  /**
+   * Tool-selection quality summary for this session, computed once at save
+   * time from the full in-memory ToolCallRecord[] — the only point where
+   * outputSizeBytes (needed for unused-output detection) is still available;
+   * it is never persisted anywhere else, including `timeline` above. null
+   * for an older session summary written before this field existed, and
+   * for sessions with no tool calls.
+   */
+  readonly toolSelectionMetrics: ToolSelectionSummary | null;
+  /**
+   * Raw per-model token/cost counters for this session, keyed by model name.
+   * Captured once at save time from ModelUsageTracker.getRawBreakdown(). Raw
+   * counters only, no derived ratios — see ModelUsageTracker.combineBreakdowns
+   * for why ratios are always recomputed at read time instead of persisted.
+   * `{}` for an older session summary written before this field existed,
+   * and for sessions with no token events.
+   */
+  readonly modelBreakdown: Readonly<Record<string, ModelBreakdownEntry>>;
+  /** Spend sliced by tool, skill, and subagent type, plus high-context spend and API wait time. Absent on legacy files. */
+  readonly attribution?: SessionAttribution;
+  /**
+   * Per-workflow-run cost, split by local-day, keyed by workflow_run_id then
+   * day key — the exact shape `CostMetrics.costByWorkflowRunId` already
+   * produces. Captured once at save time so a resumed session's per-run
+   * spend survives a process restart (see CostTracker.seedFromPersisted()).
+   * `{}` for an older session summary written before this field existed,
+   * and for sessions with no workflow runs.
+   */
+  readonly costByWorkflowRunId: Record<string, Record<string, number>>;
+  /**
+   * Raw quality-proxy signal counts for this session, captured once at save
+   * time from QualityProxyTracker.getRawCounts(). Raw counts only, no derived
+   * rates — see combineQualityProxyRawCounts for why rates are always
+   * recomputed at read time instead of persisted. All-zero
+   * (ZERO_QUALITY_PROXY_COUNTS) for an older session summary written before
+   * this field existed, and for sessions with no quality signals. Nested
+   * (not top-level) specifically to avoid
+   * colliding with the unrelated top-level testPassCount/testRunCount fields
+   * above (total task test runs, not quality-proxy test signals).
+   */
+  readonly qualityProxy: QualityProxyRawCounts;
+}
+
+/**
+ * The subset of a session summary that decides whether it represents real,
+ * attributable work. Deliberately structural and all-optional so the three
+ * callers can pass what they have: a full `FullSessionSummary`, a live
+ * `LocalSessionRollup`, or the narrowed row shape the today-aggregate route
+ * reads off disk.
+ */
+export interface AttributableActivity {
+  readonly toolCallCount?: number;
+  readonly subagentCostUsd?: number;
+  readonly timeline?: ReadonlyArray<unknown>;
+}
+
+/**
+ * Does this summary represent work we can attribute to a real session?
+ *
+ * THE single definition of "not empty" for session persistence. Three call
+ * sites derive from it and must never re-implement it:
+ *   1. `LocalSessionAggregator.toSummaries()` — which rollups get written.
+ *   2. `SessionStore.saveSession()` — which incoming writes may overwrite.
+ *   3. the `/api/sessions/today/aggregate` route — which persisted rows may
+ *      contribute a pro-rated cost when they carry no per-day buckets.
+ *
+ * Subagent spend counts as activity on purpose. A session whose parent process
+ * died while its subagent transcripts were still being tailed has an empty
+ * PARENT timeline and zero parent tool calls (subagent tool calls never appear
+ * there) yet real dollars. Keying only on `toolCallCount` discards exactly the
+ * sessions a `--local` watcher exists to rescue.
+ *
+ * A genuinely empty summary — no tool calls, no subagent dollars, no timeline
+ * — is still false, which is what keeps the empty-clobber guard intact.
+ */
+export function hasAttributableActivity(s: AttributableActivity): boolean {
+  return (
+    (s.toolCallCount ?? 0) > 0 ||
+    (s.subagentCostUsd ?? 0) > 0 ||
+    (Array.isArray(s.timeline) && s.timeline.length > 0)
+  );
+}
+
+/**
+ * Did this session record anything worth a file on disk? Wider than
+ * `hasAttributableActivity`: a chat-only session has no tool calls but real
+ * cost and tokens, and must still be kept. A session with none of these is an
+ * idle MCP process (a window that was opened and never used).
+ */
+function hasRecordedUsage(s: FullSessionSummary): boolean {
+  return (
+    hasAttributableActivity(s) ||
+    (s.estimatedCostUsd ?? 0) > 0 ||
+    (s.tokensInput ?? 0) + (s.tokensOutput ?? 0) + (s.tokensThinking ?? 0) > 0
+  );
 }
 
 export interface SessionFileInfo {
@@ -83,6 +326,384 @@ export interface ListSessionsOptions {
 // ---------------------------------------------------------------------------
 // SessionStore
 // ---------------------------------------------------------------------------
+
+/**
+ * Combine two views of the same session so neither writer can lose the other's
+ * data. Counters take the max rather than the sum: the two processes observe
+ * overlapping (not disjoint) slices of one session, so summing would inflate
+ * and taking the incoming value alone would regress.
+ */
+/**
+ * Merge two `SessionAttribution` snapshots facet-by-facet, key-by-key,
+ * taking a field-wise max on each bucket's four numbers — the same
+ * no-single-writer-loses-data rule as `modelBreakdown` above. `undefined`
+ * on either side is treated as an empty attribution rather than short-
+ * circuiting, so a session that only recently gained a `turnCostAttributor`
+ * still merges cleanly against an earlier write that had none.
+ */
+function mergeTokenBreakdown(
+  a: TokenBreakdown | undefined,
+  b: TokenBreakdown | undefined,
+): TokenBreakdown | undefined {
+  if (!a && !b) return undefined;
+  const maxNum = (x: number | undefined, y: number | undefined): number => Math.max(x ?? 0, y ?? 0);
+  return {
+    inputTokens: maxNum(a?.inputTokens, b?.inputTokens),
+    outputTokens: maxNum(a?.outputTokens, b?.outputTokens),
+    cacheReadTokens: maxNum(a?.cacheReadTokens, b?.cacheReadTokens),
+    cacheCreationTokens: maxNum(a?.cacheCreationTokens, b?.cacheCreationTokens),
+  };
+}
+
+function mergeAttribution(
+  existing: SessionAttribution | undefined,
+  incoming: SessionAttribution | undefined,
+): SessionAttribution | undefined {
+  if (!existing && !incoming) return undefined;
+  const maxNum = (a: number | undefined, b: number | undefined): number => Math.max(a ?? 0, b ?? 0);
+  const maxNullable = (
+    a: number | null | undefined,
+    b: number | null | undefined,
+  ): number | null => (a == null && b == null ? null : Math.max(a ?? 0, b ?? 0));
+
+  const a = existing ?? { buckets: {}, highContextCostUsd: 0, apiDurationMs: null };
+  const b = incoming ?? { buckets: {}, highContextCostUsd: 0, apiDurationMs: null };
+  const facets = new Set<AttributionFacet>([
+    ...(Object.keys(a.buckets) as AttributionFacet[]),
+    ...(Object.keys(b.buckets) as AttributionFacet[]),
+  ]);
+  const buckets: Partial<Record<AttributionFacet, Record<string, AttributionBucket>>> = {};
+  for (const facet of facets) {
+    const facetA = a.buckets[facet] ?? {};
+    const facetB = b.buckets[facet] ?? {};
+    const keys = new Set([...Object.keys(facetA), ...Object.keys(facetB)]);
+    const merged: Record<string, AttributionBucket> = {};
+    for (const key of keys) {
+      const ba = facetA[key];
+      const bb = facetB[key];
+      const breakdown = mergeTokenBreakdown(ba?.breakdown, bb?.breakdown);
+      merged[key] = {
+        costUsd: maxNum(ba?.costUsd, bb?.costUsd),
+        tokens: maxNum(ba?.tokens, bb?.tokens),
+        count: maxNum(ba?.count, bb?.count),
+        durationMs: maxNum(ba?.durationMs, bb?.durationMs),
+        ...(breakdown ? { breakdown } : {}),
+      };
+    }
+    if (Object.keys(merged).length > 0) buckets[facet] = merged;
+  }
+
+  return {
+    buckets,
+    highContextCostUsd: maxNum(a.highContextCostUsd, b.highContextCostUsd),
+    apiDurationMs: maxNullable(a.apiDurationMs, b.apiDurationMs),
+  };
+}
+
+// Mirrors the cap SessionTracker/LocalSessionAggregator apply when building a
+// timeline pre-merge — a merged timeline should not grow past what either
+// side could have produced on its own.
+const MAX_TIMELINE_ENTRIES = 10_000;
+
+/**
+ * Union two timelines instead of picking whichever is longer. A Claude Code
+ * `--stdio` resume starts the new process with an empty in-memory timeline;
+ * under longest-wins, every checkpoint the new process writes loses the merge
+ * race to the old process's on-disk timeline until it outgrows it, silently
+ * dropping entries from whichever side was shorter. Entries are deduped by
+ * `(timestamp, toolName)` — no toolUseId is carried on `ReplayTimelineEntry`,
+ * but two distinct real tool calls sharing a millisecond timestamp and tool
+ * name is not a case that occurs in practice.
+ */
+function mergeTimeline(
+  existing: readonly ReplayTimelineEntry[] | undefined,
+  incoming: readonly ReplayTimelineEntry[] | undefined,
+): ReplayTimelineEntry[] | undefined {
+  if (existing === undefined && incoming === undefined) return undefined;
+  const byKey = new Map<string, ReplayTimelineEntry>();
+  for (const entry of [...(existing ?? []), ...(incoming ?? [])]) {
+    byKey.set(`${entry.timestamp}:${entry.toolName}`, entry);
+  }
+  const merged = [...byKey.values()].sort((a, b) => a.timestamp - b.timestamp);
+  return merged.length > MAX_TIMELINE_ENTRIES
+    ? merged.slice(merged.length - MAX_TIMELINE_ENTRIES)
+    : merged;
+}
+
+/** Exact-only (non-byte-estimated) share of the cost and token totals. */
+export interface ExactTotals {
+  readonly costUsd: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly costByDayUsd: Readonly<Record<string, number>>;
+}
+
+/**
+ * `exactTotals` as stored, or derived as total minus ledger for a summary that
+ * predates the field. A merged total cannot be split afterwards (the file does
+ * not record which writer's figure won the max), so writers persist the split.
+ */
+function exactTotalsOf(s: FullSessionSummary): ExactTotals {
+  if (s.exactTotals) return s.exactTotals;
+  const ledger = s.byteEstimates;
+  return {
+    costUsd: Math.max(0, (s.estimatedCostUsd ?? 0) - (ledger?.costUsd ?? 0)),
+    inputTokens: Math.max(0, (s.tokensInput ?? 0) - (ledger?.inputTokens ?? 0)),
+    outputTokens: Math.max(0, (s.tokensOutput ?? 0) - (ledger?.outputTokens ?? 0)),
+    costByDayUsd: subtractRecord(s.costByDayUsd ?? {}, ledger?.costByDayUsd ?? {}),
+  };
+}
+
+/** Per-key `a + b` over the union of keys. */
+function addRecord(
+  a: Readonly<Record<string, number>>,
+  b: Readonly<Record<string, number>>,
+): Record<string, number> {
+  const out: Record<string, number> = { ...a };
+  for (const [k, v] of Object.entries(b)) out[k] = (out[k] ?? 0) + v;
+  return out;
+}
+
+/** Per-key `a - b`, clamped at zero. */
+function subtractRecord(
+  a: Readonly<Record<string, number>>,
+  b: Readonly<Record<string, number>>,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(a)) out[k] = Math.max(0, v - (b[k] ?? 0));
+  return out;
+}
+
+export function mergeSummaries(
+  existing: FullSessionSummary,
+  incoming: FullSessionSummary,
+): FullSessionSummary {
+  const maxNum = (a: unknown, b: unknown): number =>
+    Math.max(typeof a === 'number' ? a : 0, typeof b === 'number' ? b : 0);
+  const mergeCounts = (
+    a: Record<string, number> = {},
+    b: Record<string, number> = {},
+  ): Record<string, number> => {
+    const out: Record<string, number> = { ...a };
+    for (const [k, v] of Object.entries(b)) out[k] = Math.max(out[k] ?? 0, v);
+    return out;
+  };
+  const union = (a: string[] = [], b: string[] = []): string[] => [...new Set([...a, ...b])];
+  // efficiencyScore/efficiencyScoreSampleCount/efficiencyScoreComponents must
+  // always come from the SAME side, atomically — EfficiencyScorer.
+  // seedFromPersisted() treats sampleCount as a weight multiplier
+  // (score * sampleCount), not just a display field, so merging the three
+  // independently (e.g. taking the newer score but the max sampleCount) can
+  // attach a thin/unrelated sample count to a completely different score,
+  // radically over- or under-weighting it on the next re-seed. When only one
+  // side has a real score, that side wins outright (this is what makes an
+  // unseeded write never erase a real prior score). When both do, the side
+  // with the larger sampleCount wins — the more statistically meaningful one.
+  const mergeEfficiencyScoreTriple = (
+    existing: FullSessionSummary,
+    incoming: FullSessionSummary,
+  ): Pick<
+    FullSessionSummary,
+    'efficiencyScore' | 'efficiencyScoreSampleCount' | 'efficiencyScoreComponents'
+  > => {
+    const existingHasScore = existing.efficiencyScore !== null;
+    const incomingHasScore = incoming.efficiencyScore !== null;
+    const winner =
+      existingHasScore && incomingHasScore
+        ? (incoming.efficiencyScoreSampleCount ?? 0) >= (existing.efficiencyScoreSampleCount ?? 0)
+          ? incoming
+          : existing
+        : incomingHasScore
+          ? incoming
+          : existing;
+    return {
+      efficiencyScore: winner.efficiencyScore,
+      efficiencyScoreSampleCount: winner.efficiencyScoreSampleCount ?? 0,
+      efficiencyScoreComponents: winner.efficiencyScoreComponents ?? null,
+    };
+  };
+  /**
+   * Per-key max, preserving absence. `mergeCounts` already takes the per-key
+   * max; the wrapper exists because `{}` and `undefined` are DIFFERENT values
+   * to the today-aggregate route (an absent map falls back to the timeline
+   * pro-rate; a present-but-empty one reads as an authoritative $0), so two
+   * bucket-less legacy summaries must merge to `undefined`, not to `{}`.
+   */
+  const mergeDayMap = (
+    a: Record<string, number> | undefined,
+    b: Record<string, number> | undefined,
+  ): Record<string, number> | undefined =>
+    a === undefined && b === undefined ? undefined : mergeCounts(a, b);
+  // The ledger is latest-wins and shrinks when a real report replaces it, so
+  // only the exact-only totals are max-merged; the merged ledger is added back
+  // on top. A max over the estimate-laden totals would keep the stale estimate.
+  const mergedLedger = incoming.byteEstimates ?? existing.byteEstimates;
+  const existingExact = exactTotalsOf(existing);
+  const incomingExact = exactTotalsOf(incoming);
+  const exactTotals: ExactTotals = {
+    costUsd: Math.max(existingExact.costUsd, incomingExact.costUsd),
+    inputTokens: Math.max(existingExact.inputTokens, incomingExact.inputTokens),
+    outputTokens: Math.max(existingExact.outputTokens, incomingExact.outputTokens),
+    costByDayUsd: mergeCounts(existingExact.costByDayUsd, incomingExact.costByDayUsd),
+  };
+  const estimatedCostUsd =
+    existing.estimatedCostUsd === null && incoming.estimatedCostUsd === null
+      ? null
+      : exactTotals.costUsd + (mergedLedger?.costUsd ?? 0);
+  const costByDayUsd =
+    existing.costByDayUsd === undefined && incoming.costByDayUsd === undefined
+      ? undefined
+      : addRecord(exactTotals.costByDayUsd, mergedLedger?.costByDayUsd ?? {});
+  const subagentCostByDayUsd = mergeDayMap(
+    existing.subagentCostByDayUsd,
+    incoming.subagentCostByDayUsd,
+  );
+
+  const unpricedByModel = mergeCallUsageMax(existing.unpricedByModel, incoming.unpricedByModel);
+  const estimatedByModel = mergeCallUsageMax(existing.estimatedByModel, incoming.estimatedByModel);
+  // Latest writer wins, not max: the ledger shrinks to zero when a real report
+  // replaces it, and a max-merge would resurrect the stale estimate.
+  const byteEstimates = mergedLedger;
+
+  const mergeCostByWorkflowRunId = (
+    a: Record<string, Record<string, number>> = {},
+    b: Record<string, Record<string, number>> = {},
+  ): Record<string, Record<string, number>> => {
+    const out: Record<string, Record<string, number>> = { ...a };
+    for (const [runId, dayCosts] of Object.entries(b)) {
+      out[runId] = mergeCounts(out[runId], dayCosts);
+    }
+    return out;
+  };
+
+  const modelBreakdown: Record<string, ModelBreakdownEntry> = { ...existing.modelBreakdown };
+  for (const [model, entry] of Object.entries(incoming.modelBreakdown ?? {})) {
+    const prev = modelBreakdown[model];
+    modelBreakdown[model] = prev
+      ? {
+          requestCount: Math.max(prev.requestCount, entry.requestCount),
+          totalInputTokens: Math.max(prev.totalInputTokens, entry.totalInputTokens),
+          totalOutputTokens: Math.max(prev.totalOutputTokens, entry.totalOutputTokens),
+          totalCostUsd: Math.max(prev.totalCostUsd, entry.totalCostUsd),
+          totalCacheReadTokens: Math.max(prev.totalCacheReadTokens, entry.totalCacheReadTokens),
+          totalCacheCreationTokens: Math.max(
+            prev.totalCacheCreationTokens,
+            entry.totalCacheCreationTokens,
+          ),
+          totalThinkingTokens: Math.max(prev.totalThinkingTokens, entry.totalThinkingTokens),
+        }
+      : entry;
+  }
+
+  const qa = existing.qualityProxy ?? ZERO_QUALITY_PROXY_COUNTS;
+  const qb = incoming.qualityProxy ?? ZERO_QUALITY_PROXY_COUNTS;
+  const qualityProxy: QualityProxyRawCounts = {
+    totalSignals: maxNum(qa.totalSignals, qb.totalSignals),
+    diffApplyCleanCount: maxNum(qa.diffApplyCleanCount, qb.diffApplyCleanCount),
+    diffFailCount: maxNum(qa.diffFailCount, qb.diffFailCount),
+    testPassCount: maxNum(qa.testPassCount, qb.testPassCount),
+    testFailCount: maxNum(qa.testFailCount, qb.testFailCount),
+    backtrackCount: maxNum(qa.backtrackCount, qb.backtrackCount),
+    selfCorrectionCount: maxNum(qa.selfCorrectionCount, qb.selfCorrectionCount),
+  };
+
+  // Keep whichever tool-selection score saw more of the session; it is scored
+  // from an ordered record list that cannot be meaningfully merged field-wise.
+  const toolSelectionMetrics =
+    (incoming.toolSelectionMetrics?.totalCalls ?? 0) >=
+    (existing.toolSelectionMetrics?.totalCalls ?? 0)
+      ? (incoming.toolSelectionMetrics ?? existing.toolSelectionMetrics)
+      : existing.toolSelectionMetrics;
+
+  const timeline = mergeTimeline(existing.timeline, incoming.timeline);
+
+  const startTime = Math.min(
+    existing.startTime || incoming.startTime,
+    incoming.startTime || existing.startTime,
+  );
+  const endTime = maxNum(existing.endTime, incoming.endTime);
+
+  return {
+    ...existing,
+    ...incoming,
+    startTime,
+    endTime,
+    durationMs: Math.max(0, endTime - startTime),
+    toolCallCount: maxNum(existing.toolCallCount, incoming.toolCallCount),
+    sessionName: incoming.sessionName ?? existing.sessionName,
+    // Tie the source to whichever name won above so a name/source desync can't
+    // arise (incoming spreads a null source alongside a null name). The
+    // in-process tracker already enforces the no-downgrade invariant on
+    // `incoming`, so taking incoming's name+source when present is safe.
+    sessionNameSource: incoming.sessionName
+      ? incoming.sessionNameSource
+      : existing.sessionNameSource,
+    // Never clobber a previously-captured intent with a later intent-less write
+    // (e.g. a checkpoint saved before the name/intent was resolved, or a run
+    // with recordContent off).
+    sessionIntent: incoming.sessionIntent ?? existing.sessionIntent,
+    repoName: incoming.repoName ?? existing.repoName,
+    model: incoming.model ?? existing.model,
+    // A later generic-labeled checkpoint (e.g. an aggregator restarted
+    // without env signals) must not clobber a real platform label.
+    platform:
+      incoming.platform && incoming.platform !== GENERIC_MCP_PLATFORM_NAME
+        ? incoming.platform
+        : (existing.platform ?? incoming.platform),
+    instructionPromptHash: incoming.instructionPromptHash ?? existing.instructionPromptHash,
+    toolBreakdown: mergeCounts(existing.toolBreakdown, incoming.toolBreakdown),
+    skillBreakdown: mergeCounts(existing.skillBreakdown, incoming.skillBreakdown),
+    filesRead: union(existing.filesRead, incoming.filesRead),
+    filesModified: union(existing.filesModified, incoming.filesModified),
+    linesAdded: maxNum(existing.linesAdded, incoming.linesAdded),
+    linesRemoved: maxNum(existing.linesRemoved, incoming.linesRemoved),
+    bashCommandCount: maxNum(existing.bashCommandCount, incoming.bashCommandCount),
+    testRunCount: maxNum(existing.testRunCount, incoming.testRunCount),
+    testPassCount: maxNum(existing.testPassCount, incoming.testPassCount),
+    buildRunCount: maxNum(existing.buildRunCount, incoming.buildRunCount),
+    buildPassCount: maxNum(existing.buildPassCount, incoming.buildPassCount),
+    estimatedCostUsd,
+    subagentCostUsd: maxNum(existing.subagentCostUsd, incoming.subagentCostUsd),
+    ...(costByDayUsd !== undefined ? { costByDayUsd } : {}),
+    ...(subagentCostByDayUsd !== undefined ? { subagentCostByDayUsd } : {}),
+    ...(unpricedByModel !== undefined ? { unpricedByModel } : {}),
+    ...(estimatedByModel !== undefined ? { estimatedByModel } : {}),
+    ...(byteEstimates !== undefined ? { byteEstimates } : {}),
+    exactTotals,
+    tokensInput: exactTotals.inputTokens + (mergedLedger?.inputTokens ?? 0),
+    tokensOutput: exactTotals.outputTokens + (mergedLedger?.outputTokens ?? 0),
+    tokensThinking: maxNum(existing.tokensThinking, incoming.tokensThinking),
+    tokensCacheRead: maxNum(existing.tokensCacheRead, incoming.tokensCacheRead),
+    tokensCacheCreation: maxNum(existing.tokensCacheCreation, incoming.tokensCacheCreation),
+    cacheSavingsUsd: maxNum(existing.cacheSavingsUsd, incoming.cacheSavingsUsd),
+    ...mergeEfficiencyScoreTriple(existing, incoming),
+    costByWorkflowRunId: mergeCostByWorkflowRunId(
+      existing.costByWorkflowRunId,
+      incoming.costByWorkflowRunId,
+    ),
+    taskCount: maxNum(existing.taskCount, incoming.taskCount),
+    taskSuccessRate: incoming.taskSuccessRate ?? existing.taskSuccessRate,
+    toolSuccessRate: incoming.toolSuccessRate ?? existing.toolSuccessRate,
+    contextCompressions: maxNum(existing.contextCompressions, incoming.contextCompressions),
+    agentSpawns: maxNum(existing.agentSpawns, incoming.agentSpawns),
+    userMessages: maxNum(existing.userMessages, incoming.userMessages),
+    assistantMessages: maxNum(existing.assistantMessages, incoming.assistantMessages),
+    userCorrections: maxNum(existing.userCorrections, incoming.userCorrections),
+    antiPatterns:
+      (incoming.antiPatterns?.length ?? 0) >= (existing.antiPatterns?.length ?? 0)
+        ? incoming.antiPatterns
+        : existing.antiPatterns,
+    outcome:
+      incoming.outcome === 'completed' || existing.outcome !== 'completed'
+        ? incoming.outcome
+        : existing.outcome,
+    ...(timeline ? { timeline } : {}),
+    toolSelectionMetrics,
+    modelBreakdown,
+    qualityProxy,
+    attribution: mergeAttribution(existing.attribution, incoming.attribution),
+  };
+}
 
 export class SessionStore {
   private readonly sessionsDir: string;
@@ -105,39 +726,99 @@ export class SessionStore {
       mkdirSync(this.sessionsDir, { recursive: true, mode: 0o700 });
     }
 
-    const startDate = new Date(summary.startTime);
+    // Look up any existing file for this sessionId BEFORE deciding the
+    // filename — by sessionId alone, not by today's date-prefixed path. A
+    // session can already have a file under an EARLIER date than this
+    // write's own startTime computes (e.g. a `--local`/synthetic-owner
+    // process rolling up a session it only started observing after a date
+    // boundary — see LocalSessionAggregator). Deciding the filename from
+    // `summary.startTime` alone before merging, then merging in whatever
+    // file happens to share the sessionId regardless of date, wrote the
+    // merged (inflated, since counters take the max) result to a NEW file
+    // while leaving the OLD file on disk untouched — the session then
+    // appeared twice in history with overlapping, double-counted totals.
+    const existingWithPath = this.loadSessionWithPath(summary.sessionId);
+
+    // Every MCP server process checkpoints every 30s, including windows that
+    // never saw a tool call or a token. Writing those first-time files filled
+    // history with model-less zero-activity rows that dragged down every
+    // per-session average. An existing file is handled by the guard below.
+    if (!existingWithPath && !hasRecordedUsage(summary)) {
+      logger.debug('Skipping first write of a session with no recorded usage', {
+        sessionId: summary.sessionId,
+      });
+      return;
+    }
+
+    // A second process saving under the same sessionId (e.g. two MCP
+    // servers both resumed/forked against one real session ID) would
+    // otherwise silently overwrite the first save with no error.
+    //
+    // Guard the destructive case: a short-lived process that adopts an
+    // existing session ID (resolved from the session-by-cwd breadcrumb) but
+    // never observed any hook activity would replace a fully recorded session
+    // with an all-zero summary, erasing tool calls, tokens and cost from the
+    // dashboard on the next refresh. Never let an empty summary clobber a
+    // non-empty one; other collisions keep the previous last-write-wins
+    // behaviour with a warning.
+    let toWrite: FullSessionSummary = summary;
+    if (existingWithPath) {
+      const { summary: existing } = existingWithPath;
+      if (hasAttributableActivity(existing) && !hasAttributableActivity(summary)) {
+        logger.warn('Refusing to overwrite recorded session with an empty summary', {
+          sessionId: summary.sessionId,
+        });
+        return;
+      }
+      // Two processes legitimately share one session id: the CLI/editor
+      // spawns an MCP engine that owns the session natively, while a
+      // `--local` dashboard adopts the same id from the session-by-cwd
+      // breadcrumb. Each sees only part of the picture — the engine has the
+      // token/model events, the dashboard has the aggregated hook activity —
+      // so plain last-write-wins let whichever wrote last erase the other's
+      // data, which is how a fully recorded session could come back with
+      // modelBreakdown {} and a lower toolCallCount. Merge non-destructively
+      // instead: counters take the max (they only ever grow, so max never
+      // regresses and never double-counts overlapping views).
+      toWrite = mergeSummaries(existing, summary);
+    }
+
+    // The filename is derived from the merged (earliest) startTime, not the
+    // incoming write's own — mergeSummaries() takes Math.min() of the two,
+    // so this is normally the existing file's own date; recomputing here
+    // keeps the filename consistent with what's actually written.
+    const startDate = new Date(toWrite.startTime);
     if (!isFinite(startDate.getTime())) {
-      throw new Error(`Invalid startTime for session ${summary.sessionId}: ${summary.startTime}`);
+      throw new Error(`Invalid startTime for session ${toWrite.sessionId}: ${toWrite.startTime}`);
     }
     const date = startDate.toISOString().slice(0, 10);
-    const filename = `${date}_${summary.sessionId}.json`;
+    const filename = `${date}_${toWrite.sessionId}.json`;
     const filepath = resolve(this.sessionsDir, filename);
     if (!filepath.startsWith(this.sessionsDir + sep)) {
       throw new Error(`Session path escaped storage directory: ${filepath}`);
     }
 
-    // A second process saving under the same sessionId+date (e.g. two MCP
-    // servers both resumed/forked against one real session ID) would
-    // otherwise silently overwrite the first save with no error. This
-    // warning makes that cross-process collision visible instead of a
-    // silent last-write-wins; the overwrite itself is unchanged.
-    if (existsSync(filepath)) {
-      logger.warn(
-        'Overwriting existing session file — possible cross-process sessionId collision',
-        {
-          sessionId: summary.sessionId,
-          filename,
-        },
-      );
-    }
-
     try {
-      writeFileSync(filepath, JSON.stringify(summary, null, 2) + '\n', { mode: 0o600 });
-      logger.debug('Session saved', { sessionId: summary.sessionId, filename });
+      writeFileSync(filepath, JSON.stringify(toWrite, null, 2) + '\n', { mode: 0o600 });
+      // The merge landed on a different filename than where the existing
+      // record lived (a date-rollover case) — remove the now-superseded
+      // file so the session isn't left duplicated across two files.
+      if (existingWithPath && existingWithPath.filepath !== filepath) {
+        try {
+          unlinkSync(existingWithPath.filepath);
+        } catch (err) {
+          logger.warn('Failed to remove superseded session file after merge', {
+            sessionId: toWrite.sessionId,
+            stalePath: existingWithPath.filepath,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      logger.debug('Session saved', { sessionId: toWrite.sessionId, filename });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.warn('Failed to save session file', {
-        sessionId: summary.sessionId,
+        sessionId: toWrite.sessionId,
         filename,
         error: message,
       });
@@ -145,20 +826,28 @@ export class SessionStore {
   }
 
   loadSession(sessionId: string): FullSessionSummary | null {
+    return this.loadSessionWithPath(sessionId)?.summary ?? null;
+  }
+
+  /** Like loadSession(), but also returns the file path it was loaded from — used by saveSession() to detect and clean up a stale file after a merge relocates a session to a different filename. */
+  private loadSessionWithPath(
+    sessionId: string,
+  ): { summary: FullSessionSummary; filepath: string } | null {
     if (!existsSync(this.sessionsDir)) return null;
 
     for (const file of readdirSync(this.sessionsDir)) {
       if (!file.endsWith('.json')) continue;
       if (parseSessionFilename(file)?.sessionId !== sessionId) continue;
 
+      const filepath = join(this.sessionsDir, file);
       try {
-        const raw = readFileSync(join(this.sessionsDir, file), 'utf-8');
+        const raw = readFileSync(filepath, 'utf-8');
         const session = deserializeSession(raw);
         if (session === null) {
           logger.warn('Failed to deserialize session file', { file });
           return null;
         }
-        return session;
+        return { summary: session, filepath };
       } catch {
         logger.warn('Failed to read session file', { file });
       }
@@ -276,10 +965,14 @@ export class SessionStore {
 export interface BuildSessionSummarySources {
   sessionTracker: SessionTracker;
   costTracker?: CostTracker;
+  turnCostAttributor?: TurnCostAttributor;
   taskDetector?: TaskDetector;
   antiPatternDetector?: AntiPatternDetector;
   efficiencyScorer?: EfficiencyScorer;
   transcriptMessageTracker?: TranscriptMessageTracker;
+  toolSelectionScorer?: ToolSelectionScorer;
+  modelUsageTracker?: ModelUsageTracker;
+  qualityProxyTracker?: QualityProxyTracker;
   developer: string;
   repoName?: string | null;
   /**
@@ -294,6 +987,85 @@ export interface BuildSessionSummarySources {
   instructionPromptHash?: string | null;
 }
 
+function skillInvocationCounts(
+  metrics: CostAttributionMetrics | undefined,
+): Record<string, number> {
+  if (!metrics) return {};
+  const result: Record<string, number> = {};
+  for (const [skillName, entry] of Object.entries(metrics.costBySkill)) {
+    result[skillName] = entry.callCount;
+  }
+  return result;
+}
+
+/**
+ * Assemble `SessionAttribution` from the turn attributor's tool/skill
+ * buckets and the cost tracker's subagent/high-context/API-duration fields.
+ * Facets with no entries are omitted entirely rather than persisted as `{}`.
+ */
+function buildAttribution(
+  turnMetrics: CostAttributionMetrics | null,
+  costMetrics: CostMetrics | null,
+): SessionAttribution {
+  const buckets: Partial<Record<AttributionFacet, Record<string, AttributionBucket>>> = {};
+
+  if (turnMetrics) {
+    const toolBuckets: Record<string, AttributionBucket> = {};
+    for (const [tool, entry] of Object.entries(turnMetrics.costByToolType)) {
+      const hasTokenSignal =
+        entry.inputTokens > 0 ||
+        entry.outputTokens > 0 ||
+        entry.cacheReadTokens > 0 ||
+        entry.cacheCreationTokens > 0;
+      toolBuckets[tool] = {
+        costUsd: entry.totalCost,
+        tokens: entry.tokens,
+        count: entry.callCount,
+        durationMs: 0,
+        ...(hasTokenSignal
+          ? {
+              breakdown: {
+                inputTokens: entry.inputTokens,
+                outputTokens: entry.outputTokens,
+                cacheReadTokens: entry.cacheReadTokens,
+                cacheCreationTokens: entry.cacheCreationTokens,
+              },
+            }
+          : {}),
+      };
+    }
+    if (Object.keys(toolBuckets).length > 0) buckets.tool = toolBuckets;
+
+    const skillBuckets: Record<string, AttributionBucket> = {};
+    for (const [skill, entry] of Object.entries(turnMetrics.costBySkill)) {
+      skillBuckets[skill] = {
+        costUsd: entry.totalCost,
+        tokens: entry.tokens,
+        count: entry.callCount,
+        durationMs: entry.totalDurationMs,
+        breakdown: {
+          inputTokens: entry.inputTokens,
+          outputTokens: entry.outputTokens,
+          cacheReadTokens: entry.cacheReadTokens,
+          cacheCreationTokens: entry.cacheCreationTokens,
+        },
+      };
+    }
+    if (Object.keys(skillBuckets).length > 0) buckets.skill = skillBuckets;
+  }
+
+  const subagentBuckets = costMetrics?.subagentByAgentType;
+  if (subagentBuckets && Object.keys(subagentBuckets).length > 0) {
+    buckets.subagent = { ...subagentBuckets };
+  }
+
+  return {
+    buckets,
+    highContextCostUsd: costMetrics?.highContextCostUsd ?? 0,
+    apiDurationMs: costMetrics?.apiDurationMs ?? null,
+  };
+}
+
 export function buildSessionSummary(sources: BuildSessionSummarySources): FullSessionSummary {
   const {
     sessionTracker,
@@ -306,6 +1078,11 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
 
   const sessionMetrics = sessionTracker.getMetrics();
   const costMetrics = costTracker?.getMetrics() ?? null;
+  const turnAttributionMetrics = sources.turnCostAttributor?.getMetrics() ?? null;
+  const attribution =
+    sources.costTracker || sources.turnCostAttributor
+      ? buildAttribution(turnAttributionMetrics, costMetrics)
+      : undefined;
   const taskMetrics = taskDetector?.getMetrics() ?? null;
   const transcriptMessageMetrics = sources.transcriptMessageTracker?.getMetrics();
 
@@ -338,6 +1115,21 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
       totalAgentSpawns += task.subAgentsSpawned;
       allToolCalls.push(...task.toolCalls);
     }
+
+    // Fold in pre-restart totals recovered by TaskDetector.seedFromPersisted()
+    // — see TaskMetrics.seededAggregate's doc comment for why these can't be
+    // represented as a synthetic entry in completedTasks above.
+    if (taskMetrics.seededAggregate) {
+      for (const f of taskMetrics.seededAggregate.filesRead) allFilesRead.add(f);
+      for (const f of taskMetrics.seededAggregate.filesModified) allFilesModified.add(f);
+      totalLinesAdded += taskMetrics.seededAggregate.linesAdded;
+      totalLinesRemoved += taskMetrics.seededAggregate.linesRemoved;
+      totalTestsRun += taskMetrics.seededAggregate.testsRun;
+      totalTestsPassed += taskMetrics.seededAggregate.testsPassed;
+      totalBuildsRun += taskMetrics.seededAggregate.buildRun;
+      totalBuildsPassed += taskMetrics.seededAggregate.buildPassed;
+      totalAgentSpawns += taskMetrics.seededAggregate.agentSpawns;
+    }
   }
 
   // Anti-pattern analysis
@@ -346,16 +1138,18 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
       ? antiPatternDetector.analyze(allToolCalls)
       : null;
 
-  const antiPatterns: Array<{ type: string; count: number }> = [];
-  if (antiPatternResults) {
-    const grouped = new Map<string, number>();
-    for (const p of antiPatternResults.patterns) {
-      grouped.set(p.type, (grouped.get(p.type) ?? 0) + 1);
-    }
-    for (const [type, count] of grouped) {
-      antiPatterns.push({ type, count });
-    }
-  }
+  const antiPatterns: PersistedAntiPattern[] = antiPatternResults
+    ? toPersistedAntiPatterns(antiPatternResults.patterns)
+    : [];
+
+  // Tool-selection quality: same allToolCalls used for anti-pattern analysis
+  // above, still holding real outputSizeBytes at this point — see the
+  // ToolSelectionSummary doc comment on FullSessionSummary for why this is
+  // the only place that's true.
+  const toolSelectionResult =
+    sources.toolSelectionScorer && allToolCalls.length > 0
+      ? toToolSelectionSummary(sources.toolSelectionScorer.scoreSession(allToolCalls))
+      : null;
 
   // Efficiency score
   const efficiencyAvg = efficiencyScorer?.getSessionAverage() ?? null;
@@ -372,10 +1166,15 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
     success: tc.success,
     filePath: tc.filePath ? redactSensitive(String(tc.filePath)) : undefined,
     command: tc.command ? redactSensitive(String(tc.command)) : undefined,
+    cwd: tc.cwd ? redactSensitive(String(tc.cwd)) : undefined,
     isTestCommand: (tc.isTestCommand as boolean | undefined) || undefined,
     isBuildCommand: (tc.isBuildCommand as boolean | undefined) || undefined,
     isLintCommand: (tc.isLintCommand as boolean | undefined) || undefined,
     errorType: tc.errorType || undefined,
+    skillName: tc.toolName === 'Skill' && tc.skillName ? tc.skillName : undefined,
+    agentType: tc.toolName === 'Agent' && tc.agentType ? tc.agentType : undefined,
+    createdPrNumber: tc.createdPrNumber,
+    runInBackground: tc.runInBackground === true || undefined,
   }));
 
   const now = Date.now();
@@ -383,6 +1182,14 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
   return {
     sessionId: sessionMetrics.sessionId,
     sessionName: sessionMetrics.sessionName ? redactSensitive(sessionMetrics.sessionName) : null,
+    // Source is an enum label (not user content) — persisted unredacted.
+    sessionNameSource: sessionMetrics.sessionNameSource ?? null,
+    // Intent is SENSITIVE content; the tracker only holds a value when
+    // recordContent was on, and it is already redacted there. Redact again
+    // (idempotent) so persistence is safe regardless of caller.
+    sessionIntent: sessionMetrics.sessionIntent
+      ? redactSensitive(sessionMetrics.sessionIntent)
+      : null,
     repoName: sources.repoName ? redactSensitive(sources.repoName) : null,
     startTime: sessionMetrics.sessionStartTime,
     endTime: now,
@@ -393,6 +1200,9 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
     developer,
     model: costMetrics?.model ?? null,
     toolBreakdown: { ...sessionMetrics.toolCallCountByTool },
+    skillBreakdown: skillInvocationCounts(
+      sources.turnCostAttributor?.getMetrics(sessionMetrics.sessionId),
+    ),
     filesRead: [...allFilesRead].sort().map((f) => redactSensitive(f)),
     filesModified: [...allFilesModified].sort().map((f) => redactSensitive(f)),
     linesAdded: totalLinesAdded,
@@ -403,6 +1213,40 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
     buildRunCount: totalBuildsRun,
     buildPassCount: totalBuildsPassed,
     estimatedCostUsd: costMetrics?.sessionTotalCostUsd ?? null,
+    subagentCostUsd: costMetrics?.subagentCostUsd ?? 0,
+    costByDayUsd: costMetrics?.costByDayUsd ?? {},
+    subagentCostByDayUsd: costMetrics?.subagentCostByDayUsd ?? {},
+    ...(costMetrics && Object.keys(costMetrics.unpricedByModel).length > 0
+      ? { unpricedByModel: costMetrics.unpricedByModel }
+      : {}),
+    ...(costMetrics && Object.keys(costMetrics.estimatedByModel).length > 0
+      ? { estimatedByModel: costMetrics.estimatedByModel }
+      : {}),
+    ...(costMetrics?.byteEstimates !== undefined
+      ? { byteEstimates: costMetrics.byteEstimates }
+      : {}),
+    ...(costMetrics?.byteEstimates !== undefined
+      ? {
+          exactTotals: {
+            costUsd: Math.max(
+              0,
+              (costMetrics.sessionTotalCostUsd ?? 0) - costMetrics.byteEstimates.costUsd,
+            ),
+            inputTokens: Math.max(
+              0,
+              costMetrics.totalInputTokens - costMetrics.byteEstimates.inputTokens,
+            ),
+            outputTokens: Math.max(
+              0,
+              costMetrics.totalOutputTokens - costMetrics.byteEstimates.outputTokens,
+            ),
+            costByDayUsd: subtractRecord(
+              costMetrics.costByDayUsd,
+              costMetrics.byteEstimates.costByDayUsd,
+            ),
+          },
+        }
+      : {}),
     tokensInput: costMetrics?.totalInputTokens ?? 0,
     tokensOutput: costMetrics?.totalOutputTokens ?? 0,
     tokensThinking: costMetrics?.totalThinkingTokens ?? 0,
@@ -410,6 +1254,8 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
     tokensCacheCreation: costMetrics?.totalCacheCreationTokens ?? 0,
     cacheSavingsUsd: costMetrics?.totalCacheSavingsUsd ?? 0,
     efficiencyScore: efficiencyAvg?.score ?? null,
+    efficiencyScoreSampleCount: efficiencyScorer?.getSessionSampleCount() ?? 0,
+    efficiencyScoreComponents: efficiencyAvg?.components ?? null,
     antiPatterns,
     taskCount: (taskMetrics?.totalTasksCompleted ?? 0) + (taskMetrics?.currentTaskActive ? 1 : 0),
     taskSuccessRate,
@@ -423,6 +1269,11 @@ export function buildSessionSummary(sources: BuildSessionSummarySources): FullSe
     platform: sources.platform,
     instructionPromptHash: sources.instructionPromptHash ?? null,
     timeline: timeline.length > 0 ? timeline : undefined,
+    toolSelectionMetrics: toolSelectionResult,
+    modelBreakdown: sources.modelUsageTracker?.getRawBreakdown() ?? {},
+    costByWorkflowRunId: costMetrics?.costByWorkflowRunId ?? {},
+    qualityProxy: sources.qualityProxyTracker?.getRawCounts() ?? ZERO_QUALITY_PROXY_COUNTS,
+    attribution,
   };
 }
 
@@ -447,7 +1298,7 @@ export function sessionSummaryToDriftRecord(
     timestamp: summary.endTime,
     successRate: summary.taskSuccessRate,
     totalTokens: summary.tokensInput + summary.tokensOutput,
-    thrashingIncidents: summary.antiPatterns.find((p) => p.type === 'thrashing')?.count ?? 0,
+    thrashingIncidents: summary.antiPatterns.filter((p) => p.type === 'thrashing').length,
     taskCount: summary.taskCount,
     avgEfficiency: summary.efficiencyScore,
   };
@@ -472,6 +1323,8 @@ function formatDate(date: Date): string {
 interface SerializedFullSessionSummary {
   readonly sessionId?: unknown;
   readonly sessionName?: unknown;
+  readonly sessionNameSource?: unknown;
+  readonly sessionIntent?: unknown;
   readonly repoName?: unknown;
   readonly startTime?: unknown;
   readonly endTime?: unknown;
@@ -480,6 +1333,7 @@ interface SerializedFullSessionSummary {
   readonly developer?: unknown;
   readonly model?: unknown;
   readonly toolBreakdown?: Record<string, unknown>;
+  readonly skillBreakdown?: Record<string, unknown>;
   readonly filesRead?: unknown[];
   readonly filesModified?: unknown[];
   readonly linesAdded?: unknown;
@@ -490,6 +1344,13 @@ interface SerializedFullSessionSummary {
   readonly buildRunCount?: unknown;
   readonly buildPassCount?: unknown;
   readonly estimatedCostUsd?: unknown;
+  readonly subagentCostUsd?: unknown;
+  readonly costByDayUsd?: unknown;
+  readonly subagentCostByDayUsd?: unknown;
+  readonly unpricedByModel?: unknown;
+  readonly estimatedByModel?: unknown;
+  readonly byteEstimates?: unknown;
+  readonly exactTotals?: unknown;
   readonly tokensInput?: unknown;
   readonly tokensOutput?: unknown;
   readonly tokensThinking?: unknown;
@@ -497,6 +1358,8 @@ interface SerializedFullSessionSummary {
   readonly tokensCacheCreation?: unknown;
   readonly cacheSavingsUsd?: unknown;
   readonly efficiencyScore?: unknown;
+  readonly efficiencyScoreSampleCount?: unknown;
+  readonly efficiencyScoreComponents?: Record<string, unknown>;
   readonly antiPatterns?: Array<Record<string, unknown>>;
   readonly taskCount?: unknown;
   readonly taskSuccessRate?: unknown;
@@ -510,6 +1373,159 @@ interface SerializedFullSessionSummary {
   readonly platform?: unknown;
   readonly instructionPromptHash?: unknown;
   readonly timeline?: Array<Record<string, unknown>>;
+  readonly toolSelectionMetrics?: unknown;
+  readonly modelBreakdown?: Record<string, unknown>;
+  readonly costByWorkflowRunId?: Record<string, unknown>;
+  readonly qualityProxy?: Record<string, unknown>;
+  readonly attribution?: Record<string, unknown>;
+}
+
+/**
+ * Accept a breakdown only when all four fields are finite numbers; any other
+ * shape is dropped (the bucket itself still parses, just without a
+ * breakdown) rather than partially hydrated.
+ */
+function parseTokenBreakdown(raw: unknown): TokenBreakdown | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  const { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens } = r;
+  if (
+    typeof inputTokens === 'number' &&
+    Number.isFinite(inputTokens) &&
+    typeof outputTokens === 'number' &&
+    Number.isFinite(outputTokens) &&
+    typeof cacheReadTokens === 'number' &&
+    Number.isFinite(cacheReadTokens) &&
+    typeof cacheCreationTokens === 'number' &&
+    Number.isFinite(cacheCreationTokens)
+  ) {
+    return { inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens };
+  }
+  return undefined;
+}
+
+/**
+ * Accept a bucket only when all four core fields are finite numbers; any
+ * other shape is dropped rather than partially hydrated. Used to parse each
+ * key of every facet in an on-disk `SessionAttribution.buckets`. `breakdown`
+ * is optional and validated separately — a malformed breakdown drops only
+ * itself, never the bucket (see `parseTokenBreakdown`).
+ */
+function parseAttributionBucket(raw: unknown): AttributionBucket | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  const { costUsd, tokens, count, durationMs } = r;
+  if (
+    typeof costUsd === 'number' &&
+    Number.isFinite(costUsd) &&
+    typeof tokens === 'number' &&
+    Number.isFinite(tokens) &&
+    typeof count === 'number' &&
+    Number.isFinite(count) &&
+    typeof durationMs === 'number' &&
+    Number.isFinite(durationMs)
+  ) {
+    const breakdown = parseTokenBreakdown(r.breakdown);
+    return { costUsd, tokens, count, durationMs, ...(breakdown ? { breakdown } : {}) };
+  }
+  return undefined;
+}
+
+/**
+ * Parse an on-disk `attribution` field. Returns undefined when the field is
+ * absent or not an object (a legacy session summary written before this
+ * field existed), so it loads unchanged. Invalid facet keys/buckets are
+ * dropped individually rather than invalidating the whole field.
+ */
+function parseAttribution(raw: unknown): SessionAttribution | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Record<string, unknown>;
+  const rawBuckets = r.buckets;
+  const buckets: Partial<Record<AttributionFacet, Record<string, AttributionBucket>>> = {};
+  if (typeof rawBuckets === 'object' && rawBuckets !== null) {
+    for (const facet of ['tool', 'skill', 'subagent'] as const) {
+      const facetRaw = (rawBuckets as Record<string, unknown>)[facet];
+      if (typeof facetRaw !== 'object' || facetRaw === null) continue;
+      const facetBuckets: Record<string, AttributionBucket> = {};
+      for (const [key, bucketRaw] of Object.entries(facetRaw as Record<string, unknown>)) {
+        const bucket = parseAttributionBucket(bucketRaw);
+        if (bucket) facetBuckets[key] = bucket;
+      }
+      if (Object.keys(facetBuckets).length > 0) buckets[facet] = facetBuckets;
+    }
+  }
+  return {
+    buckets,
+    highContextCostUsd:
+      typeof r.highContextCostUsd === 'number' && Number.isFinite(r.highContextCostUsd)
+        ? r.highContextCostUsd
+        : 0,
+    apiDurationMs:
+      typeof r.apiDurationMs === 'number' && Number.isFinite(r.apiDurationMs)
+        ? r.apiDurationMs
+        : null,
+  };
+}
+
+/**
+ * Parse an untrusted value into a `Record<string, number>`, dropping any
+ * non-finite or non-numeric entries. Used to hydrate the per-day cost maps
+ * (`costByDayUsd` / `subagentCostByDayUsd`) from disk. Returns undefined when
+ * the value is absent or not an object, so a session summary that predates
+ * these keys leaves the field undefined and falls through to the aggregate
+ * route's timeline pro-rate fallback.
+ */
+function parseNumberRecord(value: unknown): Record<string, number> | undefined {
+  // Reject arrays too (typeof [] === 'object'): a corrupt `costByDayUsd: [5]`
+  // must yield undefined so the aggregate route falls through to the timeline
+  // pro-rate path, not a bogus `{ '0': 5 }` map that silently reads as $0 today.
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
+  }
+  return out;
+}
+
+const MAX_MODEL_ID_LENGTH = 256;
+
+function parseByteEstimates(value: unknown): ByteEstimateLedger | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  const finite = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  return {
+    costUsd: finite(obj.costUsd),
+    inputTokens: finite(obj.inputTokens),
+    outputTokens: finite(obj.outputTokens),
+    costByModel: parseNumberRecord(obj.costByModel) ?? {},
+    costByDayUsd: parseNumberRecord(obj.costByDayUsd) ?? {},
+  };
+}
+
+function parseExactTotals(value: unknown): ExactTotals | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  const finite = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  return {
+    costUsd: finite(obj.costUsd),
+    inputTokens: finite(obj.inputTokens),
+    outputTokens: finite(obj.outputTokens),
+    costByDayUsd: parseNumberRecord(obj.costByDayUsd) ?? {},
+  };
+}
+
+function parseUnpricedByModel(value: unknown): Record<string, UnpricedModelUsage> | undefined {
+  return parseCallUsageRecord<UnpricedModelUsage>(value, () => ({}));
+}
+
+function parseEstimatedByModel(value: unknown): Record<string, EstimatedModelUsage> | undefined {
+  return parseCallUsageRecord<EstimatedModelUsage>(value, ({ estimatedFrom }) =>
+    typeof estimatedFrom === 'string' &&
+    estimatedFrom.length > 0 &&
+    estimatedFrom.length <= MAX_MODEL_ID_LENGTH
+      ? { estimatedFrom }
+      : null,
+  );
 }
 
 /**
@@ -527,22 +1543,175 @@ export function deserializeFullSessionSummary(
     }
   }
 
-  const antiPatterns: Array<{ type: string; count: number }> = [];
+  const skillBreakdown = Object.create(null) as Record<string, number>;
+  if (typeof obj.skillBreakdown === 'object' && obj.skillBreakdown !== null) {
+    for (const [k, v] of Object.entries(obj.skillBreakdown)) {
+      if (typeof v === 'number') skillBreakdown[k] = v;
+    }
+  }
+
+  // Legacy on-disk files only ever have the old `{type, count}` shape —
+  // `count` meant "distinct entries of this type" and carried no target
+  // info. Every downstream consumer (trend analysis, weekly summaries,
+  // thrashing-incident counts) counts array entries rather than reading a
+  // magnitude field, so a legacy entry is expanded back into `count`
+  // separate rows of that type here, leaving `file`/`command`/etc.
+  // undefined for those older records — that keeps "one array entry = one
+  // incident" true for both legacy and current on-disk shapes.
+  const antiPatterns: PersistedAntiPattern[] = [];
   if (Array.isArray(obj.antiPatterns)) {
     for (const ap of obj.antiPatterns) {
       if (typeof ap === 'object' && ap !== null) {
         const a = ap;
-        if (typeof a.type === 'string' && typeof a.count === 'number') {
-          antiPatterns.push({ type: a.type, count: a.count });
+        if (typeof a.type !== 'string') continue;
+        const hasMagnitudeField =
+          typeof a.iterations === 'number' ||
+          typeof a.readCount === 'number' ||
+          typeof a.repeatCount === 'number' ||
+          typeof a.editCount === 'number' ||
+          typeof a.agentCount === 'number';
+        if (!hasMagnitudeField && typeof a.count === 'number') {
+          const legacyCount = Math.max(0, Math.trunc(a.count));
+          for (let i = 0; i < legacyCount; i++) {
+            antiPatterns.push({ type: a.type });
+          }
+          continue;
         }
+        antiPatterns.push({
+          type: a.type,
+          file: typeof a.file === 'string' ? a.file : undefined,
+          command: typeof a.command === 'string' ? a.command : undefined,
+          iterations: typeof a.iterations === 'number' ? a.iterations : undefined,
+          readCount: typeof a.readCount === 'number' ? a.readCount : undefined,
+          repeatCount: typeof a.repeatCount === 'number' ? a.repeatCount : undefined,
+          editCount: typeof a.editCount === 'number' ? a.editCount : undefined,
+          agentCount: typeof a.agentCount === 'number' ? a.agentCount : undefined,
+        });
       }
     }
   }
+
+  const toolSelectionMetrics: ToolSelectionSummary | null = (() => {
+    const t = obj.toolSelectionMetrics;
+    if (typeof t !== 'object' || t === null) return null;
+    const r = t as Record<string, unknown>;
+    if (
+      typeof r.score !== 'number' ||
+      typeof r.totalCalls !== 'number' ||
+      typeof r.penalizedCalls !== 'number' ||
+      typeof r.redundantReadCount !== 'number' ||
+      typeof r.repeatedFailureCount !== 'number' ||
+      typeof r.unusedOutputCount !== 'number'
+    ) {
+      return null;
+    }
+    return {
+      score: r.score,
+      totalCalls: r.totalCalls,
+      penalizedCalls: r.penalizedCalls,
+      redundantReadCount: r.redundantReadCount,
+      repeatedFailureCount: r.repeatedFailureCount,
+      unusedOutputCount: r.unusedOutputCount,
+    };
+  })();
+
+  const modelBreakdown: Record<string, ModelBreakdownEntry> = {};
+  if (typeof obj.modelBreakdown === 'object' && obj.modelBreakdown !== null) {
+    for (const [model, entry] of Object.entries(obj.modelBreakdown)) {
+      if (typeof entry !== 'object' || entry === null) continue;
+      const e = entry as Record<string, unknown>;
+      if (
+        typeof e.requestCount === 'number' &&
+        typeof e.totalInputTokens === 'number' &&
+        typeof e.totalOutputTokens === 'number' &&
+        typeof e.totalCostUsd === 'number'
+      ) {
+        modelBreakdown[model] = {
+          requestCount: e.requestCount,
+          totalInputTokens: e.totalInputTokens,
+          totalOutputTokens: e.totalOutputTokens,
+          totalCostUsd: e.totalCostUsd,
+          totalCacheReadTokens:
+            typeof e.totalCacheReadTokens === 'number' ? e.totalCacheReadTokens : 0,
+          totalCacheCreationTokens:
+            typeof e.totalCacheCreationTokens === 'number' ? e.totalCacheCreationTokens : 0,
+          totalThinkingTokens:
+            typeof e.totalThinkingTokens === 'number' ? e.totalThinkingTokens : 0,
+        };
+      }
+    }
+  }
+
+  const costByWorkflowRunId: Record<string, Record<string, number>> = {};
+  if (typeof obj.costByWorkflowRunId === 'object' && obj.costByWorkflowRunId !== null) {
+    for (const [runId, dayMap] of Object.entries(obj.costByWorkflowRunId)) {
+      if (typeof dayMap !== 'object' || dayMap === null) continue;
+      const days: Record<string, number> = {};
+      for (const [dayKey, usd] of Object.entries(dayMap)) {
+        if (typeof usd === 'number') days[dayKey] = usd;
+      }
+      costByWorkflowRunId[runId] = days;
+    }
+  }
+
+  const qualityProxy: QualityProxyRawCounts = (() => {
+    const q = obj.qualityProxy;
+    if (typeof q !== 'object' || q === null) return ZERO_QUALITY_PROXY_COUNTS;
+    const r = q as Record<string, unknown>;
+    if (
+      typeof r.totalSignals !== 'number' ||
+      typeof r.diffApplyCleanCount !== 'number' ||
+      typeof r.diffFailCount !== 'number' ||
+      typeof r.testPassCount !== 'number' ||
+      typeof r.testFailCount !== 'number' ||
+      typeof r.backtrackCount !== 'number' ||
+      typeof r.selfCorrectionCount !== 'number'
+    ) {
+      return ZERO_QUALITY_PROXY_COUNTS;
+    }
+    return {
+      totalSignals: r.totalSignals,
+      diffApplyCleanCount: r.diffApplyCleanCount,
+      diffFailCount: r.diffFailCount,
+      testPassCount: r.testPassCount,
+      testFailCount: r.testFailCount,
+      backtrackCount: r.backtrackCount,
+      selfCorrectionCount: r.selfCorrectionCount,
+    };
+  })();
+
+  const efficiencyScoreComponents: EfficiencyScoreComponents | null = (() => {
+    const c = obj.efficiencyScoreComponents;
+    if (typeof c !== 'object' || c === null) return null;
+    const r = c as Record<string, unknown>;
+    if (
+      typeof r.speed !== 'number' ||
+      typeof r.correctness !== 'number' ||
+      typeof r.autonomy !== 'number' ||
+      typeof r.firstAttemptQuality !== 'number'
+    ) {
+      return null;
+    }
+    return {
+      speed: r.speed,
+      correctness: r.correctness,
+      autonomy: r.autonomy,
+      firstAttemptQuality: r.firstAttemptQuality,
+    };
+  })();
 
   return {
     sessionId:
       typeof obj.sessionId === 'string' && obj.sessionId.length > 0 ? obj.sessionId : 'unknown',
     sessionName: typeof obj.sessionName === 'string' ? obj.sessionName : null,
+    sessionNameSource:
+      obj.sessionNameSource === 'user' ||
+      obj.sessionNameSource === 'ai-title' ||
+      obj.sessionNameSource === 'auto' ||
+      obj.sessionNameSource === 'cwd'
+        ? obj.sessionNameSource
+        : null,
+    sessionIntent: typeof obj.sessionIntent === 'string' ? obj.sessionIntent : null,
     repoName: typeof obj.repoName === 'string' ? obj.repoName : null,
     startTime: typeof obj.startTime === 'number' ? obj.startTime : 0,
     endTime: typeof obj.endTime === 'number' ? obj.endTime : 0,
@@ -551,6 +1720,7 @@ export function deserializeFullSessionSummary(
     developer: typeof obj.developer === 'string' ? obj.developer : 'unknown',
     model: typeof obj.model === 'string' ? obj.model : null,
     toolBreakdown,
+    skillBreakdown,
     filesRead: Array.isArray(obj.filesRead)
       ? obj.filesRead.filter((f): f is string => typeof f === 'string')
       : [],
@@ -565,6 +1735,13 @@ export function deserializeFullSessionSummary(
     buildRunCount: typeof obj.buildRunCount === 'number' ? obj.buildRunCount : 0,
     buildPassCount: typeof obj.buildPassCount === 'number' ? obj.buildPassCount : 0,
     estimatedCostUsd: typeof obj.estimatedCostUsd === 'number' ? obj.estimatedCostUsd : null,
+    subagentCostUsd: typeof obj.subagentCostUsd === 'number' ? obj.subagentCostUsd : 0,
+    costByDayUsd: parseNumberRecord(obj.costByDayUsd),
+    subagentCostByDayUsd: parseNumberRecord(obj.subagentCostByDayUsd),
+    unpricedByModel: parseUnpricedByModel(obj.unpricedByModel),
+    estimatedByModel: parseEstimatedByModel(obj.estimatedByModel),
+    byteEstimates: parseByteEstimates(obj.byteEstimates),
+    exactTotals: parseExactTotals(obj.exactTotals),
     tokensInput: typeof obj.tokensInput === 'number' ? obj.tokensInput : 0,
     tokensOutput: typeof obj.tokensOutput === 'number' ? obj.tokensOutput : 0,
     tokensThinking: typeof obj.tokensThinking === 'number' ? obj.tokensThinking : 0,
@@ -572,6 +1749,9 @@ export function deserializeFullSessionSummary(
     tokensCacheCreation: typeof obj.tokensCacheCreation === 'number' ? obj.tokensCacheCreation : 0,
     cacheSavingsUsd: typeof obj.cacheSavingsUsd === 'number' ? obj.cacheSavingsUsd : 0,
     efficiencyScore: typeof obj.efficiencyScore === 'number' ? obj.efficiencyScore : null,
+    efficiencyScoreSampleCount:
+      typeof obj.efficiencyScoreSampleCount === 'number' ? obj.efficiencyScoreSampleCount : 0,
+    efficiencyScoreComponents,
     antiPatterns,
     taskCount: typeof obj.taskCount === 'number' ? obj.taskCount : 0,
     taskSuccessRate: typeof obj.taskSuccessRate === 'number' ? obj.taskSuccessRate : null,
@@ -601,12 +1781,25 @@ export function deserializeFullSessionSummary(
             success: typeof e.success === 'boolean' ? e.success : true,
             filePath: typeof e.filePath === 'string' ? e.filePath : undefined,
             command: typeof e.command === 'string' ? e.command : undefined,
+            cwd: typeof e.cwd === 'string' ? e.cwd : undefined,
             isTestCommand: typeof e.isTestCommand === 'boolean' ? e.isTestCommand : undefined,
             isBuildCommand: typeof e.isBuildCommand === 'boolean' ? e.isBuildCommand : undefined,
             isLintCommand: typeof e.isLintCommand === 'boolean' ? e.isLintCommand : undefined,
             errorType: typeof e.errorType === 'string' ? e.errorType : undefined,
+            skillName: typeof e.skillName === 'string' ? e.skillName : undefined,
+            agentType: typeof e.agentType === 'string' ? e.agentType : undefined,
+            createdPrNumber:
+              typeof e.createdPrNumber === 'string' && /^\d{1,9}$/.test(e.createdPrNumber)
+                ? e.createdPrNumber
+                : undefined,
+            runInBackground: e.runInBackground === true || undefined,
           }))
       : undefined,
+    toolSelectionMetrics,
+    modelBreakdown,
+    costByWorkflowRunId,
+    qualityProxy,
+    attribution: parseAttribution(obj.attribution),
   };
 }
 

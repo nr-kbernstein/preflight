@@ -6,16 +6,25 @@ import {
   SessionStore,
   buildSessionSummary,
   deserializeFullSessionSummary,
+  hasAttributableActivity,
+  mergeSummaries,
   sessionSummaryToDriftRecord,
 } from './session-store.js';
 import type { FullSessionSummary } from './session-store.js';
 import type { SessionTracker } from '../metrics/session-tracker.js';
 import { CostTracker } from '../metrics/cost-tracker.js';
+import { buildCostTrackerSeed } from '../metrics/cost-tracker-seed.js';
 import type { CostMetrics } from '../metrics/cost-tracker.js';
 import type { TaskDetector } from '../metrics/task-detector.js';
+import type { AntiPatternDetector } from '../metrics/anti-patterns.js';
 import type { EfficiencyScorer } from '../metrics/efficiency-score.js';
 import type { TranscriptMessageTracker } from '../metrics/transcript-message-tracker.js';
 import type { SessionOutcomeRecord } from '../metrics/instruction-drift-tracker.js';
+import { ToolSelectionScorer, toToolSelectionSummary } from '../metrics/tool-selection-scorer.js';
+import type { ModelUsageTracker } from '../metrics/model-usage-tracker.js';
+import type { QualityProxyTracker } from '../metrics/quality-proxy-tracker.js';
+import { ZERO_QUALITY_PROXY_COUNTS } from '../metrics/quality-proxy-tracker.js';
+import type { TurnCostAttributor } from '../metrics/turn-cost-attributor.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let tmpDir: string;
@@ -41,6 +50,8 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
   return {
     sessionId: `sess-${now}`,
     sessionName: 'my-project',
+    sessionNameSource: null,
+    sessionIntent: null,
     repoName: null,
     startTime: now - 60_000,
     endTime: now,
@@ -49,6 +60,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     developer: 'alice',
     model: 'claude-sonnet-4-20250514',
     toolBreakdown: { Read: 5, Edit: 3, Bash: 2 },
+    skillBreakdown: {},
     filesRead: ['/src/index.ts'],
     filesModified: ['/src/index.ts'],
     linesAdded: 20,
@@ -59,6 +71,7 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     buildRunCount: 1,
     buildPassCount: 1,
     estimatedCostUsd: 0.05,
+    subagentCostUsd: 0,
     tokensInput: 5000,
     tokensOutput: 2000,
     tokensThinking: 1000,
@@ -66,6 +79,10 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     tokensCacheCreation: 0,
     cacheSavingsUsd: 0,
     efficiencyScore: 0.75,
+    toolSelectionMetrics: null,
+    modelBreakdown: {},
+    costByWorkflowRunId: {},
+    qualityProxy: { ...ZERO_QUALITY_PROXY_COUNTS },
     antiPatterns: [],
     taskCount: 1,
     taskSuccessRate: 1,
@@ -79,6 +96,32 @@ function makeSummary(overrides?: Partial<FullSessionSummary>): FullSessionSummar
     ...overrides,
   };
 }
+
+describe('hasAttributableActivity', () => {
+  it('is false for a genuinely empty summary (no tool calls, no subagent cost, no timeline)', () => {
+    expect(hasAttributableActivity({ toolCallCount: 0, subagentCostUsd: 0, timeline: [] })).toBe(
+      false,
+    );
+  });
+
+  it('is true when toolCallCount is positive', () => {
+    expect(hasAttributableActivity({ toolCallCount: 1 })).toBe(true);
+  });
+
+  it('is true when subagentCostUsd is positive even with zero tool calls', () => {
+    expect(hasAttributableActivity({ toolCallCount: 0, subagentCostUsd: 0.01 })).toBe(true);
+  });
+
+  it('is true when the timeline has entries even with zero tool calls and zero subagent cost', () => {
+    expect(hasAttributableActivity({ toolCallCount: 0, subagentCostUsd: 0, timeline: [{}] })).toBe(
+      true,
+    );
+  });
+
+  it('treats every field as optional, defaulting each to its empty value', () => {
+    expect(hasAttributableActivity({})).toBe(false);
+  });
+});
 
 describe('instructionPromptHash field', () => {
   it('buildSessionSummary sets instructionPromptHash from sources', () => {
@@ -129,12 +172,110 @@ describe('instructionPromptHash field', () => {
     expect(roundTripped.instructionPromptHash).toBe('hash-xyz');
   });
 
-  it('deserializeFullSessionSummary defaults instructionPromptHash to null when field is missing (pre-fix session files)', () => {
+  it('deserializeFullSessionSummary defaults instructionPromptHash to null when the field is missing', () => {
     const summary = makeSummary();
     const raw = JSON.parse(JSON.stringify(summary)) as Record<string, unknown>;
     delete raw.instructionPromptHash;
     const roundTripped = deserializeFullSessionSummary(raw);
     expect(roundTripped.instructionPromptHash).toBeNull();
+  });
+
+  it('deserializeFullSessionSummary round-trips timeline[].cwd', () => {
+    // Without this field surviving a disk round-trip, a session read back via
+    // loadAllSessions()/loadSession() (any window wider than what a process
+    // already holds live) can never attribute its git activity to a
+    // worktree — replaySessionToActivityRecords resolves identity from this
+    // field, and it silently fell back to 'unattributed' for every historical
+    // session before this test existed.
+    const summary = makeSummary({
+      timeline: [
+        {
+          timestamp: Date.now(),
+          toolName: 'Bash',
+          durationMs: 50,
+          success: true,
+          command: 'git commit -m "x"',
+          cwd: '/Users/alice/repo/.claude/worktrees/feature-a',
+        },
+      ],
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(summary)) as Record<string, unknown>,
+    );
+    expect(roundTripped.timeline?.[0]?.cwd).toBe('/Users/alice/repo/.claude/worktrees/feature-a');
+  });
+});
+
+describe('skillBreakdown field', () => {
+  it('buildSessionSummary reads skillBreakdown from turnCostAttributor.getMetrics().costBySkill', () => {
+    const sessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'sess-skill',
+        sessionName: null,
+        sessionStartTime: Date.now(),
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        bashCommandsRun: 0,
+        toolSuccessRate: null,
+      }),
+    } as unknown as SessionTracker;
+    const turnCostAttributor = {
+      getMetrics: () => ({
+        turns: [],
+        costByToolType: {},
+        costBySkill: {
+          'pstack:poteto-mode': { callCount: 3 },
+          simplify: { callCount: 1 },
+        },
+        totalAttributedCost: 0,
+        attributionRate: 0,
+      }),
+    } as unknown as TurnCostAttributor;
+
+    const summary = buildSessionSummary({ sessionTracker, turnCostAttributor, developer: 'dev1' });
+
+    expect(summary.skillBreakdown).toEqual({ 'pstack:poteto-mode': 3, simplify: 1 });
+  });
+
+  it('buildSessionSummary defaults skillBreakdown to {} when no turnCostAttributor is passed', () => {
+    const sessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'sess-skill-none',
+        sessionName: null,
+        sessionStartTime: Date.now(),
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        bashCommandsRun: 0,
+        toolSuccessRate: null,
+      }),
+    } as unknown as SessionTracker;
+
+    const summary = buildSessionSummary({ sessionTracker, developer: 'dev1' });
+
+    expect(summary.skillBreakdown).toEqual({});
+  });
+
+  it('mergeSummaries merges skillBreakdown with the same max-per-key, union-of-keys semantics mergeCounts gives toolBreakdown', () => {
+    const existing = makeSummary({ skillBreakdown: { simplify: 5, 'code-review': 2 } });
+    const incoming = makeSummary({ skillBreakdown: { simplify: 3, 'pstack:how': 4 } });
+
+    const merged = mergeSummaries(existing, incoming);
+
+    expect(merged.skillBreakdown).toEqual({ simplify: 5, 'code-review': 2, 'pstack:how': 4 });
+  });
+
+  it('deserializeFullSessionSummary defaults skillBreakdown to {} when the field is missing', () => {
+    const raw = JSON.parse(JSON.stringify(makeSummary())) as Record<string, unknown>;
+    delete raw.skillBreakdown;
+
+    expect(deserializeFullSessionSummary(raw).skillBreakdown).toEqual({});
+  });
+
+  it('deserializeFullSessionSummary drops non-number values from skillBreakdown', () => {
+    const raw = JSON.parse(JSON.stringify(makeSummary())) as Record<string, unknown>;
+    raw.skillBreakdown = { simplify: 3, 'code-review': 'not-a-number' };
+
+    expect(deserializeFullSessionSummary(raw).skillBreakdown).toEqual({ simplify: 3 });
   });
 });
 
@@ -154,7 +295,11 @@ describe('sessionSummaryToDriftRecord', () => {
       tokensOutput: 500,
       taskCount: 4,
       efficiencyScore: 0.9,
-      antiPatterns: [{ type: 'thrashing', count: 3 }],
+      antiPatterns: [
+        { type: 'thrashing', file: 'a.ts' },
+        { type: 'thrashing', file: 'b.ts' },
+        { type: 'thrashing', file: 'c.ts' },
+      ],
     });
 
     const record = sessionSummaryToDriftRecord(summary) as SessionOutcomeRecord;
@@ -173,11 +318,203 @@ describe('sessionSummaryToDriftRecord', () => {
   it('defaults thrashingIncidents to 0 when no thrashing anti-pattern is present', () => {
     const summary = makeSummary({
       instructionPromptHash: 'hash-456',
-      antiPatterns: [{ type: 're_reading', count: 2 }],
+      antiPatterns: [{ type: 're_reading', file: 'x.ts' }],
     });
 
     const record = sessionSummaryToDriftRecord(summary) as SessionOutcomeRecord;
     expect(record.thrashingIncidents).toBe(0);
+  });
+});
+
+describe('buildSessionSummary anti-patterns', () => {
+  const mockSessionTracker = {
+    getMetrics: () => ({
+      sessionId: 'ap-session',
+      sessionStartTime: 1_700_000_000_000,
+      sessionDurationMs: 10_000,
+      toolCallCount: 1,
+      toolCallCountByTool: { Edit: 1 },
+      toolDurationMsByTool: {},
+      toolSuccessRate: 1,
+      toolSuccessRateByTool: {},
+      toolErrorCount: 0,
+      toolErrorsByType: {},
+      uniqueFilesRead: 0,
+      uniqueFilesWritten: 1,
+      bashCommandsRun: 0,
+      bashExitCodes: {},
+      searchQueries: 0,
+      toolCallTimeline: [],
+    }),
+  };
+
+  const mockTaskDetector = {
+    getCurrentTask: () => null,
+    getMetrics: () => ({
+      totalTasksCompleted: 1,
+      currentTaskActive: false,
+      currentTaskToolCalls: 0,
+      averageTaskDurationMs: 10_000,
+      averageToolCallsPerTask: 1,
+      completedTasks: [
+        {
+          taskId: 't1',
+          startTime: 1_700_000_000_000,
+          endTime: 1_700_000_010_000,
+          durationMs: 10_000,
+          toolCallCount: 1,
+          toolCallsByType: { Edit: 1 },
+          filesRead: [],
+          filesModified: ['/src/auth.ts'],
+          linesChanged: 2,
+          linesAdded: 2,
+          linesRemoved: 0,
+          bashCommandsRun: 0,
+          testsRun: 0,
+          testsPassed: 0,
+          buildRun: 0,
+          buildPassed: 0,
+          estimatedCostUsd: 0.01,
+          tokensUsed: 100,
+          askedUserQuestions: 0,
+          subAgentsSpawned: 0,
+          toolCalls: [
+            {
+              id: 'tc1',
+              sessionId: 'ap-session',
+              toolName: 'Edit',
+              toolUseId: 'tu1',
+              timestamp: 1_700_000_001_000,
+              durationMs: 20,
+              success: true,
+              filePath: '/src/auth.ts',
+            },
+          ],
+        },
+      ],
+    }),
+  };
+
+  it('persists file and the real per-incident occurrence count', () => {
+    const mockAntiPatternDetector = {
+      analyze: () => ({
+        readEfficiency: null,
+        verifyRate: null,
+        patterns: [
+          {
+            type: 'thrashing',
+            file: '/src/auth.ts',
+            iterations: 4,
+            tokensWasted: 200,
+            suggestion: 'Read the test failure output before editing again.',
+          },
+        ],
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      taskDetector: mockTaskDetector as unknown as TaskDetector,
+      antiPatternDetector: mockAntiPatternDetector as unknown as AntiPatternDetector,
+      developer: 'alice',
+    });
+
+    expect(summary.antiPatterns).toEqual([
+      { type: 'thrashing', file: '/src/auth.ts', iterations: 4 },
+    ]);
+  });
+
+  it('keeps one row per incident when multiple incidents share a type', () => {
+    const mockAntiPatternDetector = {
+      analyze: () => ({
+        readEfficiency: null,
+        verifyRate: null,
+        patterns: [
+          {
+            type: 'thrashing',
+            file: '/src/auth.ts',
+            iterations: 4,
+            tokensWasted: 200,
+            suggestion: 's1',
+          },
+          {
+            type: 'thrashing',
+            file: '/src/session.ts',
+            iterations: 2,
+            tokensWasted: 80,
+            suggestion: 's2',
+          },
+        ],
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      taskDetector: mockTaskDetector as unknown as TaskDetector,
+      antiPatternDetector: mockAntiPatternDetector as unknown as AntiPatternDetector,
+      developer: 'alice',
+    });
+
+    expect(summary.antiPatterns).toHaveLength(2);
+    expect(summary.antiPatterns.map((p) => p.file)).toEqual(['/src/auth.ts', '/src/session.ts']);
+  });
+
+  it('round-trips file/iterations through JSON serialization', () => {
+    const original = makeSummary({
+      antiPatterns: [{ type: 're_reading', file: '/src/config.ts', readCount: 6 }],
+    });
+    const raw = JSON.parse(JSON.stringify(original)) as Record<string, unknown>;
+    const roundTripped = deserializeFullSessionSummary(raw);
+
+    expect(roundTripped.antiPatterns).toEqual([
+      { type: 're_reading', file: '/src/config.ts', readCount: 6 },
+    ]);
+  });
+
+  it('deserializes legacy {type, count} session files into `count` separate incidents of that type', () => {
+    const raw = { sessionId: 'legacy-1', antiPatterns: [{ type: 'thrashing', count: 3 }] };
+    const roundTripped = deserializeFullSessionSummary(raw);
+
+    expect(roundTripped.antiPatterns).toEqual([
+      { type: 'thrashing' },
+      { type: 'thrashing' },
+      { type: 'thrashing' },
+    ]);
+  });
+
+  it('expands a legacy {type, count: 5} entry into 5 rows of that type, matching the historical aggregate', () => {
+    const raw = { sessionId: 'legacy-2', antiPatterns: [{ type: 'thrashing', count: 5 }] };
+    const roundTripped = deserializeFullSessionSummary(raw);
+
+    expect(roundTripped.antiPatterns).toHaveLength(5);
+    expect(roundTripped.antiPatterns.every((p) => p.type === 'thrashing')).toBe(true);
+  });
+
+  it('reads a modelBreakdown entry written before cache token fields existed with both cache counts at 0', () => {
+    const raw = {
+      sessionId: 'legacy-3',
+      modelBreakdown: {
+        'claude-sonnet-4-6': {
+          requestCount: 4,
+          totalInputTokens: 120,
+          totalOutputTokens: 60,
+          totalCostUsd: 0.3,
+        },
+      },
+    };
+    const roundTripped = deserializeFullSessionSummary(raw);
+
+    expect(roundTripped.modelBreakdown).toEqual({
+      'claude-sonnet-4-6': {
+        requestCount: 4,
+        totalInputTokens: 120,
+        totalOutputTokens: 60,
+        totalCostUsd: 0.3,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        totalThinkingTokens: 0,
+      },
+    });
   });
 });
 
@@ -222,6 +559,109 @@ describe('SessionStore', () => {
     const files = readdirSync(resolve(tmpDir, 'sessions'));
     expect(files).toHaveLength(1);
     expect(files[0]).toBe('2026-04-15_abc-123.json');
+  });
+
+  it('does not let an empty summary clobber a recorded session', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const startTime = new Date('2026-04-15T10:00:00Z').getTime();
+    store.saveSession(makeSummary({ sessionId: 'clobber-me', startTime, toolCallCount: 12 }));
+
+    // A short-lived process that adopted the same session id via the
+    // session-by-cwd breadcrumb but saw no hook activity.
+    store.saveSession(
+      makeSummary({ sessionId: 'clobber-me', startTime, toolCallCount: 0, toolBreakdown: {} }),
+    );
+
+    expect(store.loadSession('clobber-me')!.toolCallCount).toBe(12);
+  });
+
+  it('does not create a file for a session that recorded no usage', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    store.saveSession(
+      makeSummary({
+        sessionId: 'idle-window',
+        toolCallCount: 0,
+        toolBreakdown: {},
+        model: null,
+        estimatedCostUsd: 0,
+        tokensInput: 0,
+        tokensOutput: 0,
+        tokensThinking: 0,
+      }),
+    );
+
+    expect(store.loadSession('idle-window')).toBeNull();
+  });
+
+  it('still creates a file for a chat-only session with cost but no tool calls', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    store.saveSession(
+      makeSummary({
+        sessionId: 'chat-only',
+        toolCallCount: 0,
+        toolBreakdown: {},
+        estimatedCostUsd: 0.4,
+      }),
+    );
+
+    expect(store.loadSession('chat-only')).not.toBeNull();
+  });
+
+  it('still overwrites when the new summary has activity', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const startTime = new Date('2026-04-15T10:00:00Z').getTime();
+    store.saveSession(makeSummary({ sessionId: 'grow', startTime, toolCallCount: 3 }));
+    store.saveSession(makeSummary({ sessionId: 'grow', startTime, toolCallCount: 9 }));
+
+    expect(store.loadSession('grow')!.toolCallCount).toBe(9);
+  });
+
+  it('accepts a subagent-only incoming summary (zero tool calls, real subagent cost) over a recorded existing session', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const startTime = new Date('2026-04-15T10:00:00Z').getTime();
+    store.saveSession(makeSummary({ sessionId: 'orphan', startTime, toolCallCount: 12 }));
+
+    // A dead-parent session whose only new activity is its subagent tail —
+    // zero tool calls, but real dollars — is exactly the write hasAttributableActivity
+    // is meant to admit.
+    store.saveSession(
+      makeSummary({
+        sessionId: 'orphan',
+        startTime,
+        toolCallCount: 0,
+        toolBreakdown: {},
+        subagentCostUsd: 3.5,
+      }),
+    );
+
+    const loaded = store.loadSession('orphan');
+    expect(loaded?.toolCallCount).toBe(12);
+    expect(loaded?.subagentCostUsd).toBe(3.5);
+  });
+
+  it('still refuses a genuinely empty incoming summary against a subagent-only existing session', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const startTime = new Date('2026-04-15T10:00:00Z').getTime();
+    store.saveSession(
+      makeSummary({
+        sessionId: 'subagent-only',
+        startTime,
+        toolCallCount: 0,
+        toolBreakdown: {},
+        subagentCostUsd: 3.5,
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: 'subagent-only',
+        startTime,
+        toolCallCount: 0,
+        toolBreakdown: {},
+        subagentCostUsd: 0,
+      }),
+    );
+
+    expect(store.loadSession('subagent-only')?.subagentCostUsd).toBe(3.5);
   });
 
   it('loadSession reads and parses a saved session', () => {
@@ -525,7 +965,6 @@ describe('buildSessionSummary', () => {
     const mockCostTracker = {
       getMetrics: () => ({
         sessionTotalCostUsd: 0.12,
-        costByTask: null,
         costPerLineOfCode: null,
         costPerFileModified: null,
         model: 'claude-opus-4-20250514',
@@ -537,6 +976,10 @@ describe('buildSessionSummary', () => {
         reportCount: 3,
         estimationCount: 0,
         latestCostBreakdown: null,
+        unpricedByModel: { 'claude-foo-9-9': { calls: 2, tokens: 30 } },
+        estimatedByModel: {
+          'claude-opus-5-9': { calls: 1, tokens: 5, estimatedFrom: 'claude-opus-5' },
+        },
       }),
     };
 
@@ -606,6 +1049,8 @@ describe('buildSessionSummary', () => {
         taskId: 'session-average',
         timestamp: Date.now(),
       }),
+      getScores: () => [{}, {}],
+      getSessionSampleCount: () => 2,
     };
 
     const summary = buildSessionSummary({
@@ -619,6 +1064,10 @@ describe('buildSessionSummary', () => {
     expect(summary.sessionId).toBe('test-session');
     expect(summary.developer).toBe('alice');
     expect(summary.model).toBe('claude-opus-4-20250514');
+    expect(summary.unpricedByModel).toEqual({ 'claude-foo-9-9': { calls: 2, tokens: 30 } });
+    expect(summary.estimatedByModel).toEqual({
+      'claude-opus-5-9': { calls: 1, tokens: 5, estimatedFrom: 'claude-opus-5' },
+    });
     expect(summary.toolCallCount).toBe(15);
     expect(summary.toolBreakdown).toEqual({ Read: 5, Edit: 7, Bash: 3 });
     expect(summary.filesRead).toEqual(['/src/a.ts', '/src/b.ts', '/src/c.ts']);
@@ -635,10 +1084,108 @@ describe('buildSessionSummary', () => {
     expect(summary.tokensOutput).toBe(5_000);
     expect(summary.tokensThinking).toBe(2_000);
     expect(summary.efficiencyScore).toBe(0.82);
+    expect(summary.efficiencyScoreSampleCount).toBe(2);
+    expect(summary.efficiencyScoreComponents).toEqual({
+      speed: 0.7,
+      correctness: 0.9,
+      autonomy: 1,
+      firstAttemptQuality: 0.7,
+    });
     expect(summary.taskCount).toBe(2);
     expect(summary.agentSpawns).toBe(1);
     expect(summary.toolSuccessRate).toBe(0.9);
     expect(summary.outcome).toBe('completed');
+  });
+
+  it('folds TaskMetrics.seededAggregate into filesRead/linesAdded/testRunCount/etc alongside completedTasks', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 0,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+
+    const mockTaskDetector = {
+      getCurrentTask: () => null,
+      getMetrics: () => ({
+        totalTasksCompleted: 3,
+        currentTaskActive: false,
+        currentTaskToolCalls: 0,
+        averageTaskDurationMs: null,
+        averageToolCallsPerTask: null,
+        completedTasks: [
+          {
+            taskId: 't1',
+            startTime: 1700000000000,
+            endTime: 1700000060000,
+            durationMs: 60_000,
+            toolCallCount: 2,
+            toolCallsByType: {},
+            filesRead: ['/live.ts'],
+            filesModified: [],
+            linesChanged: 4,
+            linesAdded: 4,
+            linesRemoved: 0,
+            bashCommandsRun: 0,
+            testsRun: 1,
+            testsPassed: 1,
+            buildRun: 0,
+            buildPassed: 0,
+            estimatedCostUsd: null,
+            tokensUsed: 0,
+            askedUserQuestions: 0,
+            subAgentsSpawned: 0,
+            toolCalls: [],
+          },
+        ],
+        seededAggregate: {
+          filesRead: ['/seeded-a.ts', '/live.ts'],
+          filesModified: ['/seeded-a.ts'],
+          linesAdded: 20,
+          linesRemoved: 5,
+          testsRun: 3,
+          testsPassed: 2,
+          buildRun: 1,
+          buildPassed: 1,
+          agentSpawns: 2,
+        },
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as Parameters<
+        typeof buildSessionSummary
+      >[0]['sessionTracker'],
+      taskDetector: mockTaskDetector as unknown as Parameters<
+        typeof buildSessionSummary
+      >[0]['taskDetector'],
+      developer: 'alice',
+    });
+
+    expect(summary.filesRead.sort()).toEqual(['/live.ts', '/seeded-a.ts'].sort()); // deduped union
+    expect(summary.filesModified).toEqual(['/seeded-a.ts']);
+    expect(summary.linesAdded).toBe(24); // 4 live + 20 seeded
+    expect(summary.linesRemoved).toBe(5);
+    expect(summary.testRunCount).toBe(4); // 1 live + 3 seeded
+    expect(summary.testPassCount).toBe(3);
+    expect(summary.buildRunCount).toBe(1);
+    expect(summary.buildPassCount).toBe(1);
+    expect(summary.agentSpawns).toBe(2);
+    expect(summary.taskCount).toBe(3); // from totalTasksCompleted, unaffected by this fold
   });
 
   it('reads userMessages/assistantMessages/userCorrections from transcriptMessageTracker', () => {
@@ -872,6 +1419,432 @@ describe('buildSessionSummary', () => {
     expect(summary.repoName).toBeNull();
   });
 
+  it('redacts secret-shaped substrings in sessionIntent (Phase 3)', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'redact-test-intent',
+        sessionName: null,
+        sessionNameSource: null,
+        // Sensitive first-prompt content; only ever non-null when recordContent
+        // was on. Persist must redact it (idempotently) before it hits disk.
+        sessionIntent: 'deploy with API_KEY=abc123def456secretvalue please',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      developer: 'alice',
+    });
+
+    expect(summary.sessionIntent).toBe('deploy with [REDACTED] please');
+  });
+
+  it('leaves sessionIntent null when not provided (recordContent off)', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'redact-test-intent-null',
+        sessionName: null,
+        sessionNameSource: null,
+        sessionIntent: null,
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      developer: 'alice',
+    });
+
+    expect(summary.sessionIntent).toBeNull();
+  });
+
+  it('deserializeFullSessionSummary round-trips sessionIntent and defaults it to null when missing', () => {
+    const original = makeSummary({ sessionIntent: 'refactor the auth flow' });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(original)) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.sessionIntent).toBe('refactor the auth flow');
+
+    // Pre-Phase-3 session files have no sessionIntent field → null, not undefined.
+    const raw = JSON.parse(JSON.stringify(original)) as Record<string, unknown>;
+    delete raw.sessionIntent;
+    expect(deserializeFullSessionSummary(raw).sessionIntent).toBeNull();
+  });
+
+  it('deserializeFullSessionSummary round-trips a valid sessionNameSource and rejects bogus/missing to null', () => {
+    const original = makeSummary({ sessionName: 'my session', sessionNameSource: 'ai-title' });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(original)) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.sessionNameSource).toBe('ai-title');
+
+    // A value outside the 4-way enum → null (defends against a corrupt/edited file).
+    const bogus = JSON.parse(JSON.stringify(original)) as Record<string, unknown>;
+    bogus.sessionNameSource = 'nonsense';
+    expect(deserializeFullSessionSummary(bogus).sessionNameSource).toBeNull();
+
+    // Pre-feature session files have no field → null.
+    const missing = JSON.parse(JSON.stringify(original)) as Record<string, unknown>;
+    delete missing.sessionNameSource;
+    expect(deserializeFullSessionSummary(missing).sessionNameSource).toBeNull();
+  });
+
+  it('mergeSummaries keeps name and source together and never clobbers a captured intent', () => {
+    const existing = makeSummary({
+      sessionName: 'human named it',
+      sessionNameSource: 'user',
+      sessionIntent: 'the original prompt',
+    });
+    // A later (checkpoint) write that never resolved a name/intent this run:
+    // both are null on `incoming`.
+    const incoming = makeSummary({
+      sessionName: null,
+      sessionNameSource: null,
+      sessionIntent: null,
+    });
+    const merged = mergeSummaries(existing, incoming);
+    // Name kept — and its source must stay tied to it (no user→null desync).
+    expect(merged.sessionName).toBe('human named it');
+    expect(merged.sessionNameSource).toBe('user');
+    // A previously-captured intent is preserved, not overwritten to null.
+    expect(merged.sessionIntent).toBe('the original prompt');
+  });
+
+  it('mergeSummaries keeps a real platform label against an incoming generic-mcp checkpoint', () => {
+    const existing = makeSummary({ platform: 'claude-code' });
+    const incoming = makeSummary({ platform: 'generic-mcp' });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.platform).toBe('claude-code');
+  });
+
+  it('mergeSummaries lets an incoming real platform upgrade an existing generic-mcp label', () => {
+    const existing = makeSummary({ platform: 'generic-mcp' });
+    const incoming = makeSummary({ platform: 'claude-code' });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.platform).toBe('claude-code');
+  });
+
+  it('mergeSummaries merges costByDayUsd / subagentCostByDayUsd per day key, taking the max on overlap', () => {
+    const existing = makeSummary({
+      costByDayUsd: { '2026-09-10': 3.1, '2026-09-11': 1.5 },
+      subagentCostByDayUsd: { '2026-09-10': 0.2 },
+    });
+    const incoming = makeSummary({
+      costByDayUsd: { '2026-09-11': 0.2 },
+      subagentCostByDayUsd: { '2026-09-11': 0.9 },
+    });
+    const merged = mergeSummaries(existing, incoming);
+    // The existing day (2026-09-10) survives an incoming write that only
+    // carries 2026-09-11 — a whole-object spread would have erased it.
+    expect(merged.costByDayUsd).toEqual({ '2026-09-10': 3.1, '2026-09-11': 1.5 });
+    expect(merged.subagentCostByDayUsd).toEqual({ '2026-09-10': 0.2, '2026-09-11': 0.9 });
+  });
+
+  it('mergeSummaries leaves costByDayUsd / subagentCostByDayUsd undefined when neither side has buckets', () => {
+    const existing = makeSummary({ costByDayUsd: undefined, subagentCostByDayUsd: undefined });
+    const incoming = makeSummary({ costByDayUsd: undefined, subagentCostByDayUsd: undefined });
+    const merged = mergeSummaries(existing, incoming);
+    // Present-but-empty ({}) would read as "authoritatively $0 today" to the
+    // aggregate route instead of falling back to the timeline pro-rate.
+    expect(merged.costByDayUsd).toBeUndefined();
+    expect(merged.subagentCostByDayUsd).toBeUndefined();
+  });
+
+  it('mergeSummaries takes the per-model max of unpriced calls and tokens', () => {
+    const existing = makeSummary({
+      unpricedByModel: { a: { calls: 3, tokens: 100 }, b: { calls: 1, tokens: 10 } },
+    });
+    const incoming = makeSummary({
+      unpricedByModel: { a: { calls: 2, tokens: 400 }, c: { calls: 7, tokens: 70 } },
+    });
+    expect(mergeSummaries(existing, incoming).unpricedByModel).toEqual({
+      a: { calls: 3, tokens: 400 },
+      b: { calls: 1, tokens: 10 },
+      c: { calls: 7, tokens: 70 },
+    });
+  });
+
+  it('mergeSummaries leaves unpricedByModel undefined when neither side has it', () => {
+    const merged = mergeSummaries(makeSummary(), makeSummary());
+    expect(merged.unpricedByModel).toBeUndefined();
+  });
+
+  it('mergeSummaries keeps unpricedByModel when only one side has it', () => {
+    const only = { a: { calls: 1, tokens: 2 } };
+    expect(
+      mergeSummaries(makeSummary({ unpricedByModel: only }), makeSummary()).unpricedByModel,
+    ).toEqual(only);
+    expect(
+      mergeSummaries(makeSummary(), makeSummary({ unpricedByModel: only })).unpricedByModel,
+    ).toEqual(only);
+  });
+
+  it('mergeSummaries takes the per-model max of estimated calls and keeps the incoming estimatedFrom', () => {
+    const existing = makeSummary({
+      estimatedByModel: { a: { calls: 3, tokens: 100, estimatedFrom: 'old' } },
+    });
+    const incoming = makeSummary({
+      estimatedByModel: {
+        a: { calls: 2, tokens: 400, estimatedFrom: 'new' },
+        c: { calls: 7, tokens: 70, estimatedFrom: 'x' },
+      },
+    });
+    expect(mergeSummaries(existing, incoming).estimatedByModel).toEqual({
+      a: { calls: 3, tokens: 400, estimatedFrom: 'new' },
+      c: { calls: 7, tokens: 70, estimatedFrom: 'x' },
+    });
+    expect(mergeSummaries(makeSummary(), makeSummary()).estimatedByModel).toBeUndefined();
+  });
+
+  it('deserializeFullSessionSummary validates estimatedByModel entries', () => {
+    const raw = {
+      sessionId: 'sess-estimated',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      estimatedByModel: {
+        good: { calls: 2, tokens: 300, estimatedFrom: 'claude-opus-5' },
+        missingFrom: { calls: 1, tokens: 1 },
+        emptyFrom: { calls: 1, tokens: 1, estimatedFrom: '' },
+        longFrom: { calls: 1, tokens: 1, estimatedFrom: 'x'.repeat(257) },
+        numericFrom: { calls: 1, tokens: 1, estimatedFrom: 5 },
+        negative: { calls: -1, tokens: 1, estimatedFrom: 'a' },
+        notAnObject: 'nope',
+      },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.estimatedByModel).toEqual({
+      good: { calls: 2, tokens: 300, estimatedFrom: 'claude-opus-5' },
+    });
+    const none = deserializeFullSessionSummary({
+      ...raw,
+      estimatedByModel: [1],
+    } as unknown as Record<string, unknown>);
+    expect(none.estimatedByModel).toBeUndefined();
+  });
+
+  it('mergeSummaries lets the incoming byteEstimates replace the existing ledger instead of taking the max', () => {
+    const ledger = (costUsd: number) => ({
+      costUsd,
+      inputTokens: 0,
+      outputTokens: 0,
+      costByModel: {},
+      costByDayUsd: {},
+    });
+    const existing = makeSummary({ byteEstimates: ledger(0.5) });
+
+    expect(
+      mergeSummaries(existing, makeSummary({ byteEstimates: ledger(0) })).byteEstimates,
+    ).toEqual(ledger(0));
+    expect(mergeSummaries(existing, makeSummary()).byteEstimates).toEqual(ledger(0.5));
+    expect(mergeSummaries(makeSummary(), makeSummary()).byteEstimates).toBeUndefined();
+  });
+
+  describe('a checkpoint written before the first real report', () => {
+    const MODEL = 'claude-sonnet-4';
+    const usage = {
+      inputTokens: 1_000,
+      outputTokens: 500,
+      thinkingTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      totalTokens: 1_500,
+    };
+
+    function checkpoint(store: SessionStore, tracker: CostTracker, sessionId: string): void {
+      const m = tracker.getMetrics();
+      store.saveSession(
+        makeSummary({
+          sessionId,
+          startTime: 1_700_000_000_000,
+          estimatedCostUsd: m.sessionTotalCostUsd,
+          costByDayUsd: m.costByDayUsd,
+          tokensInput: m.totalInputTokens,
+          tokensOutput: m.totalOutputTokens,
+          ...(m.byteEstimates && { byteEstimates: m.byteEstimates }),
+        }),
+      );
+    }
+
+    it('does not keep the estimate on disk once the real report shrinks the total', () => {
+      const store = new SessionStore({ storagePath: tmpDir });
+      const tracker = new CostTracker();
+      for (let i = 0; i < 5; i++) tracker.recordEstimatedTokens(40_000, 20_000, MODEL);
+      checkpoint(store, tracker, 'sess-shrink');
+
+      const exact = tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-shrink');
+
+      const onDisk = store.loadSession('sess-shrink');
+      expect(onDisk?.estimatedCostUsd).toBeCloseTo(exact.totalUsd, 9);
+      expect(onDisk?.tokensInput).toBe(1_000);
+      expect(onDisk?.tokensOutput).toBe(500);
+      expect(Object.values(onDisk?.costByDayUsd ?? {}).reduce((a, b) => a + b, 0)).toBeCloseTo(
+        exact.totalUsd,
+        9,
+      );
+
+      const restarted = new CostTracker();
+      restarted.seedFromPersisted(buildCostTrackerSeed(onDisk as FullSessionSummary));
+      expect(restarted.getMetrics().sessionTotalCostUsd).toBeCloseTo(exact.totalUsd, 9);
+    });
+
+    it("keeps another writer's larger exact total when the ledger shrinks", () => {
+      const store = new SessionStore({ storagePath: tmpDir });
+      const tracker = new CostTracker();
+      for (let i = 0; i < 5; i++) tracker.recordEstimatedTokens(40_000, 20_000, MODEL);
+      checkpoint(store, tracker, 'sess-other');
+      store.saveSession(
+        makeSummary({
+          sessionId: 'sess-other',
+          startTime: 1_700_000_000_000,
+          estimatedCostUsd: 0.2,
+          tokensInput: 9_000,
+          tokensOutput: 4_000,
+        }),
+      );
+
+      tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-other');
+
+      const onDisk = store.loadSession('sess-other');
+      expect(onDisk?.estimatedCostUsd).toBeCloseTo(0.2, 9);
+      expect(onDisk?.tokensInput).toBe(9_000);
+      expect(onDisk?.tokensOutput).toBe(4_000);
+    });
+
+    it('keeps growing past the shrunk total as later exact reports arrive', () => {
+      const store = new SessionStore({ storagePath: tmpDir });
+      const tracker = new CostTracker();
+      tracker.recordEstimatedTokens(40_000, 20_000, MODEL);
+      checkpoint(store, tracker, 'sess-grow');
+      tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-grow');
+      const second = tracker.recordTokenUsage(usage, MODEL, { replacesEstimates: true });
+      checkpoint(store, tracker, 'sess-grow');
+
+      expect(store.loadSession('sess-grow')?.estimatedCostUsd).toBeCloseTo(
+        tracker.getMetrics().sessionTotalCostUsd ?? 0,
+        9,
+      );
+      expect(second.totalUsd).toBeGreaterThan(0);
+    });
+  });
+
+  it('deserializeFullSessionSummary keeps only well-formed byteEstimates fields', () => {
+    const raw = {
+      sessionId: 'sess-byte-estimates',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      byteEstimates: {
+        costUsd: 0.25,
+        inputTokens: 'bad',
+        outputTokens: 40,
+        costByModel: { a: 0.25, b: 'nope' },
+        costByDayUsd: [1],
+      },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.byteEstimates).toEqual({
+      costUsd: 0.25,
+      inputTokens: 0,
+      outputTokens: 40,
+      costByModel: { a: 0.25 },
+      costByDayUsd: {},
+    });
+    const none = deserializeFullSessionSummary({
+      ...raw,
+      byteEstimates: 'x',
+    } as unknown as Record<string, unknown>);
+    expect(none.byteEstimates).toBeUndefined();
+  });
+
+  it('mergeSummaries unions timeline entries from both sides instead of keeping only the longer array', () => {
+    // Simulates a Claude Code --stdio resume: the old process's on-disk
+    // timeline is longer than what the new process has accumulated so far,
+    // so a pure longest-wins merge would drop every entry the new process
+    // wrote after the resume.
+    const existing = makeSummary({
+      timeline: [
+        { timestamp: 100, toolName: 'Read', durationMs: 5, success: true },
+        { timestamp: 200, toolName: 'Edit', durationMs: 10, success: true },
+        { timestamp: 300, toolName: 'Bash', durationMs: 20, success: true },
+      ],
+    });
+    const incoming = makeSummary({
+      timeline: [{ timestamp: 400, toolName: 'Write', durationMs: 8, success: true }],
+    });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.timeline?.map((e) => e.timestamp)).toEqual([100, 200, 300, 400]);
+  });
+
+  it('mergeSummaries de-duplicates a timeline entry present on both sides instead of doubling it', () => {
+    const shared = { timestamp: 100, toolName: 'Read', durationMs: 5, success: true };
+    const existing = makeSummary({
+      timeline: [shared, { timestamp: 200, toolName: 'Edit', durationMs: 10, success: true }],
+    });
+    const incoming = makeSummary({
+      timeline: [shared, { timestamp: 300, toolName: 'Bash', durationMs: 20, success: true }],
+    });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.timeline?.map((e) => e.timestamp)).toEqual([100, 200, 300]);
+  });
+
+  it('mergeSummaries caps a unioned timeline at MAX_TIMELINE_ENTRIES, keeping the newest entries', () => {
+    const existingEntries = Array.from({ length: 6000 }, (_, i) => ({
+      timestamp: i,
+      toolName: 'Read',
+      durationMs: 1,
+      success: true,
+    }));
+    const incomingEntries = Array.from({ length: 6000 }, (_, i) => ({
+      timestamp: 6000 + i,
+      toolName: 'Read',
+      durationMs: 1,
+      success: true,
+    }));
+    const existing = makeSummary({ timeline: existingEntries });
+    const incoming = makeSummary({ timeline: incomingEntries });
+    const merged = mergeSummaries(existing, incoming);
+    expect(merged.timeline).toHaveLength(10_000);
+    expect(merged.timeline?.[0]?.timestamp).toBe(2000);
+    expect(merged.timeline?.[merged.timeline!.length - 1]?.timestamp).toBe(11999);
+  });
+
   it('includes active task data in the summary', () => {
     const mockSessionTracker = {
       getMetrics: () => ({
@@ -954,7 +1927,6 @@ describe('buildSessionSummary', () => {
     // recordTokenUsage with real cache tokens so fields are non-zero
     jest.spyOn(costTracker, 'getMetrics').mockReturnValue({
       sessionTotalCostUsd: 0.05,
-      costByTask: null,
       costByModel: {},
       costPerLineOfCode: null,
       costPerFileModified: null,
@@ -970,9 +1942,17 @@ describe('buildSessionSummary', () => {
       reportCount: 2,
       estimationCount: 0,
       latestCostBreakdown: null,
-      subagentCostUsd: 0,
-      parentCostUsd: 0.05,
+      subagentCostUsd: 0.021,
+      parentCostUsd: 0.029,
       costByWorkflowRunId: {},
+      costByDayUsd: {},
+      subagentCostByDayUsd: {},
+      unpricedByModel: {},
+      estimatedByModel: {},
+      subagentByAgentType: {},
+      highContextCostUsd: 0,
+      apiDurationMs: null,
+      costRateMultiplierApplied: 1,
     } satisfies CostMetrics);
     const summary = buildSessionSummary({
       sessionTracker,
@@ -982,6 +1962,63 @@ describe('buildSessionSummary', () => {
     expect(summary.tokensCacheRead).toBe(5_000);
     expect(summary.tokensCacheCreation).toBe(1_500);
     expect(summary.cacheSavingsUsd).toBe(0.018);
+    expect(summary.subagentCostUsd).toBe(0.021);
+  });
+
+  it('includes costByWorkflowRunId from CostTracker', () => {
+    const sessionTracker = makeSessionTracker();
+    const costTracker = new CostTracker();
+    jest.spyOn(costTracker, 'getMetrics').mockReturnValue({
+      sessionTotalCostUsd: 0.05,
+      costByModel: {},
+      costPerLineOfCode: null,
+      costPerFileModified: null,
+      costPerMillionTokens: null,
+      model: 'claude-sonnet-4-6',
+      totalInputTokens: 3_000,
+      totalOutputTokens: 1_000,
+      totalThinkingTokens: 0,
+      totalCacheReadTokens: 5_000,
+      totalCacheCreationTokens: 1_500,
+      cacheHitRate: 0.526,
+      totalCacheSavingsUsd: 0.018,
+      reportCount: 2,
+      estimationCount: 0,
+      latestCostBreakdown: null,
+      subagentCostUsd: 0.021,
+      parentCostUsd: 0.029,
+      costByWorkflowRunId: { wf_test_run: { '2026-08-14': 0.05 } },
+      costByDayUsd: { '2026-08-14': 0.05 },
+      subagentCostByDayUsd: {},
+      unpricedByModel: {},
+      estimatedByModel: {},
+      subagentByAgentType: {},
+      highContextCostUsd: 0,
+      apiDurationMs: null,
+      costRateMultiplierApplied: 1,
+    } satisfies CostMetrics);
+    const summary = buildSessionSummary({
+      sessionTracker,
+      costTracker,
+      developer: 'dev',
+    });
+    expect(summary.costByWorkflowRunId).toEqual({ wf_test_run: { '2026-08-14': 0.05 } });
+  });
+
+  it('defaults costByWorkflowRunId to {} when no CostTracker is provided', () => {
+    const summary = buildSessionSummary({
+      sessionTracker: makeSessionTracker(),
+      developer: 'dev',
+    });
+    expect(summary.costByWorkflowRunId).toEqual({});
+  });
+
+  it('defaults subagentCostUsd to 0 when no CostTracker is provided', () => {
+    const summary = buildSessionSummary({
+      sessionTracker: makeSessionTracker(),
+      developer: 'dev',
+    });
+    expect(summary.subagentCostUsd).toBe(0);
   });
 
   it('threads the platform field through when provided', () => {
@@ -1062,6 +2099,183 @@ describe('buildSessionSummary', () => {
     expect(result.cacheSavingsUsd).toBe(0);
   });
 
+  it('deserializeFullSessionSummary round-trips subagentCostUsd', () => {
+    const raw = {
+      sessionId: 'sess-subagent',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      subagentCostUsd: 0.0345,
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.subagentCostUsd).toBe(0.0345);
+  });
+
+  it('deserializeFullSessionSummary defaults subagentCostUsd to 0 when the field is missing', () => {
+    const raw = {
+      sessionId: 'sess-old',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.subagentCostUsd).toBe(0);
+  });
+
+  it('deserializeFullSessionSummary round-trips costByWorkflowRunId', () => {
+    const raw = {
+      sessionId: 'sess-wf',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      costByWorkflowRunId: { wf_abc: { '2026-08-14': 0.5, '2026-08-15': 1.25 } },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.costByWorkflowRunId).toEqual({
+      wf_abc: { '2026-08-14': 0.5, '2026-08-15': 1.25 },
+    });
+  });
+
+  it('deserializeFullSessionSummary defaults costByWorkflowRunId to {} when the field is missing', () => {
+    const raw = {
+      sessionId: 'sess-old',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.costByWorkflowRunId).toEqual({});
+  });
+
+  it('deserializeFullSessionSummary round-trips costByDayUsd / subagentCostByDayUsd', () => {
+    const raw = {
+      sessionId: 'sess-day-buckets',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      costByDayUsd: { '2026-08-17': 245.0, '2026-08-18': 5.0 },
+      subagentCostByDayUsd: { '2026-08-18': 1.5 },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.costByDayUsd).toEqual({ '2026-08-17': 245.0, '2026-08-18': 5.0 });
+    expect(result.subagentCostByDayUsd).toEqual({ '2026-08-18': 1.5 });
+  });
+
+  it('deserializeFullSessionSummary leaves day-bucket maps undefined when the fields are missing', () => {
+    // Undefined (not {}) so the aggregate route can distinguish "old file, fall
+    // back to timeline pro-rate" from "new file that genuinely spent $0 today".
+    const raw = {
+      sessionId: 'sess-old',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.costByDayUsd).toBeUndefined();
+    expect(result.subagentCostByDayUsd).toBeUndefined();
+  });
+
+  it('deserializeFullSessionSummary drops non-numeric values inside the day-bucket maps', () => {
+    const raw = {
+      sessionId: 'sess-malformed-day',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      costByDayUsd: { '2026-08-18': 5.0, '2026-08-17': 'nope', bad: null },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.costByDayUsd).toEqual({ '2026-08-18': 5.0 });
+  });
+
+  it('deserializeFullSessionSummary treats an array costByDayUsd as absent (undefined), not a {0:..} map', () => {
+    // typeof [] === 'object'; without an Array guard a corrupt array would
+    // become { '0': 5 } (defined) and wrongly take the day-bucket branch in the
+    // aggregate route (reading $0 today) instead of falling back to pro-rating.
+    const raw = {
+      sessionId: 'sess-array-day',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      costByDayUsd: [5.0, 6.0],
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.costByDayUsd).toBeUndefined();
+  });
+
+  it('deserializeFullSessionSummary keeps valid unpricedByModel entries and drops malformed ones', () => {
+    const raw = {
+      sessionId: 'sess-unpriced',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      unpricedByModel: {
+        good: { calls: 2, tokens: 300 },
+        negative: { calls: -1, tokens: 5 },
+        negativeTokens: { calls: 1, tokens: -5 },
+        notFinite: { calls: null, tokens: 5 },
+        missingTokens: { calls: 1 },
+        notAnObject: 'nope',
+        arrayEntry: [1, 2],
+      },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.unpricedByModel).toEqual({ good: { calls: 2, tokens: 300 } });
+  });
+
+  it('deserializeFullSessionSummary yields undefined unpricedByModel when absent, an array, or nothing valid', () => {
+    const base = {
+      sessionId: 'sess-unpriced-2',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+    };
+    for (const unpricedByModel of [undefined, [1], 'x', { bad: { calls: -1, tokens: 1 } }]) {
+      const result = deserializeFullSessionSummary({
+        ...base,
+        unpricedByModel,
+      } as unknown as Record<string, unknown>);
+      expect(result.unpricedByModel).toBeUndefined();
+    }
+  });
+
+  it('deserializeFullSessionSummary drops non-numeric values inside costByWorkflowRunId rather than throwing', () => {
+    const raw = {
+      sessionId: 'sess-malformed',
+      startTime: 1_700_000_000_000,
+      endTime: 1_700_003_600_000,
+      durationMs: 3_600_000,
+      toolCallCount: 5,
+      developer: 'dev',
+      costByWorkflowRunId: {
+        wf_ok: { '2026-08-14': 0.5 },
+        wf_bad_day: { '2026-08-14': 'not-a-number' },
+        wf_not_an_object: 'not-an-object',
+      },
+    };
+    const result = deserializeFullSessionSummary(raw as unknown as Record<string, unknown>);
+    expect(result.costByWorkflowRunId).toEqual({ wf_ok: { '2026-08-14': 0.5 }, wf_bad_day: {} });
+  });
+
   it('handles missing optional trackers gracefully', () => {
     const mockSessionTracker = {
       getMetrics: () => ({
@@ -1102,6 +2316,301 @@ describe('buildSessionSummary', () => {
     expect(summary.antiPatterns).toEqual([]);
     expect(summary.filesRead).toEqual([]);
     expect(summary.filesModified).toEqual([]);
+  });
+
+  it('computes toolSelectionMetrics from the full in-memory tool calls when a scorer is provided', () => {
+    const toolCalls = [
+      {
+        id: 'c1',
+        sessionId: 'test-session',
+        toolName: 'Read',
+        toolUseId: 'c1',
+        timestamp: 1,
+        durationMs: 5,
+        success: true,
+        filePath: '/f.ts',
+      },
+      {
+        id: 'c2',
+        sessionId: 'test-session',
+        toolName: 'Read',
+        toolUseId: 'c2',
+        timestamp: 2,
+        durationMs: 5,
+        success: true,
+        filePath: '/f.ts',
+      },
+      {
+        id: 'c3',
+        sessionId: 'test-session',
+        toolName: 'Read',
+        toolUseId: 'c3',
+        timestamp: 3,
+        durationMs: 5,
+        success: true,
+        filePath: '/f.ts',
+      },
+    ];
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 3,
+        toolCallCountByTool: { Read: 3 },
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 1,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const mockTaskDetector = {
+      getCurrentTask: () => null,
+      getMetrics: () => ({
+        totalTasksCompleted: 1,
+        currentTaskActive: false,
+        currentTaskToolCalls: 0,
+        averageTaskDurationMs: 1000,
+        averageToolCallsPerTask: 3,
+        completedTasks: [
+          {
+            taskId: 't1',
+            startTime: 1,
+            endTime: 3,
+            durationMs: 2,
+            toolCallCount: 3,
+            toolCallsByType: { Read: 3 },
+            filesRead: ['/f.ts'],
+            filesModified: [],
+            linesChanged: 0,
+            linesAdded: 0,
+            linesRemoved: 0,
+            bashCommandsRun: 0,
+            testsRun: 0,
+            testsPassed: 0,
+            buildRun: 0,
+            buildPassed: 0,
+            estimatedCostUsd: 0,
+            tokensUsed: 0,
+            askedUserQuestions: 0,
+            subAgentsSpawned: 0,
+            toolCalls,
+          },
+        ],
+      }),
+    };
+    const scorer = new ToolSelectionScorer();
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      taskDetector: mockTaskDetector as unknown as TaskDetector,
+      toolSelectionScorer: scorer,
+      developer: 'alice',
+    });
+
+    expect(summary.toolSelectionMetrics).toEqual(
+      toToolSelectionSummary(scorer.scoreSession(toolCalls)),
+    );
+    expect(summary.toolSelectionMetrics?.redundantReadCount).toBe(1);
+  });
+
+  it('leaves toolSelectionMetrics null when no scorer is provided', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: null,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      developer: 'alice',
+    });
+    expect(summary.toolSelectionMetrics).toBeNull();
+  });
+
+  it('round-trips toolSelectionMetrics through JSON serialization', () => {
+    const original = makeSummary({
+      toolSelectionMetrics: {
+        score: 0.91,
+        totalCalls: 20,
+        penalizedCalls: 2,
+        redundantReadCount: 1,
+        repeatedFailureCount: 0,
+        unusedOutputCount: 1,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(original)) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.toolSelectionMetrics).toEqual(original.toolSelectionMetrics);
+  });
+
+  it('defaults toolSelectionMetrics to null for legacy session files missing the field', () => {
+    const legacy = makeSummary();
+    const { toolSelectionMetrics: _toolSelectionMetrics, ...withoutField } = legacy;
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(withoutField)) as Parameters<
+        typeof deserializeFullSessionSummary
+      >[0],
+    );
+    expect(roundTripped.toolSelectionMetrics).toBeNull();
+  });
+
+  it('captures efficiencyScoreSampleCount and efficiencyScoreComponents from EfficiencyScorer', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 0,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const mockEfficiencyScorer = {
+      getSessionAverage: () => ({
+        score: 0.77,
+        components: { speed: 0.8, correctness: 0.7, autonomy: 0.9, firstAttemptQuality: 0.6 },
+        taskId: 'session-average',
+        timestamp: Date.now(),
+      }),
+      getScores: () => [{}, {}, {}],
+      getSessionSampleCount: () => 3, // what buildSessionSummary actually reads
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as Parameters<
+        typeof buildSessionSummary
+      >[0]['sessionTracker'],
+      efficiencyScorer: mockEfficiencyScorer as unknown as Parameters<
+        typeof buildSessionSummary
+      >[0]['efficiencyScorer'],
+      developer: 'alice',
+    });
+
+    expect(summary.efficiencyScore).toBe(0.77);
+    expect(summary.efficiencyScoreSampleCount).toBe(3);
+    expect(summary.efficiencyScoreComponents).toEqual({
+      speed: 0.8,
+      correctness: 0.7,
+      autonomy: 0.9,
+      firstAttemptQuality: 0.6,
+    });
+  });
+
+  it('defaults efficiencyScoreSampleCount to 0 and efficiencyScoreComponents to null with no efficiencyScorer', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 0,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as Parameters<
+        typeof buildSessionSummary
+      >[0]['sessionTracker'],
+      developer: 'alice',
+    });
+    expect(summary.efficiencyScoreSampleCount).toBe(0);
+    expect(summary.efficiencyScoreComponents).toBeNull();
+  });
+
+  it('persists efficiencyScoreSampleCount from getSessionSampleCount(), not the fresh-only getScores().length, so seeded weight from an earlier restart survives a second checkpoint', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 0,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    // Simulates a session on its second restart: only 1 fresh task has been
+    // scored since the last restart, but getSessionAverage() (and therefore
+    // this checkpoint's efficiencyScore) is already weighted by 4 seeded
+    // samples carried over from the prior process's own checkpoint. If
+    // buildSessionSummary persisted getScores().length here instead of
+    // getSessionSampleCount(), it would record sampleCount=1 alongside a
+    // score that actually reflects 5 samples' worth of history.
+    const mockEfficiencyScorer = {
+      getSessionAverage: () => ({
+        score: 0.81,
+        components: { speed: 0.75, correctness: 0.85, autonomy: 0.9, firstAttemptQuality: 0.75 },
+        taskId: 'session-average',
+        timestamp: Date.now(),
+      }),
+      getScores: () => [{}], // 1 fresh score this process
+      getSessionSampleCount: () => 5, // 1 fresh + 4 seeded from a prior restart
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as Parameters<
+        typeof buildSessionSummary
+      >[0]['sessionTracker'],
+      efficiencyScorer: mockEfficiencyScorer as unknown as Parameters<
+        typeof buildSessionSummary
+      >[0]['efficiencyScorer'],
+      developer: 'alice',
+    });
+
+    expect(summary.efficiencyScoreSampleCount).toBe(5);
+    expect(summary.efficiencyScoreSampleCount).not.toBe(mockEfficiencyScorer.getScores().length);
   });
 });
 
@@ -1167,7 +2676,7 @@ describe('SessionStore corruption-recovery', () => {
     }
   });
 
-  it('two saveSession calls with the same sessionId result in last-write-wins, and logs a warning on the second write', () => {
+  it('merges two saveSession calls with the same sessionId into one file, keeping the latest scalar fields', () => {
     const store = new SessionStore({ storagePath: tmpDir });
     const startTime = new Date('2026-03-01T00:00:00Z').getTime();
 
@@ -1179,14 +2688,10 @@ describe('SessionStore corruption-recovery', () => {
 
     const loaded = store.loadSession('dup-id');
     expect(loaded).not.toBeNull();
+    // Scalar identity fields still follow the later write; only recorded
+    // activity is protected from regression (see the cross-process merge
+    // tests below).
     expect(loaded!.developer).toBe('bob');
-
-    const logged = stderrSpy.mock.calls.map((call: unknown[]) => String(call[0]));
-    expect(
-      logged.some(
-        (l: string) => l.includes('"warn"') && l.includes('Overwriting existing session file'),
-      ),
-    ).toBe(true);
   });
 });
 
@@ -1375,6 +2880,116 @@ describe('buildSessionSummary timeline', () => {
     expect(loaded2).not.toBeNull();
     expect(loaded2!['timeline']).toBeUndefined();
   });
+
+  it('carries skillName through for Skill entries and agentType through for Agent entries', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'skill-agent-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 30_000,
+        toolCallCount: 2,
+        toolCallCountByTool: { Skill: 1, Agent: 1 },
+        toolDurationMsByTool: {},
+        toolSuccessRate: 1,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+
+    const mockTaskDetector = {
+      getCurrentTask: () => null,
+      getMetrics: () => ({
+        totalTasksCompleted: 1,
+        currentTaskActive: false,
+        currentTaskToolCalls: 0,
+        averageTaskDurationMs: 30_000,
+        averageToolCallsPerTask: 2,
+        completedTasks: [
+          {
+            taskId: 't1',
+            startTime: 1700000000000,
+            endTime: 1700000030000,
+            durationMs: 30_000,
+            toolCallCount: 2,
+            toolCallsByType: { Skill: 1, Agent: 1 },
+            filesRead: [],
+            filesModified: [],
+            linesChanged: 0,
+            linesAdded: 0,
+            linesRemoved: 0,
+            bashCommandsRun: 0,
+            testsRun: 0,
+            testsPassed: 0,
+            buildRun: 0,
+            buildPassed: 0,
+            estimatedCostUsd: 0.02,
+            tokensUsed: 1000,
+            askedUserQuestions: 0,
+            subAgentsSpawned: 1,
+            toolCalls: [
+              {
+                id: 'tc1',
+                sessionId: 'skill-agent-session',
+                toolName: 'Skill',
+                toolUseId: 'tu1',
+                timestamp: 1700000001000,
+                durationMs: 30,
+                success: true,
+                skillName: 'unslop',
+              },
+              {
+                id: 'tc2',
+                sessionId: 'skill-agent-session',
+                toolName: 'Agent',
+                toolUseId: 'tu2',
+                timestamp: 1700000010000,
+                durationMs: 5000,
+                success: true,
+                agentType: 'general-purpose',
+              },
+              {
+                id: 'tc3',
+                sessionId: 'skill-agent-session',
+                toolName: 'Bash',
+                toolUseId: 'tu3',
+                timestamp: 1700000020000,
+                durationMs: 900,
+                success: true,
+                command: 'gh pr create --fill',
+                createdPrNumber: '42',
+                runInBackground: true,
+              },
+            ],
+          },
+        ],
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      taskDetector: mockTaskDetector as unknown as TaskDetector,
+      developer: 'alice',
+    });
+
+    expect(summary.timeline).toHaveLength(3);
+    expect(summary.timeline![2]!.createdPrNumber).toBe('42');
+    expect(summary.timeline![0]!.createdPrNumber).toBeUndefined();
+    expect(summary.timeline![2]!.runInBackground).toBe(true);
+    expect(summary.timeline![0]!.runInBackground).toBeUndefined();
+    expect(summary.timeline![0]!.toolName).toBe('Skill');
+    expect(summary.timeline![0]!.skillName).toBe('unslop');
+    expect(summary.timeline![0]!.agentType).toBeUndefined();
+    expect(summary.timeline![1]!.toolName).toBe('Agent');
+    expect(summary.timeline![1]!.agentType).toBe('general-purpose');
+    expect(summary.timeline![1]!.skillName).toBeUndefined();
+  });
 });
 
 // deserializeSession — explicit field extraction
@@ -1402,6 +3017,48 @@ describe('SessionStore deserialization', () => {
     expect(session!.toolBreakdown['Read']).toBe(3);
     // Object.prototype must have no unexpected own enumerable properties from pollution
     expect(Object.keys(Object.prototype)).toEqual([]);
+  });
+
+  it('keeps a numeric createdPrNumber on timeline entries and drops anything else', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const raw = JSON.stringify({
+      sessionId: 'pr-num',
+      startTime: 1000,
+      endTime: 2000,
+      durationMs: 1000,
+      toolCallCount: 2,
+      developer: 'alice',
+      timeline: [
+        { timestamp: 1100, toolName: 'Bash', createdPrNumber: '42' },
+        { timestamp: 1200, toolName: 'Bash', createdPrNumber: 'not-a-number' },
+      ],
+    });
+    writeFileSync(join(tmpDir, 'sessions', '2026-01-01_pr-num.json'), raw + '\n');
+
+    const session = store.loadSession('pr-num');
+    expect(session!.timeline![0]!.createdPrNumber).toBe('42');
+    expect(session!.timeline![1]!.createdPrNumber).toBeUndefined();
+  });
+
+  it('keeps runInBackground on timeline entries only when it is true', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const raw = JSON.stringify({
+      sessionId: 'bg-run',
+      startTime: 1000,
+      endTime: 2000,
+      durationMs: 1000,
+      toolCallCount: 2,
+      developer: 'alice',
+      timeline: [
+        { timestamp: 1100, toolName: 'Bash', runInBackground: true },
+        { timestamp: 1200, toolName: 'Bash', runInBackground: 'yes' },
+      ],
+    });
+    writeFileSync(join(tmpDir, 'sessions', '2026-01-01_bg-run.json'), raw + '\n');
+
+    const session = store.loadSession('bg-run');
+    expect(session!.timeline![0]!.runInBackground).toBe(true);
+    expect(session!.timeline![1]!.runInBackground).toBeUndefined();
   });
 
   it('returns null for a session file with non-object JSON', () => {
@@ -1435,5 +3092,943 @@ describe('SessionStore deserialization', () => {
     expect(session!.antiPatterns).toEqual([]);
     expect(session!.filesRead).toEqual([]);
     expect(session!.outcome).toBe('unknown');
+  });
+});
+
+describe('modelBreakdown field', () => {
+  it('buildSessionSummary populates modelBreakdown from modelUsageTracker.getRawBreakdown()', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: null,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const modelUsageTracker = {
+      getRawBreakdown: () => ({
+        'claude-sonnet-5': {
+          requestCount: 3,
+          totalInputTokens: 900,
+          totalOutputTokens: 400,
+          totalCostUsd: 0.12,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          totalThinkingTokens: 0,
+        },
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      modelUsageTracker: modelUsageTracker as unknown as ModelUsageTracker,
+      developer: 'alice',
+    });
+
+    expect(summary.modelBreakdown).toEqual({
+      'claude-sonnet-5': {
+        requestCount: 3,
+        totalInputTokens: 900,
+        totalOutputTokens: 400,
+        totalCostUsd: 0.12,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        totalThinkingTokens: 0,
+      },
+    });
+  });
+
+  it('defaults modelBreakdown to {} when no modelUsageTracker is provided', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: null,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      developer: 'alice',
+    });
+    expect(summary.modelBreakdown).toEqual({});
+  });
+
+  it('round-trips modelBreakdown through JSON serialization', () => {
+    const original = makeSummary({
+      modelBreakdown: {
+        'claude-sonnet-5': {
+          requestCount: 3,
+          totalInputTokens: 900,
+          totalOutputTokens: 400,
+          totalCostUsd: 0.12,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          totalThinkingTokens: 0,
+        },
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(original)) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.modelBreakdown).toEqual(original.modelBreakdown);
+  });
+
+  it('defaults modelBreakdown to {} for legacy session files missing the field', () => {
+    const legacy = makeSummary();
+    const { modelBreakdown: _modelBreakdown, ...withoutField } = legacy;
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(withoutField)) as Parameters<
+        typeof deserializeFullSessionSummary
+      >[0],
+    );
+    expect(roundTripped.modelBreakdown).toEqual({});
+  });
+
+  it('drops malformed entries (missing numeric fields) rather than throwing', () => {
+    const raw = JSON.stringify({
+      ...makeSummary(),
+      modelBreakdown: {
+        'good-model': {
+          requestCount: 1,
+          totalInputTokens: 10,
+          totalOutputTokens: 10,
+          totalCostUsd: 0.1,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          totalThinkingTokens: 0,
+        },
+        'bad-model': { requestCount: 1 },
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.modelBreakdown).toEqual({
+      'good-model': {
+        requestCount: 1,
+        totalInputTokens: 10,
+        totalOutputTokens: 10,
+        totalCostUsd: 0.1,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        totalThinkingTokens: 0,
+      },
+    });
+  });
+});
+
+describe('qualityProxy field', () => {
+  it('buildSessionSummary populates qualityProxy from qualityProxyTracker.getRawCounts()', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: null,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const qualityProxyTracker = {
+      getRawCounts: () => ({
+        totalSignals: 4,
+        diffApplyCleanCount: 2,
+        diffFailCount: 1,
+        testPassCount: 1,
+        testFailCount: 0,
+        backtrackCount: 0,
+        selfCorrectionCount: 0,
+      }),
+    };
+
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      qualityProxyTracker: qualityProxyTracker as unknown as QualityProxyTracker,
+      developer: 'alice',
+    });
+
+    expect(summary.qualityProxy).toEqual({
+      totalSignals: 4,
+      diffApplyCleanCount: 2,
+      diffFailCount: 1,
+      testPassCount: 1,
+      testFailCount: 0,
+      backtrackCount: 0,
+      selfCorrectionCount: 0,
+    });
+  });
+
+  it('defaults qualityProxy to all-zero counts when no qualityProxyTracker is provided', () => {
+    const mockSessionTracker = {
+      getMetrics: () => ({
+        sessionId: 'test-session',
+        sessionStartTime: 1700000000000,
+        sessionDurationMs: 1000,
+        toolCallCount: 0,
+        toolCallCountByTool: {},
+        toolDurationMsByTool: {},
+        toolSuccessRate: null,
+        toolSuccessRateByTool: {},
+        toolErrorCount: 0,
+        toolErrorsByType: {},
+        uniqueFilesRead: 0,
+        uniqueFilesWritten: 0,
+        bashCommandsRun: 0,
+        bashExitCodes: {},
+        searchQueries: 0,
+        toolCallTimeline: [],
+      }),
+    };
+    const summary = buildSessionSummary({
+      sessionTracker: mockSessionTracker as unknown as SessionTracker,
+      developer: 'alice',
+    });
+    expect(summary.qualityProxy).toEqual(ZERO_QUALITY_PROXY_COUNTS);
+  });
+
+  it('round-trips qualityProxy through JSON serialization', () => {
+    const original = makeSummary({
+      qualityProxy: {
+        totalSignals: 4,
+        diffApplyCleanCount: 2,
+        diffFailCount: 1,
+        testPassCount: 1,
+        testFailCount: 0,
+        backtrackCount: 0,
+        selfCorrectionCount: 0,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(original)) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.qualityProxy).toEqual(original.qualityProxy);
+  });
+
+  it('defaults qualityProxy to all-zero counts for legacy session files missing the field', () => {
+    const legacy = makeSummary();
+    const { qualityProxy: _qualityProxy, ...withoutField } = legacy;
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(withoutField)) as Parameters<
+        typeof deserializeFullSessionSummary
+      >[0],
+    );
+    expect(roundTripped.qualityProxy).toEqual(ZERO_QUALITY_PROXY_COUNTS);
+  });
+
+  it('defaults qualityProxy to all-zero counts when a field is malformed (missing a numeric key)', () => {
+    const raw = JSON.stringify({
+      ...makeSummary(),
+      qualityProxy: { totalSignals: 4 }, // missing the other required numeric fields
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.qualityProxy).toEqual(ZERO_QUALITY_PROXY_COUNTS);
+  });
+});
+
+describe('saveSession cross-process merge', () => {
+  it('does not let a thinner writer erase a richer view of the same session', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const rich = makeSummary({
+      sessionId: 'd0f6fceb-ecc5-4610-9c62-3b2c10415137',
+      toolCallCount: 7,
+      toolBreakdown: { Bash: 7 },
+      model: 'claude-sonnet-4-6',
+      tokensInput: 292,
+      tokensOutput: 533,
+      estimatedCostUsd: 0.008871,
+      modelBreakdown: {
+        'claude-sonnet-4-6': {
+          requestCount: 1,
+          totalInputTokens: 292,
+          totalOutputTokens: 533,
+          totalCostUsd: 0.008871,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          totalThinkingTokens: 0,
+        },
+      },
+    });
+    store.saveSession(rich);
+
+    // The MCP engine spawned by the same CLI session writes its own partial
+    // view under the identical session id.
+    const thin = makeSummary({
+      sessionId: 'd0f6fceb-ecc5-4610-9c62-3b2c10415137',
+      toolCallCount: 1,
+      toolBreakdown: { Bash: 1 },
+      model: null,
+      tokensInput: 0,
+      tokensOutput: 0,
+      estimatedCostUsd: null,
+      modelBreakdown: {},
+    });
+    store.saveSession(thin);
+
+    const loaded = store.loadSession('d0f6fceb-ecc5-4610-9c62-3b2c10415137');
+    expect(loaded?.toolCallCount).toBe(7);
+    expect(loaded?.model).toBe('claude-sonnet-4-6');
+    expect(loaded?.tokensInput).toBe(292);
+    expect(loaded?.modelBreakdown).toEqual({
+      'claude-sonnet-4-6': {
+        requestCount: 1,
+        totalInputTokens: 292,
+        totalOutputTokens: 533,
+        totalCostUsd: 0.008871,
+        totalCacheReadTokens: 0,
+        totalCacheCreationTokens: 0,
+        totalThinkingTokens: 0,
+      },
+    });
+  });
+
+  it('still lets a later write add new activity', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'aaaa1111-2222-4333-8444-555566667777';
+    store.saveSession(makeSummary({ sessionId: id, toolCallCount: 2, toolBreakdown: { Bash: 2 } }));
+    store.saveSession(makeSummary({ sessionId: id, toolCallCount: 9, toolBreakdown: { Bash: 9 } }));
+    const loaded = store.loadSession(id);
+    expect(loaded?.toolCallCount).toBe(9);
+    expect(loaded?.toolBreakdown).toEqual({ Bash: 9 });
+  });
+
+  it('unions per-model breakdowns contributed by different processes', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'bbbb1111-2222-4333-8444-555566667777';
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 1,
+        modelBreakdown: {
+          'model-a': {
+            requestCount: 1,
+            totalInputTokens: 10,
+            totalOutputTokens: 5,
+            totalCostUsd: 0.1,
+            totalCacheReadTokens: 0,
+            totalCacheCreationTokens: 0,
+            totalThinkingTokens: 0,
+          },
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 1,
+        modelBreakdown: {
+          'model-b': {
+            requestCount: 2,
+            totalInputTokens: 20,
+            totalOutputTokens: 6,
+            totalCostUsd: 0.2,
+            totalCacheReadTokens: 0,
+            totalCacheCreationTokens: 0,
+            totalThinkingTokens: 0,
+          },
+        },
+      }),
+    );
+    expect(Object.keys(store.loadSession(id)?.modelBreakdown ?? {}).sort()).toEqual([
+      'model-a',
+      'model-b',
+    ]);
+  });
+
+  it('merges into one file instead of duplicating when a later write computes an earlier date than an existing file', () => {
+    // A `--local`/synthetic-owner process rolling up a session it only
+    // started observing after a date boundary computes its own startTime
+    // from the first event *it* saw — which can be a different calendar
+    // day than a prior save for the same real session id.
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'cccc1111-2222-4333-8444-555566667777';
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        startTime: new Date('2026-03-01T10:00:00Z').getTime(),
+        toolCallCount: 5,
+        toolBreakdown: { Bash: 5 },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        startTime: new Date('2026-03-02T09:00:00Z').getTime(),
+        toolCallCount: 3,
+        toolBreakdown: { Bash: 3 },
+      }),
+    );
+
+    const files = readdirSync(join(tmpDir, 'sessions')).filter((f) => f.includes(id));
+    expect(files).toEqual(['2026-03-01_cccc1111-2222-4333-8444-555566667777.json']);
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.toolCallCount).toBe(5);
+    expect(loaded?.toolBreakdown).toEqual({ Bash: 5 });
+  });
+
+  it('does not erase a real efficiencyScore/sampleCount/components/costByWorkflowRunId when a later write never seeded them', () => {
+    // Simulates a process that resolved its session id via the cwd-only
+    // fallback (rehydrateTrackersIfResumed() is skipped for that path in
+    // src/index.ts) writing an unseeded shutdown save over a checkpoint that
+    // already had a real efficiency score recorded.
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'dddd1111-2222-4333-8444-555566667777';
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        efficiencyScore: 0.82,
+        efficiencyScoreSampleCount: 5,
+        efficiencyScoreComponents: {
+          speed: 0.8,
+          correctness: 0.9,
+          autonomy: 0.7,
+          firstAttemptQuality: 0.85,
+        },
+        costByWorkflowRunId: { 'run-1': { '2026-03-01': 1.5 } },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 20,
+        efficiencyScore: null,
+        efficiencyScoreSampleCount: 0,
+        efficiencyScoreComponents: null,
+        costByWorkflowRunId: {},
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.toolCallCount).toBe(20);
+    expect(loaded?.efficiencyScore).toBe(0.82);
+    expect(loaded?.efficiencyScoreSampleCount).toBe(5);
+    expect(loaded?.efficiencyScoreComponents).toEqual({
+      speed: 0.8,
+      correctness: 0.9,
+      autonomy: 0.7,
+      firstAttemptQuality: 0.85,
+    });
+    expect(loaded?.costByWorkflowRunId).toEqual({ 'run-1': { '2026-03-01': 1.5 } });
+  });
+
+  it('merges the efficiencyScore/sampleCount/components triple atomically when BOTH sides have a real score', () => {
+    // sampleCount is a weight multiplier for EfficiencyScorer.seedFromPersisted()
+    // (score * sampleCount), not just a display field — taking the score from
+    // one side and the (larger) sampleCount from the other would attach a
+    // thin sample's score to a much larger weight, corrupting every future
+    // re-seed. The larger-sampleCount side's full triple must win together.
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = 'eeee1111-2222-4333-8444-555566667777';
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        efficiencyScore: 0.8,
+        efficiencyScoreSampleCount: 50,
+        efficiencyScoreComponents: {
+          speed: 0.8,
+          correctness: 0.8,
+          autonomy: 0.8,
+          firstAttemptQuality: 0.8,
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 20,
+        efficiencyScore: 0.4,
+        efficiencyScoreSampleCount: 3,
+        efficiencyScoreComponents: {
+          speed: 0.4,
+          correctness: 0.4,
+          autonomy: 0.4,
+          firstAttemptQuality: 0.4,
+        },
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    // The 50-sample side wins outright — score AND sampleCount AND
+    // components together — not a mix of the two sides' fields.
+    expect(loaded?.efficiencyScore).toBe(0.8);
+    expect(loaded?.efficiencyScoreSampleCount).toBe(50);
+    expect(loaded?.efficiencyScoreComponents).toEqual({
+      speed: 0.8,
+      correctness: 0.8,
+      autonomy: 0.8,
+      firstAttemptQuality: 0.8,
+    });
+  });
+});
+
+describe('attribution field', () => {
+  function makeTurnCostAttributor(metrics: {
+    costByToolType?: Record<
+      string,
+      {
+        totalCost: number;
+        callCount: number;
+        avgCost: number;
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadTokens?: number;
+        cacheCreationTokens?: number;
+        tokens?: number;
+      }
+    >;
+    costBySkill?: Record<
+      string,
+      {
+        callCount: number;
+        attributedCallCount: number;
+        totalCost: number;
+        avgCost: number;
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheCreationTokens: number;
+        totalDurationMs: number;
+        tokens: number;
+      }
+    >;
+  }) {
+    return {
+      getMetrics: () => ({
+        turns: [],
+        costByToolType: metrics.costByToolType ?? {},
+        costBySkill: metrics.costBySkill ?? {},
+        totalAttributedCost: 0,
+        attributionRate: 0,
+      }),
+    } as unknown as import('../metrics/turn-cost-attributor.js').TurnCostAttributor;
+  }
+
+  it('composes buckets.tool and buckets.skill from the turn cost attributor', () => {
+    const turnCostAttributor = makeTurnCostAttributor({
+      costByToolType: {
+        Read: {
+          totalCost: 0.02,
+          callCount: 4,
+          avgCost: 0.005,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadTokens: 0,
+          cacheCreationTokens: 0,
+          tokens: 0,
+        },
+      },
+      costBySkill: {
+        unslop: {
+          callCount: 2,
+          attributedCallCount: 2,
+          totalCost: 0.03,
+          avgCost: 0.015,
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheReadTokens: 10,
+          cacheCreationTokens: 5,
+          totalDurationMs: 4000,
+          tokens: 165,
+        },
+      },
+    });
+
+    const summary = buildSessionSummary({
+      sessionTracker: makeSessionTracker(),
+      turnCostAttributor,
+      developer: 'alice',
+    });
+
+    // Tool bucket carries no token signal from this fixture, so tokens stay
+    // 0 and breakdown is omitted; skill tokens are now the four-category
+    // sum (100 + 50 + 10 + 5 = 165, up from the pre-cache-creation 160).
+    expect(summary.attribution).toEqual({
+      buckets: {
+        tool: { Read: { costUsd: 0.02, tokens: 0, count: 4, durationMs: 0 } },
+        skill: {
+          unslop: {
+            costUsd: 0.03,
+            tokens: 165,
+            count: 2,
+            durationMs: 4000,
+            breakdown: {
+              inputTokens: 100,
+              outputTokens: 50,
+              cacheReadTokens: 10,
+              cacheCreationTokens: 5,
+            },
+          },
+        },
+      },
+      highContextCostUsd: 0,
+      apiDurationMs: null,
+    });
+  });
+
+  it('reads subagentByAgentType/highContextCostUsd/apiDurationMs from CostMetrics when present, carrying the subagent breakdown', () => {
+    const costTracker = {
+      getMetrics: () => ({
+        subagentByAgentType: {
+          'general-purpose': {
+            costUsd: 0.5,
+            tokens: 2000,
+            count: 3,
+            durationMs: 0,
+            breakdown: {
+              inputTokens: 1500,
+              outputTokens: 400,
+              cacheReadTokens: 80,
+              cacheCreationTokens: 20,
+            },
+          },
+        },
+        highContextCostUsd: 0.75,
+        apiDurationMs: 12_000,
+        unpricedByModel: {},
+        estimatedByModel: {},
+      }),
+    } as unknown as CostTracker;
+
+    const summary = buildSessionSummary({
+      sessionTracker: makeSessionTracker(),
+      costTracker,
+      developer: 'alice',
+    });
+
+    expect(summary.attribution).toEqual({
+      buckets: {
+        subagent: {
+          'general-purpose': {
+            costUsd: 0.5,
+            tokens: 2000,
+            count: 3,
+            durationMs: 0,
+            breakdown: {
+              inputTokens: 1500,
+              outputTokens: 400,
+              cacheReadTokens: 80,
+              cacheCreationTokens: 20,
+            },
+          },
+        },
+      },
+      highContextCostUsd: 0.75,
+      apiDurationMs: 12_000,
+    });
+  });
+
+  it('drops facets with no entries instead of persisting an empty object', () => {
+    const turnCostAttributor = makeTurnCostAttributor({
+      costByToolType: { Read: { totalCost: 0.01, callCount: 1, avgCost: 0.01 } },
+    });
+
+    const summary = buildSessionSummary({
+      sessionTracker: makeSessionTracker(),
+      turnCostAttributor,
+      developer: 'alice',
+    });
+
+    expect(summary.attribution?.buckets.skill).toBeUndefined();
+    expect(summary.attribution?.buckets.subagent).toBeUndefined();
+    expect(summary.attribution?.buckets.tool).toBeDefined();
+  });
+
+  it('leaves attribution undefined when neither costTracker nor turnCostAttributor is supplied', () => {
+    const summary = buildSessionSummary({
+      sessionTracker: makeSessionTracker(),
+      developer: 'alice',
+    });
+
+    expect(summary.attribution).toBeUndefined();
+  });
+
+  it('round-trips attribution through JSON serialization', () => {
+    const original = makeSummary({
+      attribution: {
+        buckets: {
+          tool: { Read: { costUsd: 0.02, tokens: 0, count: 4, durationMs: 0 } },
+          skill: { unslop: { costUsd: 0.03, tokens: 160, count: 2, durationMs: 4000 } },
+        },
+        highContextCostUsd: 0.75,
+        apiDurationMs: 12_000,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(original)) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.attribution).toEqual(original.attribution);
+  });
+
+  it('parses to undefined for a legacy summary without the field', () => {
+    const legacy = makeSummary();
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(JSON.stringify(legacy)) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.attribution).toBeUndefined();
+  });
+
+  it('parses a legacy bucket with no breakdown field (pre-#692 file) without dropping the bucket', () => {
+    const raw = JSON.stringify({
+      ...makeSummary(),
+      attribution: {
+        buckets: {
+          skill: { unslop: { costUsd: 0.03, tokens: 165, count: 2, durationMs: 4000 } },
+        },
+        highContextCostUsd: 0,
+        apiDurationMs: null,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.attribution?.buckets.skill).toEqual({
+      unslop: { costUsd: 0.03, tokens: 165, count: 2, durationMs: 4000 },
+    });
+  });
+
+  it('drops a malformed breakdown but keeps the bucket', () => {
+    const raw = JSON.stringify({
+      ...makeSummary(),
+      attribution: {
+        buckets: {
+          skill: {
+            unslop: {
+              costUsd: 0.03,
+              tokens: 165,
+              count: 2,
+              durationMs: 4000,
+              breakdown: { inputTokens: 100, outputTokens: 50, cacheReadTokens: 'nope' },
+            },
+          },
+        },
+        highContextCostUsd: 0,
+        apiDurationMs: null,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.attribution?.buckets.skill).toEqual({
+      unslop: { costUsd: 0.03, tokens: 165, count: 2, durationMs: 4000 },
+    });
+  });
+
+  it('drops a malformed bucket (missing numeric field) rather than throwing', () => {
+    const raw = JSON.stringify({
+      ...makeSummary(),
+      attribution: {
+        buckets: {
+          tool: {
+            Read: { costUsd: 0.02, tokens: 0, count: 4, durationMs: 0 },
+            Bash: { costUsd: 0.01 }, // missing tokens/count/durationMs
+          },
+        },
+        highContextCostUsd: 0.1,
+        apiDurationMs: null,
+      },
+    });
+    const roundTripped = deserializeFullSessionSummary(
+      JSON.parse(raw) as Parameters<typeof deserializeFullSessionSummary>[0],
+    );
+    expect(roundTripped.attribution?.buckets.tool).toEqual({
+      Read: { costUsd: 0.02, tokens: 0, count: 4, durationMs: 0 },
+    });
+  });
+
+  it('merge takes a field-wise max across matching bucket keys', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = `merge-attr-${Date.now()}`;
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            tool: { Read: { costUsd: 0.02, tokens: 100, count: 4, durationMs: 500 } },
+          },
+          highContextCostUsd: 0.1,
+          apiDurationMs: 1000,
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        toolCallCount: 20,
+        attribution: {
+          buckets: {
+            tool: { Read: { costUsd: 0.05, tokens: 40, count: 6, durationMs: 300 } },
+            skill: { unslop: { costUsd: 0.01, tokens: 20, count: 1, durationMs: 200 } },
+          },
+          highContextCostUsd: 0.05,
+          apiDurationMs: 3000,
+        },
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.attribution).toEqual({
+      buckets: {
+        tool: { Read: { costUsd: 0.05, tokens: 100, count: 6, durationMs: 500 } },
+        skill: { unslop: { costUsd: 0.01, tokens: 20, count: 1, durationMs: 200 } },
+      },
+      highContextCostUsd: 0.1,
+      apiDurationMs: 3000,
+    });
+  });
+
+  it('merge takes a field-wise max on breakdown when both sides have one', () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = `merge-breakdown-both-${Date.now()}`;
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: {
+              unslop: {
+                costUsd: 0.02,
+                tokens: 100,
+                count: 4,
+                durationMs: 500,
+                breakdown: {
+                  inputTokens: 80,
+                  outputTokens: 10,
+                  cacheReadTokens: 5,
+                  cacheCreationTokens: 40,
+                },
+              },
+            },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: {
+              unslop: {
+                costUsd: 0.05,
+                tokens: 40,
+                count: 6,
+                durationMs: 300,
+                breakdown: {
+                  inputTokens: 30,
+                  outputTokens: 60,
+                  cacheReadTokens: 2,
+                  cacheCreationTokens: 10,
+                },
+              },
+            },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.attribution?.buckets.skill?.unslop.breakdown).toEqual({
+      inputTokens: 80,
+      outputTokens: 60,
+      cacheReadTokens: 5,
+      cacheCreationTokens: 40,
+    });
+  });
+
+  it("merge keeps the one side's breakdown when the other side has none", () => {
+    const store = new SessionStore({ storagePath: tmpDir });
+    const id = `merge-breakdown-one-side-${Date.now()}`;
+
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: { unslop: { costUsd: 0.02, tokens: 100, count: 4, durationMs: 500 } },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+    store.saveSession(
+      makeSummary({
+        sessionId: id,
+        attribution: {
+          buckets: {
+            skill: {
+              unslop: {
+                costUsd: 0.05,
+                tokens: 165,
+                count: 6,
+                durationMs: 300,
+                breakdown: {
+                  inputTokens: 100,
+                  outputTokens: 50,
+                  cacheReadTokens: 10,
+                  cacheCreationTokens: 5,
+                },
+              },
+            },
+          },
+          highContextCostUsd: 0,
+          apiDurationMs: null,
+        },
+      }),
+    );
+
+    const loaded = store.loadSession(id);
+    expect(loaded?.attribution?.buckets.skill?.unslop.breakdown).toEqual({
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheReadTokens: 10,
+      cacheCreationTokens: 5,
+    });
   });
 });

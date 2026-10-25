@@ -1,4 +1,4 @@
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Sessions } from './Sessions';
 
@@ -6,7 +6,7 @@ interface DetailMap {
   readonly [sessionId: string]: unknown;
 }
 
-function renderSessions(listData: unknown, detailMap: DetailMap = {}) {
+function renderSessions(listData: unknown, detailMap: DetailMap = {}, workflowsData: unknown = []) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
   globalThis.fetch = ((url: string) => {
     if (url.startsWith('/api/sessions/')) {
@@ -14,6 +14,14 @@ function renderSessions(listData: unknown, detailMap: DetailMap = {}) {
       const detail = detailMap[id] ?? { sessionId: id, timeline: [] };
       return Promise.resolve(
         new Response(JSON.stringify(detail), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }
+    if (url.startsWith('/api/workflows')) {
+      return Promise.resolve(
+        new Response(JSON.stringify(workflowsData), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         }),
@@ -57,6 +65,25 @@ describe('Sessions view', () => {
     expect(screen.getByText(/s2/)).toBeInTheDocument();
   });
 
+  it('states the actual number of visible sessions in the runs-outside-page disclosure, not the page-size cap', async () => {
+    // Fewer sessions than the page-size cap are loaded (2), and one run
+    // belongs to a session that isn't among them — the disclosure must
+    // report against the real visible count, not the fetch cap.
+    renderSessions(SAMPLE_LIST, {}, [
+      {
+        runId: 'run-1',
+        parentSessionId: 'missing-session',
+        taskId: null,
+        workflowName: 'wf',
+        status: 'completed',
+        defaultModel: 'claude',
+      },
+    ]);
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/\+1 run above/i)).toBeInTheDocument());
+    expect(screen.getByText(/outside the 2 shown below/i)).toBeInTheDocument();
+  });
+
   it('renders the consolidated workflow KPI strip and filter controls', async () => {
     renderSessions(SAMPLE_LIST);
     await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
@@ -92,14 +119,44 @@ describe('Sessions view', () => {
     }));
     renderSessions(fullPage);
     await waitFor(() =>
-      expect(screen.getByText(/showing 50 most recent sessions/i)).toBeInTheDocument(),
+      expect(screen.getByText(/only the 50 most recent sessions are loaded/i)).toBeInTheDocument(),
     );
   });
 
   it('hides the cap notice when fewer than the page size are returned', async () => {
     renderSessions(SAMPLE_LIST);
     await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
-    expect(screen.queryByText(/showing 50 most recent sessions/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/only the 50 most recent sessions are loaded/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it('clarifies the cap notice further narrows when a run filter is active', async () => {
+    // A run filter can shrink the visible list to far fewer rows than the
+    // fetch cap; the notice must not read as a description of that
+    // narrowed view.
+    const fullPage = Array.from({ length: 50 }, (_, i) => ({
+      sessionId: `cap-${i}`,
+      startTime: '2026-05-28T09:00:00Z',
+      toolCallCount: 1,
+      estimatedCostUsd: 0,
+    }));
+    renderSessions(fullPage);
+    await waitFor(() =>
+      expect(screen.getByText(/only the 50 most recent sessions are loaded/i)).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText(/only the 50 most recent sessions are loaded/i).textContent,
+    ).not.toMatch(/narrow/i);
+
+    const statusGroup = screen.getByRole('group', { name: /status filter/i });
+    fireEvent.click(within(statusGroup).getByRole('button', { name: 'Completed' }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/only the 50 most recent sessions are loaded/i).textContent).toMatch(
+        /filters narrow this further/i,
+      ),
+    );
   });
 
   it('auto-selects the first session on load (no manual pick required)', async () => {
@@ -177,6 +234,154 @@ describe('Sessions view', () => {
     expect(screen.getByText('completed')).toBeInTheDocument();
   });
 
+  it('renders every model in the Model card when modelBreakdown has more than one entry, most-called first', async () => {
+    const detail = {
+      sessionId: 's1',
+      model: 'claude-opus-5',
+      modelBreakdown: {
+        'claude-opus-5': {
+          requestCount: 2,
+          totalInputTokens: 100,
+          totalOutputTokens: 50,
+          totalCostUsd: 0.5,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          totalThinkingTokens: 0,
+        },
+        'claude-sonnet-5': {
+          requestCount: 8,
+          totalInputTokens: 400,
+          totalOutputTokens: 200,
+          totalCostUsd: 1.5,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          totalThinkingTokens: 0,
+        },
+      },
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+    };
+    const { container } = renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(screen.getAllByText('Read').length).toBeGreaterThanOrEqual(1));
+    expect(screen.getByText('Usage by model')).toBeInTheDocument();
+    expect(screen.getByText('claude-sonnet-5')).toBeInTheDocument();
+    expect(screen.getByText('claude-opus-5')).toBeInTheDocument();
+    const text = container.textContent ?? '';
+    expect(text.indexOf('claude-sonnet-5')).toBeLessThan(text.indexOf('claude-opus-5'));
+  });
+
+  it('renders the single-model layout unchanged when modelBreakdown has exactly one entry', async () => {
+    const detail = {
+      sessionId: 's1',
+      model: 'claude-sonnet-5',
+      modelBreakdown: {
+        'claude-sonnet-5': {
+          requestCount: 5,
+          totalInputTokens: 200,
+          totalOutputTokens: 100,
+          totalCostUsd: 1,
+          totalCacheReadTokens: 0,
+          totalCacheCreationTokens: 0,
+          totalThinkingTokens: 0,
+        },
+      },
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+    };
+    renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(screen.getAllByText('Read').length).toBeGreaterThanOrEqual(1));
+    expect(screen.getByText('Usage by model')).toBeInTheDocument();
+    expect(screen.getByText('claude-sonnet-5')).toBeInTheDocument();
+  });
+
+  it('falls back to data.model card when modelBreakdown is absent or empty', async () => {
+    const detail = {
+      sessionId: 's1',
+      model: 'claude-sonnet-5',
+      modelBreakdown: {},
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+    };
+    renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(screen.getAllByText('Read').length).toBeGreaterThanOrEqual(1));
+    expect(screen.getByText('Model')).toBeInTheDocument();
+    expect(screen.getByText('claude-sonnet-5')).toBeInTheDocument();
+    expect(screen.queryByText('Usage by model')).toBeNull();
+  });
+
+  it('renders per-model rows with token and cost data', async () => {
+    const detail = {
+      sessionId: 's1',
+      modelBreakdown: {
+        'claude-sonnet-5': {
+          requestCount: 5,
+          totalInputTokens: 1000,
+          totalOutputTokens: 500,
+          totalCostUsd: 1.5,
+          totalCacheReadTokens: 200,
+          totalCacheCreationTokens: 100,
+          totalThinkingTokens: 0,
+        },
+      },
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+    };
+    const { container } = renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(screen.getByText('Usage by model')).toBeInTheDocument());
+    expect(screen.getByText('Input')).toBeInTheDocument();
+    const text = container.textContent ?? '';
+    expect(text).toContain('1.0k');
+    expect(text).toContain('500');
+    expect(text).toContain('$1.50');
+  });
+
+  it('renders lines and cache % metadata when present', async () => {
+    const detail = {
+      sessionId: 's1',
+      durationMs: 5000,
+      linesAdded: 42,
+      linesRemoved: 8,
+      tokensInput: 1000,
+      tokensCacheRead: 200,
+      tokensCacheCreation: 100,
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+    };
+    const { container } = renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(screen.getAllByText('Read').length).toBeGreaterThanOrEqual(1));
+    const text = container.textContent ?? '';
+    expect(text).toContain('+42');
+    expect(text).toContain('−8');
+    expect(text).toContain('lines');
+    expect(text).toContain('cache 15%');
+  });
+
+  it('hides the cache figure when the session had no cache reads or writes at all', async () => {
+    const detail = {
+      sessionId: 's1',
+      durationMs: 5000,
+      linesAdded: 1,
+      tokensInput: 1000,
+      tokensCacheRead: 0,
+      tokensCacheCreation: 0,
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+    };
+    const { container } = renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(screen.getAllByText('Read').length).toBeGreaterThanOrEqual(1));
+    expect(container.textContent ?? '').not.toMatch(/cache \d+%/);
+  });
+
+  it('does not render API duration line when apiDurationMs is null', async () => {
+    const detail = {
+      sessionId: 's1',
+      durationMs: 5000,
+      attribution: {
+        buckets: {},
+        highContextCostUsd: 0,
+        apiDurationMs: null,
+      },
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+    };
+    renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(screen.getAllByText('Read').length).toBeGreaterThanOrEqual(1));
+    expect(screen.queryByText(/API.*wall/)).toBeNull();
+  });
+
   it('renders a Files Read list from data.filesRead, truncated to the last two path segments', async () => {
     const detail = {
       sessionId: 's1',
@@ -199,21 +404,45 @@ describe('Sessions view', () => {
     expect(screen.queryByText('Files Read')).toBeNull();
   });
 
-  it('renders antiPatterns pills reusing the SEGMENT_LABELS taxonomy, falling back to the raw type for unmapped values', async () => {
+  it('renders antiPatterns pills reusing the SEGMENT_LABELS taxonomy, summing real magnitude across grouped incidents', async () => {
+    // Real API shape: one entry per detected incident, each carrying its
+    // own file/command target.
     const detail = {
       sessionId: 's1',
       timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
       antiPatterns: [
-        { type: 'thrashing', count: 3 },
-        { type: 'over_delegation', count: 1 },
+        { type: 'thrashing', file: 'a.ts', iterations: 3 },
+        { type: 'thrashing', file: 'b.ts', iterations: 2 },
+        { type: 'thrashing', file: 'c.ts', iterations: 4 },
+        { type: 'over_delegation', agentCount: 5 },
       ],
     };
     const { container } = renderSessions(SAMPLE_LIST, { s1: detail });
     await waitFor(() => expect(container.textContent).toContain('Edit/Test Thrashing'));
-    expect(container.textContent).toContain('× 3');
-    // over_delegation has no SEGMENT_LABELS entry — falls back to the raw type string.
-    expect(container.textContent).toContain('over_delegation');
-    expect(container.textContent).toContain('× 1');
+    // Three thrashing incidents (3 + 2 + 4 iterations) sum to the real
+    // magnitude, not the count of incident objects (which would be 3).
+    expect(container.textContent).toContain('× 9');
+    // over_delegation has a SEGMENT_LABELS entry and its own magnitude.
+    expect(container.textContent).toContain('Over-Delegation');
+    expect(container.textContent).not.toContain('over_delegation');
+    expect(container.textContent).toContain('× 5');
+  });
+
+  it('groups same-type anti-pattern incidents into one pill with a stable key, summing to 1 per incident when no magnitude field is present', async () => {
+    const detail = {
+      sessionId: 's1',
+      timeline: [{ timestamp: 1_000, toolName: 'Read', durationMs: 120, success: true }],
+      antiPatterns: [
+        { type: 'stuck_loop', command: 'npm test' },
+        { type: 'stuck_loop', command: 'npm run build' },
+      ],
+    };
+    const { container } = renderSessions(SAMPLE_LIST, { s1: detail });
+    await waitFor(() => expect(container.textContent).toContain('× 2'));
+    // Exactly one pill for the type — not two pills sharing a React key,
+    // and no "undefined" from a missing top-level count field.
+    expect(screen.getAllByText(/stuck.loop/i)).toHaveLength(1);
+    expect(container.textContent).not.toContain('undefined');
   });
 
   it('does not render the Anti-Patterns section when antiPatterns is absent or empty', async () => {
@@ -282,9 +511,9 @@ describe('Sessions view — real API shapes', () => {
     await waitFor(() => expect(screen.getByText(/abc-123/)).toBeInTheDocument());
     expect(screen.getByText(/def-456/)).toBeInTheDocument();
     expect(screen.getByText('28 calls')).toBeInTheDocument();
-    // Sub-dollar costs render with 4 decimals via the shared formatUsd helper
-    // (0 < value < $1 keeps meaningful digits): 0.42 → "$0.4200".
-    expect(screen.getByText('$0.4200')).toBeInTheDocument();
+    // Sub-dollar costs at or above $0.10 render with 2 decimals via the shared
+    // formatUsd helper: 0.42 → "$0.42".
+    expect(screen.getByText('$0.42')).toBeInTheDocument();
   });
 
   it('renders without crashing when estimatedCostUsd is undefined', async () => {
@@ -486,6 +715,67 @@ describe('Sessions view — workflow consolidation', () => {
     expect(container.textContent).toMatch(/\$3(\.0+)?/);
   });
 
+  // A run's durationMs being null (unfinished/killed, still upstream in
+  // workflow-store.ts/workflow-watcher.ts) is not the same as a confirmed
+  // 0ms run. Averaging must exclude it rather than let it drag the average
+  // toward zero.
+  it('excludes a null durationMs from the Avg duration KPI average instead of treating it as zero', async () => {
+    const runsWithUnknownDuration = [RUNS[0], { ...RUNS[1], durationMs: null }];
+    const { container } = renderSessionsFull(SESSIONS, runsWithUnknownDuration);
+    await waitFor(() => expect(screen.getByText(/sess-a/)).toBeInTheDocument());
+    // Only run-1's 60_000ms contributes — average of just that one run is
+    // "1m", not (60_000 + 0) / 2 = "30s" (which is what treating the null
+    // run's duration as 0 would produce).
+    expect(container.textContent).toContain('1m');
+    expect(container.textContent).not.toContain('30s');
+  });
+
+  it('shows a session with no workflow runs under the Today tab when it started today', async () => {
+    // sessionId kept to 8 chars: SessionListRow renders `sessionId.slice(0, 8)`,
+    // so a longer id would never render in full and this assertion would be
+    // vacuous regardless of the filtering fix under test.
+    const todaySession = {
+      sessionId: 'sess-tdy',
+      startTime: new Date().toISOString(),
+      toolCallCount: 3,
+      estimatedCostUsd: 0.1,
+    };
+    const { container } = renderSessionsFull([...SESSIONS, todaySession], RUNS);
+    await waitFor(() => expect(screen.getByText(/sess-a/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('tab', { name: 'Today' }));
+    await waitFor(() => expect(within(container).getByText(/sess-tdy/)).toBeInTheDocument());
+  });
+
+  it('hides a session under the Today tab when it did not start today, even with no workflow runs', async () => {
+    const oldSession = {
+      sessionId: 'sess-old',
+      startTime: '2020-01-01T00:00:00Z',
+      toolCallCount: 3,
+      estimatedCostUsd: 0.1,
+    };
+    const { container } = renderSessionsFull([...SESSIONS, oldSession], RUNS);
+    await waitFor(() => expect(screen.getByText(/sess-a/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('tab', { name: 'Today' }));
+    await waitFor(() => expect(container.textContent).not.toContain('sess-old'));
+  });
+
+  // A run's totalUsd being null is ambiguous between "confirmed $0" and "no
+  // process ever observed this run's cost". costUnknown distinguishes the
+  // two (a partial mitigation); the KPI must disclose when it does.
+  it('flags the Workflow spend KPI as partial when a run has an unknown (not confirmed-zero) cost', async () => {
+    const runsWithUnknownCost = [RUNS[0], { ...RUNS[1], totalUsd: null, costUnknown: true }];
+    renderSessionsFull(SESSIONS, runsWithUnknownCost);
+    await waitFor(() => expect(screen.getByText(/sess-a/)).toBeInTheDocument());
+    expect(screen.getByText(/partial/i)).toBeInTheDocument();
+  });
+
+  it('does not flag the Workflow spend KPI as partial when every null cost is a confirmed $0', async () => {
+    const runsWithConfirmedZero = [RUNS[0], { ...RUNS[1], totalUsd: null, costUnknown: false }];
+    renderSessionsFull(SESSIONS, runsWithConfirmedZero);
+    await waitFor(() => expect(screen.getByText(/sess-a/)).toBeInTheDocument());
+    expect(screen.queryByText(/partial/i)).not.toBeInTheDocument();
+  });
+
   it('scopes the visible session list to the run-source filter', async () => {
     renderSessionsFull(SESSIONS, RUNS);
     await waitFor(() => expect(screen.getByText(/sess-a/)).toBeInTheDocument());
@@ -611,5 +901,494 @@ describe('Sessions view — subagent fetch failure fallback', () => {
     await waitFor(() => expect(screen.getByText('Parent')).toBeInTheDocument());
     expect(screen.queryByText('Loading subagents')).toBeNull();
     await waitFor(() => expect(subagentsCalls.length).toBeGreaterThan(0));
+  });
+});
+
+describe('Sessions view — live-detection and selection reliability', () => {
+  // A deep link to a non-existent session (e.g., ?session=bad-id) should
+  // show an error state with a "clear selection" action, not blank the detail pane.
+  it('shows error state and clear-selection action when a deep-linked session does not exist', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    globalThis.fetch = ((url: string) => {
+      if (url.startsWith('/api/sessions/')) {
+        const id = decodeURIComponent(url.split('/').pop() ?? '');
+        // Simulate a 404 for the bad deep-linked id
+        if (id === 'bad-id') {
+          return Promise.resolve(new Response('{"error":"not_found"}', { status: 404 }));
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ sessionId: id, timeline: [] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(SAMPLE_LIST), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as typeof globalThis.fetch;
+
+    const original = window.location;
+    // @ts-expect-error -- test-only reassignment
+    delete window.location;
+    window.location = { ...original, search: '?session=bad-id' } as unknown as string & Location;
+
+    render(
+      <QueryClientProvider client={qc}>
+        <Sessions />
+      </QueryClientProvider>,
+    );
+
+    // The error state should render with the title "Session not found"
+    await waitFor(() => expect(screen.getByText('Session not found')).toBeInTheDocument());
+    // And a "Clear selection" button must be present to dismiss the error
+    const clearBtn = screen.getByRole('button', { name: /clear selection/i });
+    expect(clearBtn).toBeInTheDocument();
+
+    // Clicking the button should clear selectedId. The error state should disappear.
+    fireEvent.click(clearBtn);
+    await waitFor(() => expect(screen.queryByText('Session not found')).not.toBeInTheDocument());
+
+    window.location = original as unknown as string & Location;
+  });
+
+  // When current.data.sessionId is present but liveSessions is empty (a
+  // session has ended), the liveSessionIds derivation should not fall back to
+  // treating the ended session as live. It should return an empty set.
+  it('treats empty liveSessions array as "nothing is live" and does not fall back to current.data.sessionId', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    const sessionList = [
+      {
+        sessionId: 's1',
+        startTime: '2026-05-28T09:00:00Z',
+        toolCallCount: 10,
+      },
+      {
+        sessionId: 's2',
+        startTime: '2026-05-27T09:00:00Z',
+        toolCallCount: 5,
+      },
+    ];
+
+    globalThis.fetch = ((url: string) => {
+      if (url === '/api/session/current') {
+        // Session s1 was active before but has ended: no liveSessions, but sessionId is present
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              sessionId: 's1',
+              liveSessions: [],
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          ),
+        );
+      }
+      if (url.startsWith('/api/sessions/')) {
+        const id = decodeURIComponent(url.split('/').pop() ?? '');
+        return Promise.resolve(
+          new Response(JSON.stringify({ sessionId: id, timeline: [] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(sessionList), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as typeof globalThis.fetch;
+
+    render(
+      <QueryClientProvider client={qc}>
+        <Sessions />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    // s1 should NOT have the "live" badge because liveSessions is empty (even
+    // though current.data.sessionId = 's1'). Instead, the oldest item (s1)
+    // should be auto-selected by the fallback once current settles.
+    const liveElements = screen.queryAllByText(/live/i);
+    expect(liveElements.length).toBe(0);
+  });
+
+  // Race condition guard: /api/sessions (list) can resolve before
+  // /api/session/current (live check). The auto-select fallback to rows[0]
+  // must wait until current.isLoading has settled to false at least once,
+  // so it never clobbers a potential live-session selection.
+  it('does not auto-select from rows before the live-session check has settled', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    const sessionList = [
+      { sessionId: 's1', startTime: '2026-05-28T09:00:00Z', toolCallCount: 10 },
+      { sessionId: 's2', startTime: '2026-05-27T09:00:00Z', toolCallCount: 5 },
+    ];
+
+    let currentFetchResolved = false;
+    const detailFetchCalls: string[] = [];
+
+    globalThis.fetch = ((url: string) => {
+      if (url === '/api/session/current') {
+        // Simulate a delay: this resolves after /api/sessions
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            currentFetchResolved = true;
+            resolve(
+              new Response(
+                JSON.stringify({
+                  sessionId: 's2',
+                  liveSessions: ['s2'],
+                }),
+                {
+                  status: 200,
+                  headers: { 'content-type': 'application/json' },
+                },
+              ),
+            );
+          }, 100);
+        });
+      }
+      if (url.startsWith('/api/sessions/')) {
+        const id = decodeURIComponent(url.split('/').pop() ?? '');
+        // Track which session detail is fetched to verify correct selection.
+        // Without the fix, s1 would be fetched (buggy early auto-select).
+        // With the fix, s2 is fetched (correct selection after live check settles).
+        detailFetchCalls.push(id);
+        return Promise.resolve(
+          new Response(JSON.stringify({ sessionId: id, timeline: [] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      // /api/sessions list resolves immediately
+      return Promise.resolve(
+        new Response(JSON.stringify(sessionList), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as typeof globalThis.fetch;
+
+    render(
+      <QueryClientProvider client={qc}>
+        <Sessions />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    // Even though s1 loads first from the list, the effect should NOT auto-select
+    // it immediately. Once the live-session check settles (current.isLoading → false),
+    // it should select s2 (the live session), not s1.
+    await waitFor(() => expect(currentFetchResolved).toBe(true), { timeout: 1000 });
+    // Verify that s2's detail was fetched, not s1's. This proves s2 was
+    // selected — if s1 had been selected immediately, the "selectedId is
+    // already set" guard would block ever switching to s2.
+    await waitFor(() => expect(detailFetchCalls).toContain('s2'));
+  });
+});
+
+describe('Sessions view — Tools panel Context tab', () => {
+  it('fetches Context tab data through fetchContext(sessionId), rendering real contribution data', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    const sessionList = [
+      { sessionId: 'live-sess', startTime: '2026-05-28T09:00:00Z', toolCallCount: 5 },
+    ];
+    const contextRequests: string[] = [];
+
+    globalThis.fetch = ((url: string) => {
+      if (url === '/api/session/current') {
+        return Promise.resolve(
+          new Response(JSON.stringify({ sessionId: 'live-sess', liveSessions: ['live-sess'] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (url.startsWith('/api/context')) {
+        contextRequests.push(url);
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              turnCount: 3,
+              growth: { startTokens: 0, currentTokens: 1000, deltaTokens: 1000 },
+              currentBreakdown: { system: 100, tools: 500, user: 200, assistant: 200 },
+              fillPercent: 0.5,
+              contextWindow: 200_000,
+              toolContributions: [
+                { tool: 'Read', totalBytes: 2000, estimatedTokens: 500, percentOfToolOutput: 1 },
+              ],
+              history: [],
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          ),
+        );
+      }
+      if (url.startsWith('/api/sessions/')) {
+        const id = decodeURIComponent(url.split('/').pop() ?? '');
+        return Promise.resolve(
+          new Response(JSON.stringify({ sessionId: id, toolBreakdown: { Bash: 3 } }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(sessionList), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as typeof globalThis.fetch;
+
+    render(
+      <QueryClientProvider client={qc}>
+        <Sessions />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText(/^Tools$/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('tab', { name: 'Context' }));
+    await waitFor(() => expect(screen.getByText('Read')).toBeInTheDocument());
+    // Requesting the exact endpoint shape fetchContext(sessionId) builds
+    // confirms the query goes through the shared client helper, not just
+    // that some request happened to succeed.
+    expect(contextRequests[0]).toBe('/api/context?sessionId=live-sess');
+  });
+
+  // Switching from a live session with the Context tab open to a different,
+  // non-live session must reset the Tools panel to the Calls tab — a
+  // session with real tool-call data should never render as if it has no
+  // data.
+  it('resets the Tools panel back to the Calls tab when switching from a live session to a non-live one', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: 0 } } });
+    const sessionList = [
+      { sessionId: 'live-sess', startTime: '2026-05-28T09:00:00Z', toolCallCount: 5 },
+      { sessionId: 'done-sess', startTime: '2026-05-27T09:00:00Z', toolCallCount: 3 },
+    ];
+
+    globalThis.fetch = ((url: string) => {
+      if (url === '/api/session/current') {
+        return Promise.resolve(
+          new Response(JSON.stringify({ sessionId: 'live-sess', liveSessions: ['live-sess'] }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      if (url.startsWith('/api/context')) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              turnCount: 0,
+              growth: { startTokens: 0, currentTokens: 0, deltaTokens: 0 },
+              currentBreakdown: { system: 0, tools: 0, user: 0, assistant: 0 },
+              fillPercent: 0,
+              contextWindow: 200_000,
+              toolContributions: [],
+              history: [],
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          ),
+        );
+      }
+      if (url.startsWith('/api/sessions/')) {
+        const id = decodeURIComponent(url.split('/').pop() ?? '');
+        const toolBreakdown = id === 'live-sess' ? { Bash: 3 } : { Edit: 7 };
+        return Promise.resolve(
+          new Response(JSON.stringify({ sessionId: id, toolBreakdown }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(JSON.stringify(sessionList), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    }) as typeof globalThis.fetch;
+
+    render(
+      <QueryClientProvider client={qc}>
+        <Sessions />
+      </QueryClientProvider>,
+    );
+
+    // Auto-selects the live session; open its Context tab.
+    await waitFor(() => expect(screen.getByText(/^Tools$/)).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('tab', { name: 'Context' }));
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Context' })).toHaveAttribute('aria-selected', 'true'),
+    );
+
+    // Switch to the non-live session.
+    fireEvent.click(screen.getAllByText(/done-ses/)[0]);
+    await waitFor(() => expect(screen.getByText('Edit')).toBeInTheDocument());
+    // The non-live session has no tab switcher at all (isLive is false), and
+    // the Calls breakdown — not a stuck "No context data" empty state —
+    // must be what's showing.
+    expect(screen.queryByRole('tab', { name: 'Context' })).toBeNull();
+    expect(screen.queryByText(/no context data/i)).toBeNull();
+  });
+});
+
+describe('Sessions view — ?repo= deep-link filter', () => {
+  const MULTI_REPO_LIST = [
+    {
+      sessionId: 's1',
+      startTime: '2026-05-28T09:00:00Z',
+      toolCallCount: 42,
+      estimatedCostUsd: 1.23,
+      repoName: 'org/repo-a',
+    },
+    {
+      sessionId: 's2',
+      startTime: '2026-05-27T15:30:00Z',
+      toolCallCount: 18,
+      estimatedCostUsd: 0.45,
+      repoName: 'org/repo-b',
+    },
+  ];
+
+  it('narrows the list to sessions from the repo named in ?repo= on mount', async () => {
+    const original = window.location;
+    // @ts-expect-error -- test-only reassignment of a read-only global
+    delete window.location;
+    window.location = {
+      ...original,
+      search: '?repo=org%2Frepo-a',
+    } as unknown as string & Location;
+    renderSessions(MULTI_REPO_LIST);
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    expect(screen.queryByText(/s2/)).toBeNull();
+    expect(screen.getByText(/Repo: org\/repo-a/)).toBeInTheDocument();
+    window.location = original as unknown as string & Location;
+  });
+
+  it("clears the repo filter and shows every session again when the chip's × is clicked", async () => {
+    const original = window.location;
+    // @ts-expect-error -- test-only reassignment of a read-only global
+    delete window.location;
+    window.location = {
+      ...original,
+      search: '?repo=org%2Frepo-a',
+    } as unknown as string & Location;
+    renderSessions(MULTI_REPO_LIST);
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    expect(screen.queryByText(/s2/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear repo filter' }));
+    await waitFor(() => expect(screen.getByText(/s2/)).toBeInTheDocument());
+    expect(screen.queryByText(/Repo: org\/repo-a/)).toBeNull();
+    window.location = original as unknown as string & Location;
+  });
+});
+
+describe('Sessions view — ?sessionIds= deep-link filter', () => {
+  const THREE_SESSION_LIST = [
+    {
+      sessionId: 's1',
+      startTime: '2026-05-28T09:00:00Z',
+      toolCallCount: 42,
+      estimatedCostUsd: 1.23,
+      repoName: 'org/repo-a',
+    },
+    {
+      sessionId: 's2',
+      startTime: '2026-05-27T15:30:00Z',
+      toolCallCount: 18,
+      estimatedCostUsd: 0.45,
+      repoName: 'org/repo-a',
+    },
+    {
+      sessionId: 's3',
+      startTime: '2026-05-26T15:30:00Z',
+      toolCallCount: 7,
+      estimatedCostUsd: 0.1,
+      repoName: 'org/repo-b',
+    },
+  ];
+
+  it('narrows the list to exactly the sessions named in ?sessionIds= on mount, more precise than repo alone', async () => {
+    const original = window.location;
+    // @ts-expect-error -- test-only reassignment of a read-only global
+    delete window.location;
+    window.location = {
+      ...original,
+      // s1 and s3 only — deliberately skips s2, which shares s1's repo, to
+      // prove this filters by exact session id, not by repo.
+      search: '?sessionIds=s1,s3',
+    } as unknown as string & Location;
+    renderSessions(THREE_SESSION_LIST);
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    expect(screen.getByText(/s3/)).toBeInTheDocument();
+    expect(screen.queryByText(/s2/)).toBeNull();
+    expect(screen.getByText('2 sessions selected')).toBeInTheDocument();
+    window.location = original as unknown as string & Location;
+  });
+
+  it('flags a selected session id that is not in the loaded page, instead of silently dropping it', async () => {
+    const original = window.location;
+    // @ts-expect-error -- test-only reassignment of a read-only global
+    delete window.location;
+    window.location = {
+      ...original,
+      // 'old-session' isn't in THREE_SESSION_LIST at all — the kind of id a
+      // deep-link can carry when it points at a session older than the
+      // most-recent page this view loads.
+      search: '?sessionIds=s1,old-session',
+    } as unknown as string & Location;
+    renderSessions(THREE_SESSION_LIST);
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    expect(screen.getByText('2 sessions selected')).toBeInTheDocument();
+    expect(screen.getByText(/1 of 2 not shown/)).toBeInTheDocument();
+    window.location = original as unknown as string & Location;
+  });
+
+  it('shows no missing-session note when every selected id is in the loaded page', async () => {
+    const original = window.location;
+    // @ts-expect-error -- test-only reassignment of a read-only global
+    delete window.location;
+    window.location = {
+      ...original,
+      search: '?sessionIds=s1,s3',
+    } as unknown as string & Location;
+    renderSessions(THREE_SESSION_LIST);
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    expect(screen.queryByText(/not shown/)).toBeNull();
+    window.location = original as unknown as string & Location;
+  });
+
+  it("clears the session filter and shows every session again when the chip's × is clicked", async () => {
+    const original = window.location;
+    // @ts-expect-error -- test-only reassignment of a read-only global
+    delete window.location;
+    window.location = {
+      ...original,
+      search: '?sessionIds=s1',
+    } as unknown as string & Location;
+    renderSessions(THREE_SESSION_LIST);
+    await waitFor(() => expect(screen.getByText(/s1/)).toBeInTheDocument());
+    expect(screen.queryByText(/s2/)).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear session filter' }));
+    await waitFor(() => expect(screen.getByText(/s2/)).toBeInTheDocument());
+    expect(screen.queryByText(/session.*selected/)).toBeNull();
+    window.location = original as unknown as string & Location;
   });
 });

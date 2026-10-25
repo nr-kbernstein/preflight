@@ -6,11 +6,11 @@
  */
 
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, copyFileSync, realpathSync, readFileSync } from 'node:fs';
+import { existsSync, copyFileSync, readFileSync, unlinkSync } from 'node:fs';
 import { createInterface } from 'node:readline/promises';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 
 import { createLogger } from '../shared/index.js';
 import {
@@ -22,8 +22,23 @@ import {
   detectMcpConfigPath,
   generateNrConfig,
 } from './install-helper.js';
+import {
+  detectCopilotHooksPath,
+  detectVsCodeMcpPath,
+  detectVsCodeSettingsPath,
+  mergeCopilotHooksFile,
+  removeCopilotHooksFile,
+  mergeVsCodeMcpConfig,
+  removeVsCodeMcpConfig,
+  mergeVsCodeSettings,
+  removeVsCodeHookFilesLocationsEntry,
+  applyHookCollisionFix,
+  installCopilotSdkExtension,
+} from './copilot-install-helper.js';
+import { copilotSdkExtensionInstallPath } from '../hooks/copilot-sdk-extension-health.js';
 import { isWsl, resolveWindowsHome } from './platform.js';
 import { validateConfigFile, DEFAULT_STORAGE_PATH, ConfigFileSchema } from '../config.js';
+import { VALID_MODES, type Mode } from '../config.js';
 import type { PlatformTarget } from '../config.js';
 import { migrateStoragePath } from './migrate.js';
 import {
@@ -34,10 +49,13 @@ import {
   removeDashboardDaemon,
   getDashboardDaemonStatus,
   resolveBinaryPath,
+  resolveNamedBinaryOnPath,
 } from './schedule.js';
+import { detectUpdateSupport, updateBlockerLines } from './update-support.js';
 import { readJsonFileStrict, writeJsonFile, errMsg } from './json-utils.js';
 import { LocalStore } from '../storage/index.js';
 import { getDashboardAddress, waitForHealthyDashboard } from './dashboard-health.js';
+import type { DiagnosticCheck } from './diagnostics.js';
 
 const logger = createLogger('cli');
 
@@ -170,24 +188,6 @@ function printPathWarning(): void {
   print('  Fix: run `npm link` in the project directory, or install globally:');
   print('    npm install -g @newrelic/preflight');
   print('');
-}
-
-// ---------------------------------------------------------------------------
-// Repo root discovery (for update command and setup wizard)
-// ---------------------------------------------------------------------------
-
-export function findRepoRoot(): string | null {
-  try {
-    let dir = dirname(realpathSync(process.argv[1]));
-    while (true) {
-      if (existsSync(join(dir, 'package.json'))) return dir;
-      const parent = dirname(dir);
-      if (parent === dir) return null;
-      dir = parent;
-    }
-  } catch {
-    return null;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -367,12 +367,14 @@ function formatAge(ms: number): string {
 /**
  * `preflight local` — lists every `--local` process preflight has
  * registered (see `LocalStore.registerLocalInstance()`), marking whichever
- * one currently owns the dashboard port. `--clean` additionally offers to
- * kill every live, non-owning entry (a single combined prompt, default
- * yes) — these are processes that lost the dashboard port race and have
- * been running headless ever since, with no other way to detect them
- * short of scanning the OS process table, which this feature deliberately
- * avoids.
+ * one currently owns the dashboard port, and every live `--stdio` MCP
+ * process (one per Claude Code window, see `LocalStore.writeHeartbeat()`).
+ * `--clean` additionally offers to kill every live, non-owning `--local`
+ * entry (processes that lost the dashboard port race and have been running
+ * headless ever since) plus any `--stdio` process whose recorded binary no
+ * longer exists on disk (a high-confidence sign it was uninstalled or moved
+ * out from under a still-running session) — a single combined prompt,
+ * default yes.
  */
 async function handleLocal(options: { clean?: boolean }): Promise<void> {
   const localStore = new LocalStore(DEFAULT_STORAGE_PATH);
@@ -384,25 +386,56 @@ async function handleLocal(options: { clean?: boolean }): Promise<void> {
 
   const owner = localStore.getLiveLocalDashboardProcess();
   const instances = localStore.listLocalInstances().filter((i) => i.alive);
+  const stdioInstances = localStore.listActiveStdioInstances().filter((i) => i.alive);
 
-  if (instances.length === 0) {
-    print('No --local processes running.');
+  if (instances.length === 0 && stdioInstances.length === 0) {
+    print('No --local or --stdio processes running.');
     return;
   }
 
-  print(`${instances.length} --local process(es) running:`);
-  print();
-  for (const inst of instances) {
-    const status = inst.pid === owner?.pid ? 'dashboard owner' : 'idle';
+  if (instances.length > 0) {
+    print(`${instances.length} --local process(es) running:`);
+    print();
+    for (const inst of instances) {
+      const status = inst.pid === owner?.pid ? 'dashboard owner' : 'idle';
+      print(
+        `  PID ${inst.pid}  (${status}, started ${formatAge(Date.now() - inst.startedAt)} ago)  ${inst.cwd}`,
+      );
+    }
+    print();
+  }
+
+  // High-confidence --stdio orphans: the recorded binary (argv[0]) no longer
+  // exists on disk — e.g. it was uninstalled or moved after Claude Code
+  // spawned this process. Unlike a --local process that lost the dashboard
+  // port race, a live --stdio process with an intact binary is the normal
+  // case (one per Claude Code window) — only the binary-missing ones are
+  // auto-flagged.
+  const stdioOrphans = stdioInstances.filter((i) => i.argv[0] && !existsSync(i.argv[0]));
+
+  if (stdioInstances.length > 0) {
+    print(`${stdioInstances.length} --stdio MCP process(es) running:`);
+    print();
+    for (const inst of stdioInstances) {
+      const orphanTag = stdioOrphans.includes(inst) ? ', binary missing' : '';
+      print(
+        `  PID ${inst.pid}  (session ${inst.sessionId}, started ${formatAge(Date.now() - inst.startedAt)} ago${orphanTag})  ${inst.cwd ?? 'unknown cwd'}`,
+      );
+    }
+    print();
     print(
-      `  PID ${inst.pid}  (${status}, started ${formatAge(Date.now() - inst.startedAt)} ago)  ${inst.cwd}`,
+      '  Note: a --stdio process is spawned once by Claude Code over stdio pipes — killing it will not',
+    );
+    print(
+      '  make Claude Code respawn a replacement; restart Claude Code (or that window) afterward.',
     );
   }
 
   if (!options.clean) return;
 
-  const orphans = instances.filter((i) => i.pid !== owner?.pid);
-  if (orphans.length === 0) {
+  const localOrphans = instances.filter((i) => i.pid !== owner?.pid);
+  const totalOrphans = localOrphans.length + stdioOrphans.length;
+  if (totalOrphans === 0) {
     print('\nNo orphaned processes to clean up.');
     return;
   }
@@ -412,7 +445,7 @@ async function handleLocal(options: { clean?: boolean }): Promise<void> {
   try {
     answer = (
       await rl.question(
-        `\nKill ${orphans.length} orphaned process${orphans.length > 1 ? 'es' : ''}? [Y/n]: `,
+        `\nKill ${totalOrphans} orphaned process${totalOrphans > 1 ? 'es' : ''}? [Y/n]: `,
       )
     )
       .trim()
@@ -422,7 +455,7 @@ async function handleLocal(options: { clean?: boolean }): Promise<void> {
   }
   if (answer === 'n' || answer === 'no') return;
 
-  for (const orphan of orphans) {
+  for (const orphan of localOrphans) {
     try {
       await killProcessGracefully(orphan.pid);
       localStore.unregisterLocalInstance(orphan.pid);
@@ -431,49 +464,26 @@ async function handleLocal(options: { clean?: boolean }): Promise<void> {
       print(`⚠ Could not kill PID ${orphan.pid}: ${errMsg(err)}`);
     }
   }
+
+  for (const orphan of stdioOrphans) {
+    try {
+      await killProcessGracefully(orphan.pid);
+      localStore.removeStdioHeartbeat(orphan.sessionId);
+      print(`✓ Killed PID ${orphan.pid} (session ${orphan.sessionId}).`);
+    } catch (err) {
+      print(`⚠ Could not kill PID ${orphan.pid}: ${errMsg(err)}`);
+    }
+  }
 }
 
 async function handleUpdate(): Promise<void> {
   migrateStoragePath();
-  const repoRoot = findRepoRoot();
-  if (!repoRoot) {
-    print(
-      '✗ Could not locate the repo root. Run this command from within the cloned repo or after npm link.',
-    );
+  const support = detectUpdateSupport();
+  if (!support.supported) {
+    for (const line of updateBlockerLines(support.blocker)) print(line);
     process.exit(1);
   }
-
-  let gitRoot!: string;
-  try {
-    gitRoot = execFileSync('git', ['-C', repoRoot, 'rev-parse', '--show-toplevel'], {
-      stdio: 'pipe',
-      env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined },
-    })
-      .toString()
-      .trim();
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      print('✗ git is not installed or not found on PATH.');
-      print('  Install git (https://git-scm.com) then retry: preflight update');
-    } else {
-      print('✗ preflight was installed via a package manager, not cloned from source.');
-      print('  (If your .git directory is missing or corrupt, re-clone the repo instead.)');
-      print('  To update, reinstall using your package manager, e.g.:');
-      print('    npm install -g @newrelic/preflight@latest');
-      print('    pnpm add -g @newrelic/preflight@latest');
-    }
-    process.exit(1);
-  }
-  // If repoRoot sits below a node_modules directory within the git tree,
-  // preflight is installed as a dependency — not a source clone.
-  // path.relative() normalises separators on all platforms (robust on Windows).
-  if (relative(gitRoot, repoRoot).split(sep).includes('node_modules')) {
-    print('✗ preflight was installed via a package manager, not cloned from source.');
-    print('  To update, reinstall using your package manager, e.g.:');
-    print('    npm install -g @newrelic/preflight@latest');
-    print('    pnpm add -g @newrelic/preflight@latest');
-    process.exit(1);
-  }
+  const { repoRoot } = support;
 
   print(`Updating Preflight from ${repoRoot}...\n`);
 
@@ -530,6 +540,12 @@ function handleSchedule(options: { time?: string; disable?: boolean }): void {
   }
 
   if (options.time !== undefined) {
+    const support = detectUpdateSupport();
+    if (!support.supported) {
+      for (const line of updateBlockerLines(support.blocker)) print(line);
+      print('  The daily schedule runs `preflight update`, which cannot run on this install.');
+      process.exit(1);
+    }
     const match = options.time.match(/^(\d{1,2}):(\d{2})$/);
     if (!match) {
       print(`Invalid time format "${options.time}". Use HH:MM (e.g. 08:00).`);
@@ -582,6 +598,7 @@ function handleSchedule(options: { time?: string; disable?: boolean }): void {
 function handleInstall(options: {
   licenseKey?: string;
   accountId?: string;
+  mode?: Mode;
   project?: boolean;
   windowsCc?: boolean;
   linuxCc?: boolean;
@@ -659,6 +676,11 @@ function handleInstall(options: {
           generateNrConfig(options.licenseKey as string, options.accountId as string),
         );
       }
+      if (options.mode) {
+        nrConfig.mode = options.mode;
+      } else if (nrConfig.mode === undefined && existingNrConfig.licenseKey === undefined) {
+        nrConfig.mode = 'local';
+      }
       writeJsonFile(NR_CONFIG_PATH, nrConfig, DEFAULT_STORAGE_PATH);
       nrConfigWritten = credentialsProvided;
     } catch (err) {
@@ -686,7 +708,7 @@ function handleInstall(options: {
   }
 
   print(`\n✓ Claude Code hooks updated: ${settingsPath}`);
-  print('  - Added PreToolUse and PostToolUse hooks');
+  print('  - Added PreToolUse, PostToolUse, PermissionRequest, and PermissionDenied hooks');
   print(`✓ MCP server registered: ${mcpPath}`);
   print('  - Added preflight MCP server');
 
@@ -702,6 +724,25 @@ function handleInstall(options: {
     printPathWarning();
   }
 
+  // Double-capture fix — VS Code reads hook files from both the standard
+  // Claude settings.json location and the Copilot hooks file at once with no
+  // dedup (see handleCopilotInstall). Uses the fixed desktop path here
+  // (not the possibly-WSL-resolved settingsPath above) since that's what VS
+  // Code's own chat.hookFilesLocations default always references regardless
+  // of which Claude Code platform target this install resolved to. Applied
+  // here too — not just from the Copilot flow — so the fix takes effect
+  // regardless of which install (Claude or Copilot) ran most recently.
+  const collisionFix = applyHookCollisionFix({
+    claudeSettingsPath: detectSettingsPath(scope, null),
+    copilotHooksPath: detectCopilotHooksPath(scope),
+    vsCodeSettingsPath: detectVsCodeSettingsPath(),
+    claudeHooksJustInstalled: true,
+  });
+  if (collisionFix.applied) {
+    print('✓ Disabled duplicate Claude-format hook reading in VS Code (double-count fix)');
+    print('  Reload the VS Code window for this to take effect.');
+  }
+
   print('\nNext steps:');
   print('  1. Restart Claude Code');
   print('  2. Verify: ask Claude Code to call nr_observe_get_session_stats');
@@ -709,6 +750,306 @@ function handleInstall(options: {
   print('  Tip: if the MCP server fails to connect, run:');
   print('    preflight validate');
   print('  to check your config file for typos or unsupported fields.');
+}
+
+// ---------------------------------------------------------------------------
+// Copilot install/uninstall handlers
+// ---------------------------------------------------------------------------
+
+// Idempotent: always remove-then-add rather than parsing `copilot mcp list`
+// output (undocumented/unstable format risk). Uses execFileSync with an
+// argv array — never a shell string — so a license key containing shell
+// metacharacters can never be interpreted by a shell.
+//
+// Registers with MCP_CLIENT=copilot-sdk (unchanged from today's documented
+// setup) — this env var only affects the MCP *server* process's own
+// platform self-detection (CopilotSdkAdapter's tool-name normalization,
+// local-dashboard session summaries), which is independent of the hooks
+// file's per-event NR tagging (NEW_RELIC_AI_PLATFORM=copilot, embedded by
+// generateCopilotHooksFile). VS Code's own mcp.json entry separately and
+// correctly uses MCP_CLIENT=copilot (see generateVsCodeMcpEntry).
+function registerCopilotMcpServer(
+  copilotCliPath: string,
+  binPath: string | null,
+  licenseKey?: string,
+  accountId?: string,
+): void {
+  try {
+    execFileSync(copilotCliPath, ['mcp', 'remove', 'preflight'], { stdio: 'pipe' });
+  } catch {
+    /* not previously registered — fine */
+  }
+
+  const target = binPath ?? 'npx';
+  const targetArgs = binPath ? ['--stdio'] : ['preflight', '--stdio'];
+  const args = [
+    'mcp',
+    'add',
+    'preflight',
+    '--env',
+    'MCP_CLIENT=copilot-sdk',
+    ...(licenseKey ? ['--env', `NEW_RELIC_LICENSE_KEY=${licenseKey}`] : []),
+    ...(accountId ? ['--env', `NEW_RELIC_ACCOUNT_ID=${accountId}`] : []),
+    '--',
+    target,
+    ...targetArgs,
+  ];
+  execFileSync(copilotCliPath, args, { stdio: 'pipe' });
+}
+
+function handleCopilotInstall(options: {
+  licenseKey?: string;
+  accountId?: string;
+  project?: boolean;
+}): void {
+  const scope = options.project ? 'project' : 'user';
+  const binPath = resolveBinaryPath();
+  const copilotCliPath = resolveNamedBinaryOnPath('copilot');
+  const hooksPath = detectCopilotHooksPath(scope);
+
+  // 1. Hooks file — always written; shared by both the Copilot CLI and VS
+  //    Code Copilot Chat, so this alone covers both surfaces' tool-call
+  //    capture regardless of what's found below.
+  let mergedHooks: Record<string, unknown>;
+  try {
+    mergedHooks = mergeCopilotHooksFile(readJsonFileStrict(hooksPath), binPath);
+  } catch (err) {
+    eprint(`\n✗ Failed to prepare Copilot hooks config: ${errMsg(err)}`);
+    throw err;
+  }
+  try {
+    writeJsonFile(hooksPath, mergedHooks);
+  } catch (err) {
+    eprint(`\n✗ Failed to write Copilot hooks config (${hooksPath}): ${errMsg(err)}`);
+    throw err;
+  }
+  print(`\n✓ Copilot hooks written: ${hooksPath}`);
+
+  // 2. Copilot CLI MCP registration + SDK extension — only when the CLI is
+  //    actually present. Degrades gracefully otherwise: hooks still work.
+  if (copilotCliPath) {
+    try {
+      registerCopilotMcpServer(copilotCliPath, binPath, options.licenseKey, options.accountId);
+      print('✓ Registered preflight with `copilot mcp add` (Copilot CLI)');
+    } catch (err) {
+      eprint(`\n⚠ Could not register MCP server with the copilot CLI: ${errMsg(err)}`);
+      eprint('  Hooks were still installed — tool-call capture works regardless.');
+    }
+
+    const ext = installCopilotSdkExtension();
+    if (ext.copied) {
+      print('✓ Copilot SDK usage extension installed (token-exact cost)');
+      print(
+        '  Restart the Copilot CLI with --experimental (or run /experimental on) to activate it.',
+      );
+    } else if (ext.reason === 'exists') {
+      print('  Copilot SDK usage extension already installed');
+    } else {
+      print(`  ⚠ Could not install Copilot SDK usage extension: ${ext.reason}`);
+    }
+  } else {
+    print('\n  ℹ `copilot` CLI not found on PATH — skipping CLI MCP registration.');
+    print('  Hooks were still installed; VS Code Copilot Chat picks them up automatically.');
+  }
+
+  // 3. VS Code — independent of whether the copilot CLI binary exists.
+  const vsCodeMcpPath = detectVsCodeMcpPath();
+  const vsCodeSettingsPath = detectVsCodeSettingsPath();
+  let touchedVsCodeSettings = false;
+
+  if (vsCodeMcpPath && existsSync(dirname(vsCodeMcpPath))) {
+    try {
+      const mergedVsCodeMcp = mergeVsCodeMcpConfig(readJsonFileStrict(vsCodeMcpPath), binPath, {
+        licenseKey: options.licenseKey,
+        accountId: options.accountId,
+      });
+      writeJsonFile(vsCodeMcpPath, mergedVsCodeMcp);
+      print(`✓ VS Code MCP server registered: ${vsCodeMcpPath}`);
+    } catch (err) {
+      eprint(`\n⚠ Failed to write VS Code MCP config (${vsCodeMcpPath}): ${errMsg(err)}`);
+    }
+  } else {
+    print('\n  ℹ VS Code user directory not found — skipping VS Code MCP registration.');
+  }
+
+  if (vsCodeSettingsPath && existsSync(dirname(vsCodeSettingsPath))) {
+    try {
+      const merged = mergeVsCodeSettings(readJsonFileStrict(vsCodeSettingsPath), {
+        enableAgentDebugLog: true,
+      });
+      writeJsonFile(vsCodeSettingsPath, merged);
+      print('✓ Enabled token-exact cost logging in VS Code settings.json');
+      touchedVsCodeSettings = true;
+    } catch (err) {
+      eprint(`\n⚠ Could not update VS Code settings.json: ${errMsg(err)}`);
+    }
+  }
+
+  // 4. Double-capture fix — VS Code reads hook files from both the Claude
+  //    settings.json location and this Copilot hooks file at once with no
+  //    dedup. Applied here (and from handleInstall's Claude flow) so it's
+  //    correct regardless of install order.
+  const claudeSettingsPath = detectSettingsPath(scope, null);
+  const fix = applyHookCollisionFix({
+    claudeSettingsPath,
+    copilotHooksPath: hooksPath,
+    vsCodeSettingsPath,
+    copilotHooksJustInstalled: true,
+  });
+  if (fix.applied) {
+    print('✓ Disabled duplicate Claude-format hook reading in VS Code (double-count fix)');
+    touchedVsCodeSettings = true;
+  }
+
+  if (touchedVsCodeSettings) {
+    print('\n  ℹ VS Code settings changed — reload the window for these to take effect:');
+    print('    Cmd/Ctrl+Shift+P → "Developer: Reload Window"');
+  }
+
+  print('\nNext steps:');
+  print('  1. Restart the Copilot CLI (if installed) and/or reload VS Code');
+  print('  2. Verify: ask Copilot to call nr_observe_get_session_stats');
+}
+
+async function handleCopilotUninstall(options: {
+  project?: boolean;
+  yes?: boolean;
+}): Promise<void> {
+  const scope = options.project ? 'project' : 'user';
+  const hooksPath = detectCopilotHooksPath(scope);
+  const vsCodeMcpPath = detectVsCodeMcpPath();
+  const vsCodeSettingsPath = detectVsCodeSettingsPath();
+  const claudeSettingsPath = detectSettingsPath(scope, null);
+  const copilotCliPath = resolveNamedBinaryOnPath('copilot');
+  const extensionPath = copilotSdkExtensionInstallPath();
+
+  const changeSummary: string[] = [];
+  if (existsSync(hooksPath)) changeSummary.push(`  • Remove Copilot hooks from ${hooksPath}`);
+  if (vsCodeMcpPath && existsSync(vsCodeMcpPath)) {
+    changeSummary.push(`  • Remove MCP server from ${vsCodeMcpPath}`);
+  }
+
+  // Only remove our own hookFilesLocations entry — never the whole object,
+  // in case the user has unrelated entries there — and only if it's still
+  // exactly `false` (our fix); if the user has since changed it, leave it.
+  let hasHookFilesLocationsFix = false;
+  if (vsCodeSettingsPath && existsSync(vsCodeSettingsPath)) {
+    try {
+      const settings = readJsonFileStrict(vsCodeSettingsPath);
+      const locations = settings['chat.hookFilesLocations'];
+      if (
+        typeof locations === 'object' &&
+        locations !== null &&
+        (locations as Record<string, unknown>)[claudeSettingsPath] === false
+      ) {
+        hasHookFilesLocationsFix = true;
+        changeSummary.push(
+          `  • Remove the "${claudeSettingsPath}": false entry from chat.hookFilesLocations in ${vsCodeSettingsPath}`,
+        );
+      }
+    } catch {
+      /* unreadable — skip this check, nothing to remove */
+    }
+  }
+  if (existsSync(extensionPath)) {
+    changeSummary.push(`  • Remove Copilot SDK usage extension at ${extensionPath}`);
+  }
+  if (copilotCliPath) {
+    changeSummary.push('  • Run `copilot mcp remove preflight`');
+  }
+
+  if (changeSummary.length === 0) {
+    print('Nothing installed for Copilot — no changes to make.');
+    return;
+  }
+
+  print('preflight uninstall --copilot will make the following changes:\n');
+  for (const line of changeSummary) print(line);
+  print('');
+  print(
+    '  Note: the VS Code debug-log setting (github.copilot.chat.agentDebugLog.fileLogging.enabled)',
+  );
+  print('  is left as-is — it is a user preference, not exclusively managed by preflight.');
+  print('');
+
+  if (!handleConfirm(await promptConfirm(options.yes ?? false))) return;
+  print('');
+
+  let anyRemoved = false;
+  let anyFailed = false;
+
+  if (existsSync(hooksPath)) {
+    const { written } = backupAndWrite(
+      hooksPath,
+      undefined,
+      removeCopilotHooksFile,
+      'Copilot hooks',
+    );
+    if (written) {
+      anyRemoved = true;
+      print(`✓ Copilot hooks removed: ${hooksPath}`);
+    } else {
+      anyFailed = true;
+    }
+  }
+
+  if (vsCodeMcpPath && existsSync(vsCodeMcpPath)) {
+    const { written } = backupAndWrite(
+      vsCodeMcpPath,
+      undefined,
+      removeVsCodeMcpConfig,
+      'VS Code MCP config',
+    );
+    if (written) {
+      anyRemoved = true;
+      print(`✓ VS Code MCP server removed: ${vsCodeMcpPath}`);
+    } else {
+      anyFailed = true;
+    }
+  }
+
+  if (hasHookFilesLocationsFix && vsCodeSettingsPath) {
+    const { written } = backupAndWrite(
+      vsCodeSettingsPath,
+      undefined,
+      (data) => removeVsCodeHookFilesLocationsEntry(data, claudeSettingsPath),
+      'VS Code hookFilesLocations setting',
+    );
+    if (written) {
+      anyRemoved = true;
+      print(`✓ Removed the double-count fix from ${vsCodeSettingsPath}`);
+    } else {
+      anyFailed = true;
+    }
+  }
+
+  if (existsSync(extensionPath)) {
+    try {
+      unlinkSync(extensionPath);
+      anyRemoved = true;
+      print(`✓ Copilot SDK usage extension removed: ${extensionPath}`);
+    } catch (err) {
+      anyFailed = true;
+      eprint(`⚠ Could not remove Copilot SDK usage extension: ${errMsg(err)}`);
+    }
+  }
+
+  if (copilotCliPath) {
+    try {
+      execFileSync(copilotCliPath, ['mcp', 'remove', 'preflight'], { stdio: 'pipe' });
+      print('✓ Removed preflight from `copilot mcp list`');
+      anyRemoved = true;
+    } catch (err) {
+      eprint(`⚠ \`copilot mcp remove preflight\` failed (may already be removed): ${errMsg(err)}`);
+    }
+  }
+
+  print(anyFailed ? '\nUninstall incomplete — see errors above.\n' : '\nUninstall complete.\n');
+  if (anyRemoved) {
+    print(
+      'Restart the Copilot CLI (if installed) and/or reload VS Code for changes to take effect.\n',
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,13 +1519,30 @@ function handleValidate(options: { config?: string }): void {
 // Doctor handler
 // ---------------------------------------------------------------------------
 
-async function handleDoctor(options: { config?: string; platform?: string }): Promise<void> {
+function doctorExitCode(checks: readonly DiagnosticCheck[]): number {
+  if (checks.some((c) => c.status === 'fail')) return 1;
+  return checks.some((c) => c.status === 'warn') ? 2 : 0;
+}
+
+async function handleDoctor(options: {
+  config?: string;
+  platform?: string;
+  json?: boolean;
+}): Promise<void> {
   const { runDiagnostics } = await import('./diagnostics.js');
   const configPath = options.config ?? resolve(DEFAULT_STORAGE_PATH, 'config.json');
 
   const storagePath = process.env.NEW_RELIC_AI_MCP_STORAGE_PATH ?? undefined;
-  print('Running diagnostics...');
+  if (!options.json) {
+    print('Running diagnostics...');
+  }
   const checks = await runDiagnostics({ configPath, storagePath, platform: options.platform });
+
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(checks)}\n`);
+    process.exitCode = doctorExitCode(checks);
+    return;
+  }
 
   const ICON: Record<string, string> = { ok: '✓', warn: '⚠', fail: '✗', skip: '-' };
   const COL = 22;
@@ -1211,7 +1569,7 @@ async function handleDoctor(options: { config?: string; platform?: string }): Pr
   if (warns > 0) parts.push(`${warns} warning${warns > 1 ? 's' : ''}`);
   print(`${parts.join(', ')} found. Run the fix commands above, then restart.`);
 
-  process.exitCode = fails > 0 ? 1 : 2;
+  process.exitCode = doctorExitCode(checks);
 }
 
 // ---------------------------------------------------------------------------
@@ -1227,10 +1585,39 @@ export function createInstallProgram(): Command {
     .description('Configure Claude Code hooks and MCP server for AI observability')
     .option('--license-key <key>', 'New Relic license key')
     .option('--account-id <id>', 'New Relic account ID')
+    .addOption(
+      new Option('--mode <mode>', 'Telemetry mode: cloud, local, or both (default: local)').choices(
+        [...VALID_MODES],
+      ),
+    )
     .option('--project', 'Write to project-level .claude/settings.json instead of user-level')
     .option('--windows-cc', 'Target Windows Claude Code (desktop app) when running inside WSL')
     .option('--linux-cc', 'Target Linux Claude Code (npm in WSL) when running inside WSL')
-    .action(handleInstall);
+    .option(
+      '--copilot',
+      'Configure GitHub Copilot instead — Copilot CLI hooks/MCP and VS Code Copilot Chat hooks/MCP',
+    )
+    .action(
+      (options: {
+        licenseKey?: string;
+        accountId?: string;
+        mode?: Mode;
+        project?: boolean;
+        windowsCc?: boolean;
+        linuxCc?: boolean;
+        copilot?: boolean;
+      }) => {
+        if (options.copilot) {
+          if (options.windowsCc || options.linuxCc) {
+            print('\n  ⚠ --copilot cannot be combined with --windows-cc or --linux-cc.');
+            process.exit(1);
+          }
+          handleCopilotInstall(options);
+          return;
+        }
+        handleInstall(options);
+      },
+    );
 
   program
     .command('uninstall')
@@ -1243,17 +1630,38 @@ export function createInstallProgram(): Command {
       'Remove only the background dashboard daemon (preserves hooks, MCP config, and session history)',
     )
     .option('--yes', 'Skip the confirmation prompt (useful for scripts and CI)')
-    .action(handleUninstall);
+    .option('--copilot', 'Remove GitHub Copilot CLI + VS Code Copilot Chat hooks/MCP instead')
+    .action(
+      async (options: {
+        project?: boolean;
+        windowsCc?: boolean;
+        linuxCc?: boolean;
+        daemon?: boolean;
+        yes?: boolean;
+        copilot?: boolean;
+      }) => {
+        if (options.copilot) {
+          if (options.windowsCc || options.linuxCc || options.daemon) {
+            print('\n  ⚠ --copilot cannot be combined with --windows-cc, --linux-cc, or --daemon.');
+            process.exit(1);
+          }
+          await handleCopilotUninstall(options);
+          return;
+        }
+        await handleUninstall(options);
+      },
+    );
 
   program
     .command('setup')
     .description(
       'Interactive first-run setup: configure New Relic keys, install hooks, and deploy dashboards',
     )
-    .action(async () => {
+    .addOption(new Option('--staging', 'pre-select the New Relic staging environment').hideHelp())
+    .action(async (opts: Record<string, unknown>) => {
       try {
         const { runSetupWizard } = await import('./setup-wizard.js');
-        await runSetupWizard();
+        await runSetupWizard({ staging: opts.staging === true });
       } catch (err) {
         print(`\n✗ Setup failed: ${errMsg(err)}`);
         process.exitCode = 1;
@@ -1274,6 +1682,7 @@ export function createInstallProgram(): Command {
       '--platform <name>',
       'Platform to check hooks for (e.g. kiro, cursor) — Claude Code checked by default',
     )
+    .option('--json', 'Output results as JSON array instead of human-readable text')
     .action(handleDoctor);
 
   program

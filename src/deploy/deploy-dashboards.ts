@@ -11,6 +11,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { resolve, sep } from 'node:path';
 
 import { normalizeDeveloperName } from '../config.js';
+import { getRegionByDeployFlags } from '../install/regions.js';
+import { stagingHost } from '../shared/transport/http-client.js';
 import { resolveDataDir } from './data-paths.js';
 
 export const CREATE_MUTATION = `
@@ -99,7 +101,9 @@ export interface DashboardDeployOptions {
   readonly update: boolean;
   readonly teardown: boolean;
   readonly print: boolean;
+  readonly staging: boolean;
   readonly eu: boolean;
+  readonly jp: boolean;
   readonly developer: string | null;
   readonly file: string | null;
   /**
@@ -349,8 +353,7 @@ async function teardownDashboard(
 
 function pickNerdgraphUrl(opts: DashboardDeployOptions): string {
   if (opts.nerdgraphUrlOverride) return opts.nerdgraphUrlOverride;
-  if (opts.eu) return 'https://api.eu.newrelic.com/graphql';
-  return 'https://api.newrelic.com/graphql';
+  return getRegionByDeployFlags(opts).nerdgraphUrl;
 }
 
 /**
@@ -365,6 +368,10 @@ export async function runDeployDashboards(opts: DashboardDeployOptions): Promise
   const out: OutputStream = opts.stdout ?? process.stdout;
   const fetchImpl: typeof fetch = opts.fetchImpl ?? fetch;
 
+  if ([opts.staging, opts.eu, opts.jp].filter(Boolean).length > 1) {
+    out.write('Error: --staging, --eu, and --jp are mutually exclusive.\n');
+    return 1;
+  }
   if (opts.teardown && (opts.print || opts.update)) {
     out.write('Error: --teardown is mutually exclusive with --print and --update.\n');
     return 1;
@@ -374,8 +381,12 @@ export async function runDeployDashboards(opts: DashboardDeployOptions): Promise
     return 1;
   }
 
-  if (opts.eu) {
+  if (opts.staging) {
+    out.write(`Targeting staging API: https://${stagingHost('api')}/graphql\n`);
+  } else if (opts.eu) {
     out.write('Targeting EU API: https://api.eu.newrelic.com/graphql\n');
+  } else if (opts.jp) {
+    out.write('Targeting Japan API: https://api.jp.newrelic.com/graphql\n');
   }
 
   const accountIdStr = process.env.NEW_RELIC_ACCOUNT_ID;

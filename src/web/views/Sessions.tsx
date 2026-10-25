@@ -16,6 +16,7 @@ import {
   fetchSessionSubagents,
   fetchWorkflows,
   fetchWorkflowDetail,
+  fetchContext,
   qk,
   type SessionDetail,
   type WorkflowRunInfo,
@@ -32,6 +33,7 @@ import {
   formatDuration,
   formatUsd,
   formatUsdOrDash,
+  formatTokensCompact,
   rateColor,
   scoreColor,
   shortToolName,
@@ -51,6 +53,7 @@ interface SessionRow {
   readonly toolCallCount?: number;
   readonly estimatedCostUsd?: number | null;
   readonly outcome?: string | null;
+  readonly repoName?: string | null;
 }
 
 interface CurrentSession {
@@ -75,6 +78,7 @@ const SEGMENT_LABELS: Record<string, string> = {
   stuck_loop: 'Stuck Loop',
   blind_editing: 'Blind Editing',
   re_reading: 'Repeated Reads',
+  over_delegation: 'Over-Delegation',
 };
 
 const WORKFLOW_STATUS_PILL: Record<WorkflowRunInfo['status'], { tone: PillTone; label: string }> = {
@@ -88,8 +92,9 @@ const WORKFLOW_STATUS_PILL: Record<WorkflowRunInfo['status'], { tone: PillTone; 
 type SortKey = 'date' | 'lastActive' | 'cost' | 'calls';
 
 // Run-level filters consolidated from the former Workflows view. They scope the
-// KPI strip AND the master list (a non-default filter shows only sessions that
-// own a matching run).
+// KPI strip AND the master list — see the `visibleRows` computation below for
+// how each filter narrows the master list (the time window and the run
+// source/status filters apply differently).
 type TimeWindow = 'today' | '7d' | '30d' | 'all';
 type RunSource = 'all' | 'script' | 'agent_tool';
 type StatusFilter = 'all' | 'running' | 'completed' | 'failed' | 'cancelled';
@@ -147,6 +152,46 @@ function readSessionParam(search: string): string | null {
   const trimmed = raw.trim();
   if (trimmed.length === 0 || trimmed.length > 256) return null;
   return trimmed;
+}
+
+// `?repo=<repoName>` deep-link — narrows the master list to sessions from one
+// repo. Repo-only, not worktree-specific: which worktree a session ran in
+// only exists inside its (unfetched-at-list-time) timeline, not on the list
+// summary itself. Superseded for the Git Efficiency tab's own links by the
+// exact `?sessionIds=` below, which the report can resolve precisely per
+// repo OR per worktree — this stays as a coarser, still-useful manual
+// deep-link (e.g. pasted into a URL bar by hand).
+function readRepoParam(search: string): string | null {
+  let raw: string | null;
+  try {
+    raw = new URLSearchParams(search).get('repo');
+  } catch {
+    return null;
+  }
+  if (raw == null) return null;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0 || trimmed.length > 256) return null;
+  return trimmed;
+}
+
+// `?sessionIds=id1,id2,...` deep-link — narrows the master list to exactly
+// these sessions. Used by the Git Efficiency tab's per-repo/per-worktree
+// "Sessions" column, which already knows precisely which sessions touched
+// that row (from GitActivityRecord.sessionId), so it can link far more
+// precisely than the repo-name-only `?repo=` above.
+function readSessionIdsParam(search: string): ReadonlySet<string> | null {
+  let raw: string | null;
+  try {
+    raw = new URLSearchParams(search).get('sessionIds');
+  } catch {
+    return null;
+  }
+  if (raw == null) return null;
+  const ids = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s.length <= 256);
+  return ids.length > 0 ? new Set(ids) : null;
 }
 
 function startTimeMs(row: SessionRow): number {
@@ -222,9 +267,31 @@ export function Sessions(): JSX.Element {
     if (sessionParam) setSelectedId(sessionParam);
   }, [sessionParam]);
 
+  // Mount-only initial repo filter, same pattern as selectedId above. A user
+  // can clear it (the "×" on the filter chip below), unlike selectedId which
+  // is only ever replaced, never cleared — so this is separate state rather
+  // than reusing sessionParam's effect.
+  const [repoFilter, setRepoFilter] = useState<string | null>(() =>
+    readRepoParam(window.location.search),
+  );
+  const repoParam = useMemo(() => readRepoParam(search), [search]);
+  useEffect(() => {
+    if (repoParam) setRepoFilter(repoParam);
+  }, [repoParam]);
+
+  // Same mount-only + reactive pattern as repoFilter above, for the more
+  // precise `?sessionIds=` deep-link.
+  const [sessionIdsFilter, setSessionIdsFilter] = useState<ReadonlySet<string> | null>(() =>
+    readSessionIdsParam(window.location.search),
+  );
+  const sessionIdsParam = useMemo(() => readSessionIdsParam(search), [search]);
+  useEffect(() => {
+    if (sessionIdsParam) setSessionIdsFilter(sessionIdsParam);
+  }, [sessionIdsParam]);
+
   const list = useQuery<SessionRow[]>({
     queryKey: qk.sessionsList(SESSIONS_PAGE_SIZE),
-    queryFn: () => fetchSessionsList(SESSIONS_PAGE_SIZE),
+    queryFn: ({ signal }) => fetchSessionsList(SESSIONS_PAGE_SIZE, signal),
     refetchInterval: 10_000,
   });
 
@@ -232,13 +299,13 @@ export function Sessions(): JSX.Element {
   // run tree. One shared query for the whole view (was one per expanded row).
   const { data: rawWorkflows } = useQuery({
     queryKey: qk.workflows,
-    queryFn: fetchWorkflows,
+    queryFn: ({ signal }) => fetchWorkflows(signal),
     refetchInterval: 10_000,
   });
 
   const current = useQuery<CurrentSession>({
     queryKey: qk.sessionCurrent,
-    queryFn: fetchSessionCurrent,
+    queryFn: ({ signal }) => fetchSessionCurrent(signal),
     refetchInterval: 10_000,
   });
 
@@ -246,15 +313,13 @@ export function Sessions(): JSX.Element {
     const set = new Set<string>();
     if (current.data?.liveSessions?.length) {
       for (const id of current.data.liveSessions) set.add(id);
-    } else if (current.data?.sessionId) {
-      set.add(current.data.sessionId);
     }
     return set;
   }, [current.data]);
 
   const detail = useQuery<SessionDetail>({
     queryKey: selectedId ? qk.sessionDetail(selectedId) : ['session', 'none'],
-    queryFn: () => fetchSessionDetail(selectedId!),
+    queryFn: ({ signal }) => fetchSessionDetail(selectedId!, signal),
     enabled: selectedId !== null,
     // Poll while current session data is still loading (we don't know yet if
     // this session is live), then only continue polling if it turns out to be live.
@@ -286,9 +351,15 @@ export function Sessions(): JSX.Element {
     const totalAgents = filteredRuns.reduce((sum, r) => sum + (r.agentCount ?? 0), 0);
     const spendVals = filteredRuns.map((r) => r.totalUsd).filter((v): v is number => v != null);
     const totalSpend = spendVals.length > 0 ? spendVals.reduce((a, b) => a + b, 0) : null;
+    // A run's totalUsd can be null either because it's a confirmed $0 or
+    // because no process ever observed its cost (restart, or a --local
+    // dashboard reading a different --stdio process's run). costUnknown
+    // distinguishes the two (a partial mitigation); if any filtered run has
+    // it set, the KPI sum above is missing real spend, not just zeros.
+    const spendIsPartial = filteredRuns.some((r) => r.costUnknown === true);
     const durs = filteredRuns.map((r) => r.durationMs).filter((v): v is number => v != null);
     const avgDurationMs = durs.length > 0 ? durs.reduce((a, b) => a + b, 0) / durs.length : null;
-    return { totalRuns, totalAgents, totalSpend, avgDurationMs };
+    return { totalRuns, totalAgents, totalSpend, spendIsPartial, avgDurationMs };
   }, [filteredRuns]);
   // runId-set per session, built from the FILTERED runs — drives both the
   // per-session run tree and which sessions stay visible when a filter is set.
@@ -304,22 +375,82 @@ export function Sessions(): JSX.Element {
     return m;
   }, [filteredRuns]);
   const filtersActive =
-    activeWindow !== 'all' || runSourceFilter !== 'all' || statusFilter !== 'all';
-  // When a filter is active, show only sessions that own a matching run.
-  const visibleRows = useMemo(
-    () => (filtersActive ? rows.filter((r) => runsBySession.has(r.sessionId)) : rows),
-    [filtersActive, rows, runsBySession],
-  );
+    activeWindow !== 'all' ||
+    runSourceFilter !== 'all' ||
+    statusFilter !== 'all' ||
+    repoFilter !== null ||
+    sessionIdsFilter !== null;
+  // Run-specific filters (source/status) still narrow to sessions owning a
+  // matching run — that's the whole point of those two filters. The time
+  // window, however, must filter sessions by their OWN startTime: most
+  // sessions never spawn a subagent and so have no entry in runsBySession at
+  // all, and joining them out via that map hid every such session the moment
+  // any tab but "All" was active, regardless of when it actually happened.
+  const runFiltersActive = runSourceFilter !== 'all' || statusFilter !== 'all';
+  const visibleRows = useMemo(() => {
+    let result = rows;
+    if (activeWindow !== 'all') {
+      // A session is in-window if its own startTime falls inside it, OR it
+      // owns a run that does (runsBySession is built from filteredRuns, which
+      // is already window-filtered) — this keeps a session visible when it
+      // started just before the window but spawned a subagent run just after
+      // the boundary.
+      result = result.filter(
+        (r) => isWithinWindow(startTimeMs(r), activeWindow) || runsBySession.has(r.sessionId),
+      );
+    }
+    if (runFiltersActive) {
+      result = result.filter((r) => runsBySession.has(r.sessionId));
+    }
+    if (repoFilter !== null) {
+      result = result.filter((r) => r.repoName === repoFilter);
+    }
+    if (sessionIdsFilter !== null) {
+      result = result.filter((r) => sessionIdsFilter.has(r.sessionId));
+    }
+    return result;
+  }, [rows, activeWindow, runFiltersActive, runsBySession, repoFilter, sessionIdsFilter]);
+  // A deep-link's sessionIds are matched against `rows` — the most-recent-
+  // SESSIONS_PAGE_SIZE page, not the full session history — so a session
+  // older than that page silently has nothing to match and just vanishes
+  // from the list with no indication why. Surfaced below instead of left
+  // silent.
+  const missingSelectedSessionCount = useMemo(() => {
+    if (sessionIdsFilter === null) return 0;
+    const loadedIds = new Set(rows.map((r) => r.sessionId));
+    let missing = 0;
+    for (const id of sessionIdsFilter) {
+      if (!loadedIds.has(id)) missing++;
+    }
+    return missing;
+  }, [sessionIdsFilter, rows]);
+  // The KPI strip above is built from filteredRuns, which come from
+  // WorkflowStore.listRuns() — a machine-wide, 30-day-window, 500-run scan
+  // with no relationship to `rows` (the session list's own most-recent-50
+  // page from a separate store). Count how many of those runs belong to a
+  // session that isn't even in the visible page, so the UI can disclose
+  // when the two panels describe different populations instead of silently
+  // contradicting each other.
+  const runsOutsideVisibleSessions = useMemo(() => {
+    const visibleSessionIds = new Set(visibleRows.map((r) => r.sessionId));
+    let count = 0;
+    for (const run of filteredRuns) {
+      if (typeof run.parentSessionId === 'string' && !visibleSessionIds.has(run.parentSessionId)) {
+        count++;
+      }
+    }
+    return count;
+  }, [filteredRuns, visibleRows]);
 
   useEffect(() => {
     if (selectedId) return;
     const firstLiveId = liveSessionIds.size > 0 ? [...liveSessionIds][0]! : null;
     if (firstLiveId) {
       setSelectedId(firstLiveId);
-    } else if (rows.length > 0) {
+    } else if (!current.isLoading && rows.length > 0) {
       setSelectedId(rows[0]!.sessionId);
     }
-  }, [liveSessionIds, rows, selectedId]);
+  }, [liveSessionIds, rows, selectedId, current.isLoading]);
 
   const handleSessionClick = (sessionId: string): void => {
     setSelectedId(sessionId);
@@ -375,8 +506,13 @@ export function Sessions(): JSX.Element {
         <Card>
           <Kpi
             label="Workflow spend"
-            value={formatUsdOrDash(kpis.totalSpend)}
+            value={formatUsdOrDash(kpis.totalSpend) + (kpis.spendIsPartial ? '*' : '')}
             tone={kpis.totalSpend !== null ? 'warn' : 'neutral'}
+            sub={
+              kpis.spendIsPartial
+                ? '*partial — some runs have cost never observed by any process'
+                : undefined
+            }
           />
         </Card>
         <Card>
@@ -386,6 +522,13 @@ export function Sessions(): JSX.Element {
           />
         </Card>
       </div>
+      {runsOutsideVisibleSessions > 0 && (
+        <div className="text-xs text-ink-subtle -mt-2 mb-4">
+          +{runsOutsideVisibleSessions} run{runsOutsideVisibleSessions === 1 ? '' : 's'} above from{' '}
+          {runsOutsideVisibleSessions === 1 ? 'a session' : 'sessions'} outside the{' '}
+          {visibleRows.length} shown below
+        </div>
+      )}
 
       <div className="flex items-center gap-3 flex-wrap mb-4 shrink-0">
         <Tabs<TimeWindow>
@@ -435,6 +578,44 @@ export function Sessions(): JSX.Element {
             );
           })}
         </div>
+        {repoFilter !== null && (
+          <>
+            <div className="h-4 w-px bg-border-subtle" aria-hidden="true" />
+            <span className="flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] bg-primary-soft text-primary font-medium">
+              Repo: {repoFilter}
+              <button
+                type="button"
+                onClick={() => setRepoFilter(null)}
+                aria-label="Clear repo filter"
+                className="hover:text-ink-base focus-visible:outline-none"
+              >
+                &#10005;
+              </button>
+            </span>
+          </>
+        )}
+        {sessionIdsFilter !== null && (
+          <>
+            <div className="h-4 w-px bg-border-subtle" aria-hidden="true" />
+            <span className="flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] bg-primary-soft text-primary font-medium">
+              {sessionIdsFilter.size} session{sessionIdsFilter.size === 1 ? '' : 's'} selected
+              <button
+                type="button"
+                onClick={() => setSessionIdsFilter(null)}
+                aria-label="Clear session filter"
+                className="hover:text-ink-base focus-visible:outline-none"
+              >
+                &#10005;
+              </button>
+            </span>
+            {missingSelectedSessionCount > 0 && (
+              <span className="text-[11px] text-accent-amber">
+                {missingSelectedSessionCount} of {sessionIdsFilter.size} not shown — older than the{' '}
+                {SESSIONS_PAGE_SIZE} most recent sessions
+              </span>
+            )}
+          </>
+        )}
         {filtersActive && (
           <button
             type="button"
@@ -442,6 +623,8 @@ export function Sessions(): JSX.Element {
               setActiveWindow('all');
               setRunSourceFilter('all');
               setStatusFilter('all');
+              setRepoFilter(null);
+              setSessionIdsFilter(null);
             }}
             className="text-[10px] text-ink-muted hover:text-ink-subtle underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
           >
@@ -477,7 +660,9 @@ export function Sessions(): JSX.Element {
                 title={filtersActive ? 'No matching sessions' : 'No sessions yet'}
                 subtitle={
                   filtersActive
-                    ? 'No sessions own a workflow run matching these filters.'
+                    ? runFiltersActive
+                      ? 'No sessions own a workflow run matching these filters.'
+                      : 'No sessions in this time window.'
                     : 'Start coding with Claude to see your sessions here.'
                 }
               />
@@ -502,10 +687,16 @@ export function Sessions(): JSX.Element {
               sessions exist beyond what's rendered. The cap is enforced
               server-side (api-handler `limit` clamp) and matches the
               `qk.sessionsList(50)` query above; bump both together if the
-              cap ever changes. */}
+              cap ever changes.
+              Worded as "loaded" (not "showing") because this describes the
+              underlying fetch, not the currently visible row count — with a
+              run filter active, visibleRows can be far smaller than
+              SESSIONS_PAGE_SIZE, and "Showing 50" would misleadingly read as
+              a description of the filtered list. */}
             {rows.length >= SESSIONS_PAGE_SIZE && (
               <div className="p-2 text-[10px] text-ink-muted text-center border-t border-border-subtle">
-                Showing {SESSIONS_PAGE_SIZE} most recent sessions.
+                Only the {SESSIONS_PAGE_SIZE} most recent sessions are loaded
+                {filtersActive ? '; filters narrow this further' : ''}.
               </div>
             )}
           </div>
@@ -521,6 +712,22 @@ export function Sessions(): JSX.Element {
           )}
           {selectedId && detail.isLoading && (
             <EmptyState variant="loading" icon="timeline" title="Loading detail" />
+          )}
+          {selectedId && detail.isError && (
+            <div className="flex flex-col items-center justify-center py-8 gap-4">
+              <EmptyState
+                icon="timeline"
+                title="Session not found"
+                subtitle="This session could not be loaded."
+              />
+              <button
+                type="button"
+                onClick={() => setSelectedId(null)}
+                className="text-primary hover:text-primary-hover text-sm font-medium"
+              >
+                Clear selection
+              </button>
+            </div>
           )}
           {selectedId && detail.data && (
             <SessionTimeline
@@ -678,7 +885,7 @@ function SessionRunSubRow({
 }: SessionRunSubRowProps): JSX.Element {
   const { data: detail } = useQuery<WorkflowRunDetailResponse>({
     queryKey: qk.workflowDetail(run.runId),
-    queryFn: () => fetchWorkflowDetail(run.runId),
+    queryFn: ({ signal }) => fetchWorkflowDetail(run.runId, signal),
     enabled: isExpanded,
   });
 
@@ -788,6 +995,32 @@ function SessionTimeline({
   const durationLabel = data.durationMs != null ? formatDuration(data.durationMs) : null;
   const entries = data.timeline ?? [];
   const first = entries.length > 0 ? entries[0]!.timestamp : 0;
+  // Models used this session, most-called first. Falls back to the single
+  // `model` field when no breakdown is present (older persisted sessions,
+  // or the cross-process live branch, predate `modelBreakdown`). A session
+  // that switched models mid-run (e.g. via /model) has more than one entry
+  // here even though `model` only reflects whichever was current at read
+  // time.
+  const modelBreakdownEntries = Object.entries(data.modelBreakdown ?? {});
+  const modelTableRows = modelBreakdownEntries
+    .map(([model, entry]) => ({
+      model,
+      ...entry,
+    }))
+    .sort((a, b) => b.totalCostUsd - a.totalCostUsd);
+
+  const cacheHitPct =
+    data.tokensInput != null &&
+    data.tokensCacheRead != null &&
+    data.tokensCacheCreation != null &&
+    data.tokensInput + data.tokensCacheRead + data.tokensCacheCreation > 0 &&
+    data.tokensCacheRead + data.tokensCacheCreation > 0
+      ? Math.round(
+          (data.tokensCacheRead /
+            (data.tokensInput + data.tokensCacheRead + data.tokensCacheCreation)) *
+            100,
+        )
+      : null;
 
   if (entries.length === 0 && breakdownEntries.length === 0) {
     return (
@@ -835,16 +1068,78 @@ function SessionTimeline({
               })}
             </div>
           )}
+          {(data.linesAdded != null ||
+            data.linesRemoved != null ||
+            data.attribution?.apiDurationMs != null ||
+            cacheHitPct != null) && (
+            <div className="text-[11px] text-ink-muted mt-2 flex flex-wrap gap-2">
+              {(data.linesAdded != null || data.linesRemoved != null) && (
+                <span>
+                  {data.linesAdded != null && `+${data.linesAdded}`}
+                  {data.linesAdded != null && data.linesRemoved != null && ' / '}
+                  {data.linesRemoved != null && `−${data.linesRemoved}`} lines
+                </span>
+              )}
+              {data.attribution?.apiDurationMs != null && (
+                <span>
+                  API {formatDuration(data.attribution.apiDurationMs)} · wall{' '}
+                  {formatDuration(data.durationMs ?? 0)}
+                </span>
+              )}
+              {cacheHitPct != null && <span>cache {cacheHitPct}%</span>}
+            </div>
+          )}
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 mb-4 text-xs">
-        {data.model && (
-          <div className="bg-bg-panel rounded-lg p-2.5">
-            <div className="text-xs text-ink-muted mb-0.5">Model</div>
-            <div className="font-mono">{data.model}</div>
+      {modelTableRows.length > 0 ? (
+        <div className="mb-4">
+          <Eyebrow className="mb-2">Usage by model</Eyebrow>
+          <div className="max-h-48 overflow-y-auto text-xs">
+            <table className="w-full">
+              <thead className="text-ink-muted sticky top-0 bg-bg-panel">
+                <tr>
+                  <th className="text-left pb-1">Model</th>
+                  <th className="text-right pb-1">Input</th>
+                  <th className="text-right pb-1">Output</th>
+                  <th className="text-right pb-1">Cache read</th>
+                  <th className="text-right pb-1">Cache write</th>
+                  <th className="text-right pb-1">Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {modelTableRows.map((row) => (
+                  <tr key={row.model} className="border-t border-bg-line">
+                    <td className="py-1 font-mono text-[11px] truncate" title={row.model}>
+                      {row.model}
+                    </td>
+                    <td className="py-1 text-right tabular-nums">
+                      {formatTokensCompact(row.totalInputTokens)}
+                    </td>
+                    <td className="py-1 text-right tabular-nums">
+                      {formatTokensCompact(row.totalOutputTokens)}
+                    </td>
+                    <td className="py-1 text-right tabular-nums">
+                      {formatTokensCompact(row.totalCacheReadTokens)}
+                    </td>
+                    <td className="py-1 text-right tabular-nums">
+                      {formatTokensCompact(row.totalCacheCreationTokens)}
+                    </td>
+                    <td className="py-1 text-right tabular-nums">{formatUsd(row.totalCostUsd)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        )}
+        </div>
+      ) : data.model ? (
+        <div className="mb-4 bg-bg-panel rounded-lg p-2.5 text-xs">
+          <div className="text-xs text-ink-muted mb-0.5">Model</div>
+          <div className="font-mono">{data.model}</div>
+        </div>
+      ) : null}
+
+      <div className="grid grid-cols-2 gap-2 mb-4 text-xs">
         {data.estimatedCostUsd != null && (
           <div className="bg-bg-panel rounded-lg p-2.5">
             <div className="text-xs text-ink-muted mb-0.5">Cost</div>
@@ -863,7 +1158,25 @@ function SessionTimeline({
         <div className="mb-4">
           <Eyebrow className="mb-1">Anti-Patterns</Eyebrow>
           <div className="flex flex-wrap gap-1.5">
-            {data.antiPatterns!.map(({ type, count }) => (
+            {/* One pill per type, grouping the per-incident array by `type`
+                so each pill has a stable React key. The pill's number is
+                the summed real magnitude (iterations/readCount/repeatCount/
+                editCount/agentCount, whichever the incident carries) across
+                every incident of that type, not a count of incident
+                objects. */}
+            {Object.entries(
+              (data.antiPatterns ?? []).reduce<Record<string, number>>((counts, ap) => {
+                const magnitude =
+                  ap.iterations ??
+                  ap.readCount ??
+                  ap.repeatCount ??
+                  ap.editCount ??
+                  ap.agentCount ??
+                  1;
+                counts[ap.type] = (counts[ap.type] ?? 0) + magnitude;
+                return counts;
+              }, {}),
+            ).map(([type, count]) => (
               <Pill key={type} tone="warning" size="sm" bordered>
                 {SEGMENT_LABELS[type] ?? type}
                 <span className="opacity-70">× {count}</span>
@@ -936,6 +1249,7 @@ function SessionTimeline({
           so they stay visible without scrolling past the whole gantt/list. */}
       {breakdownEntries.length > 0 && (
         <ToolsSection
+          key={`tools-${data.sessionId}`}
           breakdownEntries={breakdownEntries}
           totalCalls={totalCalls}
           isLive={isLive}
@@ -1020,7 +1334,7 @@ function SessionTraceSection({
 }): JSX.Element {
   const { data, isLoading, isError } = useQuery<SessionSubagentsResponse>({
     queryKey: qk.sessionSubagents(sessionId),
-    queryFn: () => fetchSessionSubagents(sessionId),
+    queryFn: ({ signal }) => fetchSessionSubagents(sessionId, signal),
     retry: false,
     refetchInterval: isLive ? 10_000 : false,
   });
@@ -1030,7 +1344,7 @@ function SessionTraceSection({
   // qk.workflows query/key as the KPI strip and master-list run tree above.
   const { data: rawWorkflows } = useQuery({
     queryKey: qk.workflows,
-    queryFn: fetchWorkflows,
+    queryFn: ({ signal }) => fetchWorkflows(signal),
     refetchInterval: isLive ? 10_000 : 30_000,
   });
 
@@ -1136,10 +1450,9 @@ function ToolsSection({
 }): JSX.Element {
   const [tab, setTab] = useState<'calls' | 'context'>('calls');
 
-  const contextUrl = `/api/context?sessionId=${encodeURIComponent(sessionId)}`;
   const { data: contextData } = useQuery<ContextResponse>({
     queryKey: ['context', sessionId],
-    queryFn: () => fetch(contextUrl).then((r) => (r.ok ? r.json() : null)),
+    queryFn: ({ signal }) => fetchContext(sessionId, signal),
     refetchInterval: 10_000,
     enabled: isLive && tab === 'context',
   });

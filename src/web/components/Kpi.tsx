@@ -1,4 +1,4 @@
-import type { JSX } from 'react';
+import type { JSX, ReactNode } from 'react';
 
 import { useAnimatedValue } from '../hooks/useAnimatedValue';
 
@@ -14,11 +14,19 @@ const TONE: Record<KpiTone, string> = {
 export interface KpiProps {
   readonly label: string;
   readonly value: string;
-  readonly sub?: string;
+  readonly sub?: ReactNode;
   readonly tone?: KpiTone;
   readonly hero?: boolean;
   readonly animate?: boolean;
-  readonly numericValue?: number;
+  /**
+   * The live numeric value backing the animated count-up. Accepts `null` for
+   * "genuinely unknown/not-yet-available" (as opposed to a confirmed `0`) —
+   * callers should pass the raw nullable metric through rather than
+   * coalescing it to `0` first, or the animate branch below renders a
+   * misleading "0" instead of falling through to the `value` string (e.g.
+   * `value="—"`).
+   */
+  readonly numericValue?: number | null;
   readonly prefix?: string;
   readonly suffix?: string;
   readonly decimals?: number;
@@ -44,25 +52,25 @@ export function Kpi({
   decimals = 0,
   format,
 }: KpiProps): JSX.Element {
+  // `null` means "genuinely unknown", same as `undefined` — neither should
+  // coalesce to a rendered `0`. Only a real number reaches the animate branch.
+  const hasNumericValue = numericValue !== undefined && numericValue !== null;
+
   const animated = useAnimatedValue(numericValue ?? 0, {
     decimals,
-    enabled: animate && numericValue !== undefined,
+    enabled: animate && hasNumericValue,
     format,
   });
 
   const display =
-    animate && numericValue !== undefined
-      ? format
-        ? animated
-        : `${prefix}${animated}${suffix}`
-      : value;
+    animate && hasNumericValue ? (format ? animated : `${prefix}${animated}${suffix}`) : value;
 
   const valueClass = hero
     ? 'text-2xl font-semibold mt-1 tabular-nums text-primary'
     : `text-2xl font-semibold mt-1 tabular-nums ${TONE[tone]}`;
 
   return (
-    <div>
+    <div data-kpi="">
       <div className="text-xs text-ink-muted uppercase tracking-wide">{label}</div>
       <div className={valueClass}>{display}</div>
       {sub && <div className="text-xs text-ink-muted mt-1">{sub}</div>}

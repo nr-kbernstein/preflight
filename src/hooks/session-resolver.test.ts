@@ -1,14 +1,31 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync, utimesSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   resolveSessionId,
   resolveFromJobDir,
   resolveFromBreadcrumb,
+  resolveFromCwd,
+  resolveFromAncestorBreadcrumb,
   nextDelayMs,
   isSyntheticSessionId,
+  isUnscopedAggregatorSessionId,
+  watchPpidBreadcrumb,
+  watchCwdBreadcrumbForCorrection,
+  readJobState,
+  readTranscriptTitle,
+  findLastAiTitleInText,
+  resolveSessionName,
+  sessionNameSourceRank,
+  shouldReplaceSessionName,
+  sanitizeCwdForFilename,
 } from './session-resolver.js';
+import type { ExecFileSyncFn } from './process-ancestry.js';
+import { redactSensitive } from '../config.js';
+
+/** Above every platform's pid_max, so `kill(pid, 0)` always reports ESRCH. */
+const DEAD_PID = 2_147_483_646;
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 let tmpDir: string;
@@ -103,6 +120,125 @@ describe('session-resolver', () => {
       writeFileSync(resolve(tmpDir, 'session-by-ppid', `${ppid}.txt`), 'has spaces');
       expect(resolveFromBreadcrumb(tmpDir, ppid)).toBeNull();
     });
+
+    it('rejects a breadcrumb whose mtime predates the given process start time', () => {
+      const ppid = 4242;
+      const breadcrumbDir = resolve(tmpDir, 'session-by-ppid');
+      mkdirSync(breadcrumbDir, { recursive: true });
+      const breadcrumbPath = resolve(breadcrumbDir, `${ppid}.txt`);
+      writeFileSync(breadcrumbPath, 'sess-stale-leftover');
+
+      // Simulate the breadcrumb having been written well before "now" by
+      // backdating its mtime, then asking for a process that started later.
+      const oldMs = Date.now() - 60_000;
+      utimesSync(breadcrumbPath, oldMs / 1000, oldMs / 1000);
+
+      const processStartMs = Date.now(); // this "process" started after the breadcrumb was written
+      expect(resolveFromBreadcrumb(tmpDir, ppid, processStartMs)).toBeNull();
+    });
+
+    it('accepts a breadcrumb whose mtime is at or after the given process start time', () => {
+      const ppid = 4243;
+      const breadcrumbDir = resolve(tmpDir, 'session-by-ppid');
+      mkdirSync(breadcrumbDir, { recursive: true });
+      const breadcrumbPath = resolve(breadcrumbDir, `${ppid}.txt`);
+      writeFileSync(breadcrumbPath, 'sess-fresh');
+
+      const processStartMs = Date.now() - 60_000; // this "process" started well before the write
+      expect(resolveFromBreadcrumb(tmpDir, ppid, processStartMs)).toBe('sess-fresh');
+    });
+  });
+
+  describe('resolveFromCwd()', () => {
+    it('returns null when cwd is missing or empty', () => {
+      expect(resolveFromCwd(tmpDir, undefined)).toBeNull();
+      expect(resolveFromCwd(tmpDir, '')).toBeNull();
+    });
+
+    it('returns null when breadcrumb file is missing', () => {
+      expect(resolveFromCwd(tmpDir, '/projects/missing')).toBeNull();
+    });
+
+    it('returns the trimmed sessionId from <storage>/session-by-cwd/<sanitized-cwd>.txt', () => {
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-cwd', '-projects-test.txt'), 'sess-from-cwd\n');
+      expect(resolveFromCwd(tmpDir, '/projects/test')).toBe('sess-from-cwd');
+    });
+
+    it('sanitizes a backslash-separated (Windows) cwd the same way as the collector', () => {
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-cwd', 'C--Users-test-myproject.txt'), 'sess-win');
+      expect(resolveFromCwd(tmpDir, 'C:\\Users\\test\\myproject')).toBe('sess-win');
+    });
+
+    it('resolves correctly when cwd contains a Windows drive letter with colon', () => {
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-cwd', 'C--Users-test-myproject.txt'), 'sess-drive');
+      expect(resolveFromCwd(tmpDir, 'C:\\Users\\test\\myproject')).toBe('sess-drive');
+    });
+
+    it('returns null when breadcrumb content fails the regex', () => {
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-cwd', '-projects-test.txt'), 'has spaces');
+      expect(resolveFromCwd(tmpDir, '/projects/test')).toBeNull();
+    });
+  });
+
+  describe('resolveFromAncestorBreadcrumb()', () => {
+    /** Writes a ppid breadcrumb and returns its path. */
+    function writeBreadcrumb(pid: number, sessionId: string): string {
+      const dir = resolve(tmpDir, 'session-by-ppid');
+      mkdirSync(dir, { recursive: true });
+      const path = resolve(dir, `${pid}.txt`);
+      writeFileSync(path, sessionId);
+      return path;
+    }
+
+    it('returns null for empty or single-element input (nothing above our own ppid)', () => {
+      expect(resolveFromAncestorBreadcrumb(tmpDir, [])).toBeNull();
+      expect(resolveFromAncestorBreadcrumb(tmpDir, [72995])).toBeNull();
+    });
+
+    it('resolves the npx-shaped tree — breadcrumb at the IDE, one level above our ppid', () => {
+      // Real Kiro trace: server ppid is the npm exec wrapper (72995); the
+      // collector wrote its breadcrumb at Kiro Helper's pid (72451).
+      writeBreadcrumb(72451, 'sess-kiro-real');
+      const hit = resolveFromAncestorBreadcrumb(tmpDir, [72995, 72451, 72060]);
+      expect(hit).toEqual({ sessionId: 'sess-kiro-real', pid: 72451, depth: 1 });
+    });
+
+    it('skips index 0 — the direct ppid is resolveFromBreadcrumb()’s job', () => {
+      writeBreadcrumb(72995, 'sess-direct-ppid');
+      expect(resolveFromAncestorBreadcrumb(tmpDir, [72995, 72451])).toBeNull();
+    });
+
+    it('prefers the closest ancestor when several have breadcrumbs', () => {
+      writeBreadcrumb(72451, 'sess-closest');
+      writeBreadcrumb(72060, 'sess-further-up');
+      const hit = resolveFromAncestorBreadcrumb(tmpDir, [72995, 72451, 72060]);
+      expect(hit?.sessionId).toBe('sess-closest');
+      expect(hit?.depth).toBe(1);
+    });
+
+    it('keeps walking past ancestors that have no breadcrumb', () => {
+      writeBreadcrumb(72060, 'sess-two-up');
+      const hit = resolveFromAncestorBreadcrumb(tmpDir, [72995, 72451, 72060]);
+      expect(hit).toEqual({ sessionId: 'sess-two-up', pid: 72060, depth: 2 });
+    });
+
+    it('inherits the mtime staleness gate, rejecting a recycled-PID ancestor', () => {
+      const path = writeBreadcrumb(72451, 'sess-stale-leftover');
+      const oldMs = Date.now() - 60_000;
+      utimesSync(path, oldMs / 1000, oldMs / 1000);
+      // A process that started after the breadcrumb was written must not trust it.
+      expect(resolveFromAncestorBreadcrumb(tmpDir, [72995, 72451], Date.now())).toBeNull();
+    });
+
+    it('accepts an ancestor breadcrumb written after the process started', () => {
+      writeBreadcrumb(72451, 'sess-fresh');
+      const hit = resolveFromAncestorBreadcrumb(tmpDir, [72995, 72451], Date.now() - 60_000);
+      expect(hit?.sessionId).toBe('sess-fresh');
+    });
   });
 
   describe('nextDelayMs()', () => {
@@ -139,6 +275,235 @@ describe('session-resolver', () => {
         storagePath: tmpDir,
       });
       expect(sid).toBe('sess-immediate');
+    });
+
+    it('falls back to the cwd breadcrumb when the ppid breadcrumb never appears (via the poll loop, not trusted at t=0)', async () => {
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(
+        resolve(tmpDir, 'session-by-cwd', '-projects-winrepo.txt'),
+        'sess-cwd-fallback',
+      );
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 424242, // never has a matching breadcrumb
+        cwd: '/projects/winrepo',
+        storagePath: tmpDir,
+        suppressWarn: true,
+      });
+      expect(sid).toBe('sess-cwd-fallback');
+    });
+
+    it('prefers a ppid breadcrumb that appears just after startup over an already-present, possibly-stale cwd breadcrumb', async () => {
+      // A cwd breadcrumb left over from an unrelated prior session in the
+      // same directory must not win the race just because it already
+      // exists at t=0 — a ppid breadcrumb that shows up moments later (the
+      // real signal for THIS process) must still be preferred.
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(
+        resolve(tmpDir, 'session-by-cwd', '-projects-race.txt'),
+        'sess-stale-from-other-session',
+      );
+      const ppid = 424243;
+      const breadcrumbDir = resolve(tmpDir, 'session-by-ppid');
+      mkdirSync(breadcrumbDir, { recursive: true });
+      setTimeout(() => {
+        writeFileSync(resolve(breadcrumbDir, `${ppid}.txt`), 'sess-real-for-this-process');
+      }, 10);
+
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid,
+        cwd: '/projects/race',
+        storagePath: tmpDir,
+        suppressWarn: true,
+      });
+      expect(sid).toBe('sess-real-for-this-process');
+    });
+
+    it('prefers the ppid breadcrumb over the cwd breadcrumb when both are present', async () => {
+      const ppid = 111222;
+      mkdirSync(resolve(tmpDir, 'session-by-ppid'), { recursive: true });
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-ppid', `${ppid}.txt`), 'sess-from-ppid');
+      writeFileSync(resolve(tmpDir, 'session-by-cwd', '-projects-both.txt'), 'sess-from-cwd');
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid,
+        cwd: '/projects/both',
+        storagePath: tmpDir,
+      });
+      expect(sid).toBe('sess-from-ppid');
+    });
+
+    it('reports source "jobdir" via onResolutionSource when CLAUDE_JOB_DIR resolves', async () => {
+      const jobDir = resolve(tmpDir, 'job-src');
+      mkdirSync(jobDir, { recursive: true });
+      writeFileSync(
+        resolve(jobDir, 'state.json'),
+        JSON.stringify({ linkScanPath: '/whatever/job-src-uuid.jsonl' }),
+      );
+      const onResolutionSource = jest.fn();
+      const sid = await resolveSessionId({
+        claudeJobDir: jobDir,
+        ppid: 1,
+        storagePath: tmpDir,
+        onResolutionSource,
+      });
+      expect(sid).toBe('job-src-uuid');
+      expect(onResolutionSource).toHaveBeenCalledWith({
+        source: 'jobdir',
+        sessionId: 'job-src-uuid',
+      });
+    });
+
+    it('reports source "ppid" via onResolutionSource when the ppid breadcrumb resolves immediately', async () => {
+      const ppid = 99001;
+      mkdirSync(resolve(tmpDir, 'session-by-ppid'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-ppid', `${ppid}.txt`), 'sess-ppid-source');
+      const onResolutionSource = jest.fn();
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid,
+        storagePath: tmpDir,
+        onResolutionSource,
+      });
+      expect(sid).toBe('sess-ppid-source');
+      expect(onResolutionSource).toHaveBeenCalledWith({
+        source: 'ppid',
+        sessionId: 'sess-ppid-source',
+      });
+    });
+
+    it('reports source "cwd" via onResolutionSource when only the cwd fallback resolves', async () => {
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(
+        resolve(tmpDir, 'session-by-cwd', '-projects-cwd-source.txt'),
+        'sess-cwd-source',
+      );
+      const onResolutionSource = jest.fn();
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 424243, // never has a matching breadcrumb
+        cwd: '/projects/cwd-source',
+        storagePath: tmpDir,
+        onResolutionSource,
+      });
+      expect(sid).toBe('sess-cwd-source');
+      expect(onResolutionSource).toHaveBeenCalledWith({
+        source: 'cwd',
+        sessionId: 'sess-cwd-source',
+      });
+    });
+  });
+
+  describe('resolveSessionId() — ancestor ppid fallback', () => {
+    /** Writes a ppid breadcrumb. */
+    function writeBreadcrumb(pid: number, sessionId: string): void {
+      const dir = resolve(tmpDir, 'session-by-ppid');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(resolve(dir, `${pid}.txt`), sessionId);
+    }
+
+    it('resolves via an ancestor and reports source "ppid-ancestor"', async () => {
+      // Our own ppid (88101) has no breadcrumb — the npx wrapper case.
+      writeBreadcrumb(88102, 'sess-via-ancestor');
+      const onResolutionSource = jest.fn();
+
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 88101,
+        ancestorPids: [88101, 88102, 88103],
+        storagePath: tmpDir,
+        suppressWarn: true,
+        onResolutionSource,
+      });
+
+      expect(sid).toBe('sess-via-ancestor');
+      expect(onResolutionSource).toHaveBeenCalledWith({
+        source: 'ppid-ancestor',
+        sessionId: 'sess-via-ancestor',
+      });
+    });
+
+    it('prefers the direct ppid over an ancestor when both have breadcrumbs', async () => {
+      writeBreadcrumb(88201, 'sess-direct');
+      writeBreadcrumb(88202, 'sess-ancestor');
+      const onResolutionSource = jest.fn();
+
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 88201,
+        ancestorPids: [88201, 88202],
+        storagePath: tmpDir,
+        suppressWarn: true,
+        onResolutionSource,
+      });
+
+      expect(sid).toBe('sess-direct');
+      expect(onResolutionSource).toHaveBeenCalledWith({
+        source: 'ppid',
+        sessionId: 'sess-direct',
+      });
+    });
+
+    it('prefers an ancestor over the collision-prone cwd breadcrumb', async () => {
+      writeBreadcrumb(88302, 'sess-ancestor-wins');
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-cwd', '-projects-shared.txt'), 'sess-cwd-loses');
+      const onResolutionSource = jest.fn();
+
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 88301,
+        ancestorPids: [88301, 88302],
+        cwd: '/projects/shared',
+        storagePath: tmpDir,
+        suppressWarn: true,
+        onResolutionSource,
+      });
+
+      expect(sid).toBe('sess-ancestor-wins');
+      expect(onResolutionSource).toHaveBeenCalledWith({
+        source: 'ppid-ancestor',
+        sessionId: 'sess-ancestor-wins',
+      });
+    });
+
+    it('still falls back to cwd when no ancestor has a breadcrumb', async () => {
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(resolve(tmpDir, 'session-by-cwd', '-projects-fallback.txt'), 'sess-cwd-used');
+      const onResolutionSource = jest.fn();
+
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 88401,
+        ancestorPids: [88401, 88402, 88403],
+        cwd: '/projects/fallback',
+        storagePath: tmpDir,
+        suppressWarn: true,
+        onResolutionSource,
+      });
+
+      expect(sid).toBe('sess-cwd-used');
+      expect(onResolutionSource).toHaveBeenCalledWith({
+        source: 'cwd',
+        sessionId: 'sess-cwd-used',
+      });
+    });
+
+    it('resolves once an ancestor breadcrumb appears mid-poll', async () => {
+      setTimeout(() => {
+        writeBreadcrumb(88502, 'sess-ancestor-late');
+      }, 150);
+
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 88501,
+        ancestorPids: [88501, 88502],
+        storagePath: tmpDir,
+        suppressWarn: true,
+      });
+      expect(sid).toBe('sess-ancestor-late');
     });
   });
 
@@ -177,6 +542,590 @@ describe('session-resolver', () => {
         }),
       ).rejects.toThrow(/aborted/);
     });
+
+    it('resolves via the cwd fallback once it appears, when the ppid breadcrumb never does (native-Windows Git-Bash-interposition scenario)', async () => {
+      const breadcrumbCwdDir = resolve(tmpDir, 'session-by-cwd');
+      mkdirSync(breadcrumbCwdDir, { recursive: true });
+
+      // The ppid the resolver looks for (the MCP's own process.ppid, i.e.
+      // claude.exe's pid) never gets a breadcrumb — only a transient,
+      // unrelated interposed-shell pid would have one, which this resolver
+      // call never sees. The cwd breadcrumb appears after a delay instead,
+      // exactly like the real collector writing it on the next hook fire.
+      setTimeout(() => {
+        writeFileSync(resolve(breadcrumbCwdDir, '-projects-native-win.txt'), 'sess-win-regression');
+      }, 150);
+
+      const sid = await resolveSessionId({
+        claudeJobDir: null,
+        ppid: 333444, // never resolves
+        cwd: '/projects/native-win',
+        storagePath: tmpDir,
+        suppressWarn: true,
+      });
+      expect(sid).toBe('sess-win-regression');
+    });
+  });
+
+  describe('watchPpidBreadcrumb()', () => {
+    it('resolves once a ppid breadcrumb appears', async () => {
+      const ppid = 88001;
+      const breadcrumbDir = resolve(tmpDir, 'session-by-ppid');
+      mkdirSync(breadcrumbDir, { recursive: true });
+
+      setTimeout(() => {
+        writeFileSync(resolve(breadcrumbDir, `${ppid}.txt`), 'sess-ppid-correction');
+      }, 150);
+
+      const sid = await watchPpidBreadcrumb({ ppid, storagePath: tmpDir, suppressWarn: true });
+      expect(sid).toBe('sess-ppid-correction');
+    });
+
+    it('never resolves via a cwd breadcrumb, even if one appears first', async () => {
+      const ppid = 88002;
+      mkdirSync(resolve(tmpDir, 'session-by-cwd'), { recursive: true });
+      writeFileSync(
+        resolve(tmpDir, 'session-by-cwd', '-projects-watch-cwd.txt'),
+        'sess-cwd-should-be-ignored',
+      );
+
+      const ppidBreadcrumbDir = resolve(tmpDir, 'session-by-ppid');
+      mkdirSync(ppidBreadcrumbDir, { recursive: true });
+      setTimeout(() => {
+        writeFileSync(resolve(ppidBreadcrumbDir, `${ppid}.txt`), 'sess-ppid-wins');
+      }, 150);
+
+      const sid = await watchPpidBreadcrumb({
+        ppid,
+        cwd: '/projects/watch-cwd',
+        storagePath: tmpDir,
+        suppressWarn: true,
+      });
+      expect(sid).toBe('sess-ppid-wins');
+    });
+
+    describe('with includeParentOfPpid', () => {
+      const npmExec = 'npm exec @newrelic/preflight --stdio';
+      const breadcrumbDir = (): string => resolve(tmpDir, 'session-by-ppid');
+      const writeBreadcrumb = (pid: number, sessionId: string): void => {
+        mkdirSync(breadcrumbDir(), { recursive: true });
+        writeFileSync(resolve(breadcrumbDir(), `${pid}.txt`), sessionId);
+      };
+
+      /** Fakes `ps -o ppid=,args= -p <ppid>`, counting calls. */
+      function psRow(parentPid: number, command: string): { fn: ExecFileSyncFn; calls: number } {
+        const state = { calls: 0, fn: (() => '') as ExecFileSyncFn };
+        state.fn = () => {
+          state.calls++;
+          return `${parentPid} ${command}\n`;
+        };
+        return state;
+      }
+
+      async function watchUntil(
+        abortAfterMs: number,
+        options: {
+          readonly ppid: number;
+          readonly staleId: string;
+          readonly execFileSync: ExecFileSyncFn;
+          readonly platform?: NodeJS.Platform;
+          /** Times (ms after the watch starts) at which staleId activity is reported. */
+          readonly staleIdActivityAtMs?: readonly number[];
+        },
+      ): Promise<string | 'aborted'> {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), abortAfterMs);
+        let onActivity: (() => void) | undefined;
+        const activityTimers = (options.staleIdActivityAtMs ?? []).map((ms) =>
+          setTimeout(() => onActivity?.(), ms),
+        );
+        try {
+          return await watchPpidBreadcrumb({
+            ppid: options.ppid,
+            storagePath: tmpDir,
+            includeParentOfPpid: true,
+            staleId: options.staleId,
+            subscribeToStaleIdActivity: (listener) => {
+              onActivity = listener;
+            },
+            ancestry: {
+              platform: options.platform ?? 'darwin',
+              execFileSync: options.execFileSync,
+            },
+            signal: ac.signal,
+          });
+        } catch (err) {
+          if (/aborted/.test(String(err))) return 'aborted';
+          throw err;
+        } finally {
+          clearTimeout(timer);
+          activityTimers.forEach(clearTimeout);
+        }
+      }
+
+      it('is off unless includeParentOfPpid is set', async () => {
+        const ppid = 88004;
+        const hostPid = 88005;
+        writeBreadcrumb(hostPid, 'sess-host');
+        const ps = psRow(hostPid, npmExec);
+        const ac = new AbortController();
+        setTimeout(() => ac.abort(), 400);
+        await expect(
+          watchPpidBreadcrumb({
+            ppid,
+            ancestry: { platform: 'darwin', execFileSync: ps.fn },
+            storagePath: tmpDir,
+            signal: ac.signal,
+          }),
+        ).rejects.toThrow(/aborted/);
+        expect(ps.calls).toBe(0);
+      });
+
+      it('resolves from the npx host breadcrumb one level up (#479)', async () => {
+        // npx: our ppid is the `npm exec` wrapper (no breadcrumb); the host that
+        // launched it (Copilot CLI here) is where its hooks write theirs.
+        const npmExecPid = 88006;
+        const hostPid = 88007;
+        setTimeout(() => writeBreadcrumb(hostPid, 'sess-copilot'), 150);
+        const ps = psRow(hostPid, npmExec);
+
+        const result = await watchUntil(2000, {
+          ppid: npmExecPid,
+          staleId: 'sess-claude',
+          execFileSync: ps.fn,
+        });
+        expect(result).toBe('sess-copilot');
+      });
+
+      it('ignores the parent breadcrumb of an engine its host launched directly', async () => {
+        // The Claude Code CLI launched this engine, so its parent is the VS Code
+        // extension host. Another host's hooks running as that process's
+        // children (Copilot's, say) leave their session's breadcrumb there.
+        // It is ownerless and differs from the cwd guess, so only the gate
+        // keeps it out.
+        const ppid = 88025;
+        const extensionHostPid = 88026;
+        writeBreadcrumb(extensionHostPid, 'sess-copilot');
+        const ps = psRow(extensionHostPid, 'claude');
+
+        const result = await watchUntil(800, {
+          ppid,
+          staleId: 'sess-claude-a',
+          execFileSync: ps.fn,
+        });
+        expect(result).toBe('aborted');
+        // Read once, on the first tick: the answer is kept for the watch's life.
+        expect(ps.calls).toBe(1);
+      });
+
+      it('still resolves from the direct ppid breadcrumb when ppid is not a wrapper', async () => {
+        const ppid = 88027;
+        const parentPid = 88028;
+        writeBreadcrumb(parentPid, 'sess-copilot');
+        setTimeout(() => writeBreadcrumb(ppid, 'sess-claude-b'), 150);
+
+        const result = await watchUntil(2000, {
+          ppid,
+          staleId: 'sess-claude-a',
+          execFileSync: psRow(parentPid, 'claude').fn,
+        });
+        expect(result).toBe('sess-claude-b');
+      });
+
+      it('never looks more than one level above ppid', async () => {
+        const ppid = 88008;
+        const hostPid = 88009;
+        const sharedShellPid = 88010;
+        // A shared ancestor (a shell or tmux server) carrying a neighbouring
+        // session's id must never be adopted as a correction.
+        writeBreadcrumb(sharedShellPid, 'sess-neighbour');
+
+        const result = await watchUntil(400, {
+          ppid,
+          staleId: 'sess-own',
+          execFileSync: psRow(hostPid, npmExec).fn,
+        });
+        expect(result).toBe('aborted');
+      });
+
+      it('still prefers the direct ppid breadcrumb', async () => {
+        const ppid = 88011;
+        const parentPid = 88012;
+        writeBreadcrumb(ppid, 'sess-direct');
+        writeBreadcrumb(parentPid, 'sess-parent');
+
+        const result = await watchUntil(2000, {
+          ppid,
+          staleId: 'sess-cwd-guess',
+          execFileSync: psRow(parentPid, npmExec).fn,
+        });
+        expect(result).toBe('sess-direct');
+      });
+
+      it('stops reading the parent level once it names the cwd guess', async () => {
+        // The default Claude Code plugin launch: an npx engine whose cwd guess
+        // A is right, so the host's slot names A too. A later /clear or
+        // /resume rewrites that slot to B. That is the host switching
+        // sessions, not a correction of a wrong guess, and adopting B as one
+        // would carry A's tool calls into B with only B's cost.
+        const npmExecPid = 88013;
+        const hostPid = 88014;
+        writeBreadcrumb(hostPid, 'sess-claude-a');
+        setTimeout(() => writeBreadcrumb(hostPid, 'sess-claude-b'), 350);
+
+        const result = await watchUntil(1500, {
+          ppid: npmExecPid,
+          staleId: 'sess-claude-a',
+          execFileSync: psRow(hostPid, npmExec).fn,
+        });
+        expect(result).toBe('aborted');
+      });
+
+      it('never resolves the cwd guess from the parent level, only from the direct ppid', async () => {
+        // A match at the parent level is not a confirmation, but the watch
+        // keeps checking our own ppid's breadcrumb after it.
+        const ppid = 88029;
+        const hostPid = 88030;
+        writeBreadcrumb(hostPid, 'sess-claude-a');
+        let ownWritten = false;
+        setTimeout(() => {
+          writeBreadcrumb(ppid, 'sess-claude-a');
+          ownWritten = true;
+        }, 350);
+
+        const result = await watchUntil(2000, {
+          ppid,
+          staleId: 'sess-claude-a',
+          execFileSync: psRow(hostPid, npmExec).fn,
+        });
+        expect(result).toBe('sess-claude-a');
+        expect(ownWritten).toBe(true);
+      });
+
+      it('skips a parent breadcrumb whose session has a live owning engine', async () => {
+        // The cwd guess is right, but the host's slot carries a co-located
+        // session's id. That session already has its own engine, so it can't
+        // be this one's.
+        const npmExecPid = 88015;
+        const hostPid = 88016;
+        writeBreadcrumb(hostPid, 'sess-claude-a');
+        writeFileSync(resolve(tmpDir, 'active-sess-claude-a.pid'), String(process.pid));
+
+        const result = await watchUntil(400, {
+          ppid: npmExecPid,
+          staleId: 'sess-copilot',
+          execFileSync: psRow(hostPid, npmExec).fn,
+        });
+        expect(result).toBe('aborted');
+      });
+
+      it('adopts a parent breadcrumb whose owner heartbeat names a dead process', async () => {
+        const npmExecPid = 88017;
+        const hostPid = 88018;
+        writeBreadcrumb(hostPid, 'sess-copilot');
+        writeFileSync(resolve(tmpDir, 'active-sess-copilot.pid'), String(DEAD_PID));
+
+        const result = await watchUntil(2000, {
+          ppid: npmExecPid,
+          staleId: 'sess-claude-a',
+          execFileSync: psRow(hostPid, npmExec).fn,
+        });
+        expect(result).toBe('sess-copilot');
+      });
+
+      it('keeps skipping a parent breadcrumb after its owning engine exits', async () => {
+        // The co-located session ending doesn't make its breadcrumb ours.
+        const npmExecPid = 88021;
+        const hostPid = 88022;
+        writeBreadcrumb(hostPid, 'sess-claude-a');
+        const heartbeat = resolve(tmpDir, 'active-sess-claude-a.pid');
+        writeFileSync(heartbeat, String(process.pid));
+        setTimeout(() => writeFileSync(heartbeat, String(DEAD_PID)), 200);
+
+        const result = await watchUntil(1000, {
+          ppid: npmExecPid,
+          staleId: 'sess-copilot',
+          execFileSync: psRow(hostPid, npmExec).fn,
+        });
+        expect(result).toBe('aborted');
+      });
+
+      it('never consults the parent level on Linux or Windows', async () => {
+        // Linux collectors write breadcrumbs at their ancestors too, so the
+        // parent slot is routinely shared; an ownerless neighbour there would
+        // otherwise pass every other check. Windows has no `ps`.
+        const npmExecPid = 88023;
+        const hostPid = 88024;
+        writeBreadcrumb(hostPid, 'sess-hooks-only-neighbour');
+        for (const platform of ['linux', 'win32'] as const) {
+          const ps = psRow(hostPid, npmExec);
+          const result = await watchUntil(400, {
+            ppid: npmExecPid,
+            staleId: 'sess-own',
+            execFileSync: ps.fn,
+            platform,
+          });
+          expect(result).toBe('aborted');
+          expect(ps.calls).toBe(0);
+        }
+      });
+
+      describe('with staleId activity reported', () => {
+        // Ticks land at ~100, 300, 800, 1800 and 3800ms.
+        const npmExecPid = 88031;
+        const hostPid = 88032;
+
+        /** `ps` fails on its first call only, like a one-off timeout under load. */
+        const psFailingOnce = (): { fn: ExecFileSyncFn; calls: number } => {
+          const state = { calls: 0, fn: (() => '') as ExecFileSyncFn };
+          state.fn = () => {
+            state.calls++;
+            if (state.calls === 1) throw new Error('spawnSync ps ETIMEDOUT');
+            return `${hostPid} ${npmExec}\n`;
+          };
+          return state;
+        };
+
+        it('stops reading the parent level once activity is drained while it names the guess', async () => {
+          // The host's hook writes its slot before appending the event the
+          // caller drains, so the slot named A when that activity arrived. No
+          // tick read it: all of A's activity and the /clear rewriting the
+          // slot to B fell between the 800ms and 1800ms ticks.
+          setTimeout(() => writeBreadcrumb(hostPid, 'sess-claude-a'), 1000);
+          setTimeout(() => writeBreadcrumb(hostPid, 'sess-claude-b'), 1200);
+
+          const result = await watchUntil(2600, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: psRow(hostPid, npmExec).fn,
+            staleIdActivityAtMs: [1100],
+          });
+          expect(result).toBe('aborted');
+        });
+
+        it('still corrects from the parent level while the guessed session stays active (#479)', async () => {
+          // The wrongly guessed Claude Code session stays active: its events
+          // drain under staleId before the first lookup, before our host's
+          // slot exists, and after the slot names the Copilot session.
+          setTimeout(() => writeBreadcrumb(hostPid, 'sess-copilot'), 1000);
+
+          const result = await watchUntil(2600, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude',
+            execFileSync: psRow(hostPid, npmExec).fn,
+            staleIdActivityAtMs: [50, 500, 900, 1100],
+          });
+          expect(result).toBe('sess-copilot');
+        });
+
+        it('stops reading the parent level after activity while the lookup is failing', async () => {
+          // With no parent pid cached the slot can't be read, so this activity
+          // could be ours under a slot that has since moved to B.
+          writeBreadcrumb(hostPid, 'sess-claude-b');
+
+          const result = await watchUntil(1000, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: psFailingOnce().fn,
+            staleIdActivityAtMs: [200],
+          });
+          expect(result).toBe('aborted');
+        });
+
+        it('stops reading the parent level when the lookup after unchecked activity fails', async () => {
+          writeBreadcrumb(hostPid, 'sess-claude-b');
+
+          const result = await watchUntil(1000, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: psFailingOnce().fn,
+            staleIdActivityAtMs: [50],
+          });
+          expect(result).toBe('aborted');
+        });
+
+        it('still confirms the guess from the direct ppid after activity latched the parent level', async () => {
+          setTimeout(() => writeBreadcrumb(hostPid, 'sess-claude-a'), 1000);
+          setTimeout(() => writeBreadcrumb(hostPid, 'sess-claude-b'), 1200);
+          setTimeout(() => writeBreadcrumb(npmExecPid, 'sess-claude-a'), 1300);
+
+          const result = await watchUntil(2600, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: psRow(hostPid, npmExec).fn,
+            staleIdActivityAtMs: [1100],
+          });
+          expect(result).toBe('sess-claude-a');
+        });
+
+        it('still confirms the guess from the direct ppid after unchecked activity', async () => {
+          writeBreadcrumb(hostPid, 'sess-claude-b');
+          setTimeout(() => writeBreadcrumb(npmExecPid, 'sess-claude-a'), 400);
+
+          const result = await watchUntil(1500, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: psFailingOnce().fn,
+            staleIdActivityAtMs: [200],
+          });
+          expect(result).toBe('sess-claude-a');
+        });
+      });
+
+      describe('reading the ppid command line', () => {
+        const npmExecPid = 88019;
+        const hostPid = 88020;
+
+        it('retries a lookup whose ps call failed instead of caching the failure', async () => {
+          // macOS, npx-launched Copilot engine on a saturated machine: the first
+          // `ps` times out. A later tick must still reach the host's breadcrumb.
+          writeBreadcrumb(hostPid, 'sess-copilot');
+          let calls = 0;
+          const result = await watchUntil(1500, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: () => {
+              calls++;
+              if (calls === 1) throw new Error('spawnSync ps ETIMEDOUT');
+              return `${hostPid} ${npmExec}\n`;
+            },
+          });
+          expect(result).toBe('sess-copilot');
+          expect(calls).toBe(2);
+        });
+
+        it('spaces out retries of a lookup that keeps failing', async () => {
+          // Ticks land at ~100, 300 and 800ms; lookups run on ticks 1 and 2 only.
+          let calls = 0;
+          const result = await watchUntil(1300, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: () => {
+              calls++;
+              throw new Error('spawnSync ps ETIMEDOUT');
+            },
+          });
+          expect(result).toBe('aborted');
+          expect(calls).toBe(2);
+        });
+
+        it('looks up once when the lookup succeeds', async () => {
+          const ps = psRow(hostPid, npmExec);
+          const result = await watchUntil(1300, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: ps.fn,
+          });
+          expect(result).toBe('aborted');
+          expect(ps.calls).toBe(1);
+        });
+
+        it('looks up once when the wrapper is a child of launchd', async () => {
+          // ppid's parent is PID 1, so there is no parent level to watch.
+          writeBreadcrumb(1, 'sess-launchd');
+          const ps = psRow(1, npmExec);
+          const result = await watchUntil(1300, {
+            ppid: npmExecPid,
+            staleId: 'sess-claude-a',
+            execFileSync: ps.fn,
+          });
+          expect(result).toBe('aborted');
+          expect(ps.calls).toBe(1);
+        });
+      });
+    });
+
+    it('aborts via signal', async () => {
+      const ppid = 88003;
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 50);
+      await expect(
+        watchPpidBreadcrumb({
+          ppid,
+          storagePath: tmpDir,
+          suppressWarn: true,
+          signal: ac.signal,
+        }),
+      ).rejects.toThrow(/aborted/);
+    });
+  });
+
+  describe('watchCwdBreadcrumbForCorrection()', () => {
+    it('resolves once the cwd breadcrumb points at a different, buffer-confirmed session', async () => {
+      const cwdDir = resolve(tmpDir, 'session-by-cwd');
+      mkdirSync(cwdDir, { recursive: true });
+      writeFileSync(resolve(cwdDir, '-projects-win686.txt'), 'stale-short-lived-id');
+
+      // Real session appears a bit later, as the collector overwrites the
+      // cwd breadcrumb — plus its buffer, the positive-evidence signal this
+      // function requires before trusting the new value.
+      setTimeout(() => {
+        writeFileSync(resolve(cwdDir, '-projects-win686.txt'), 'real-session-id');
+        writeFileSync(resolve(tmpDir, 'buffer-real-session-id.jsonl'), '{"hook_event_name":"x"}\n');
+      }, 150);
+
+      const sid = await watchCwdBreadcrumbForCorrection({
+        staleId: 'stale-short-lived-id',
+        cwd: '/projects/win686',
+        storagePath: tmpDir,
+      });
+      expect(sid).toBe('real-session-id');
+    });
+
+    it('keeps polling when the cwd breadcrumb changes but the candidate has no buffer yet (unconfirmed)', async () => {
+      const cwdDir = resolve(tmpDir, 'session-by-cwd');
+      mkdirSync(cwdDir, { recursive: true });
+      writeFileSync(resolve(cwdDir, '-projects-unconfirmed.txt'), 'stale-id');
+
+      // A different id appears in the breadcrumb, but its buffer file never
+      // shows up (e.g. a stale leftover from an unrelated session that never
+      // ran here) — must not be adopted.
+      setTimeout(() => {
+        writeFileSync(resolve(cwdDir, '-projects-unconfirmed.txt'), 'unconfirmed-candidate');
+      }, 100);
+
+      const ac = new AbortController();
+      const watch = watchCwdBreadcrumbForCorrection({
+        staleId: 'stale-id',
+        cwd: '/projects/unconfirmed',
+        storagePath: tmpDir,
+        signal: ac.signal,
+      });
+      // Give the candidate several poll ticks to be (wrongly) accepted, then
+      // abort and confirm it never resolved.
+      setTimeout(() => ac.abort(), 500);
+      await expect(watch).rejects.toThrow(/aborted/);
+    });
+
+    it('ignores a breadcrumb that still matches staleId', async () => {
+      const cwdDir = resolve(tmpDir, 'session-by-cwd');
+      mkdirSync(cwdDir, { recursive: true });
+      writeFileSync(resolve(cwdDir, '-projects-samevalue.txt'), 'same-id');
+      writeFileSync(resolve(tmpDir, 'buffer-same-id.jsonl'), '{"hook_event_name":"x"}\n');
+
+      const ac = new AbortController();
+      const watch = watchCwdBreadcrumbForCorrection({
+        staleId: 'same-id',
+        cwd: '/projects/samevalue',
+        storagePath: tmpDir,
+        signal: ac.signal,
+      });
+      setTimeout(() => ac.abort(), 300);
+      await expect(watch).rejects.toThrow(/aborted/);
+    });
+
+    it('aborts via signal', async () => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 50);
+      await expect(
+        watchCwdBreadcrumbForCorrection({
+          staleId: 'whatever',
+          cwd: '/projects/abort-test',
+          storagePath: tmpDir,
+          signal: ac.signal,
+        }),
+      ).rejects.toThrow(/aborted/);
+    });
   });
 });
 
@@ -203,5 +1152,370 @@ describe('isSyntheticSessionId', () => {
 
   it('returns false for undefined', () => {
     expect(isSyntheticSessionId(undefined)).toBe(false);
+  });
+});
+
+describe('isUnscopedAggregatorSessionId', () => {
+  it('returns true for local- prefix', () => {
+    // A --local process's SubagentWatcher runs unscoped (parentSessionId:
+    // undefined) — it may have parsed transcripts belonging to other real
+    // sessions, so its own live cost is not exclusively-its-own.
+    expect(isUnscopedAggregatorSessionId('local-1234567890')).toBe(true);
+  });
+
+  it('returns true for proxy- prefix', () => {
+    expect(isUnscopedAggregatorSessionId('proxy-1234567890')).toBe(true);
+  });
+
+  it('returns false for pending- prefix', () => {
+    // A pending-<ts> id is still exactly one real --stdio session mid-
+    // resolution — its live cost genuinely is exclusively its own, so it
+    // must NOT be treated the same as an unscoped aggregator.
+    expect(isUnscopedAggregatorSessionId('pending-1234567890')).toBe(false);
+  });
+
+  it('returns false for a real session ID', () => {
+    expect(isUnscopedAggregatorSessionId('abc-123-real-session')).toBe(false);
+  });
+
+  it('returns false for empty string', () => {
+    expect(isUnscopedAggregatorSessionId('')).toBe(false);
+  });
+
+  it('returns false for null', () => {
+    expect(isUnscopedAggregatorSessionId(null)).toBe(false);
+  });
+
+  it('returns false for undefined', () => {
+    expect(isUnscopedAggregatorSessionId(undefined)).toBe(false);
+  });
+});
+
+describe('sanitizeCwdForFilename', () => {
+  it('replaces backslash, forward slash, and colon with "-"', () => {
+    expect(sanitizeCwdForFilename('/Users/dev/projects/app')).toBe('-Users-dev-projects-app');
+    expect(sanitizeCwdForFilename('C:\\Users\\dev\\app')).toBe('C--Users-dev-app');
+  });
+});
+
+describe('readJobState', () => {
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+  let jobDir: string;
+
+  beforeEach(() => {
+    stderrSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    jobDir = resolve(tmpdir(), `nr-jobstate-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(jobDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    if (existsSync(jobDir)) rmSync(jobDir, { recursive: true, force: true });
+  });
+
+  it('returns null when the dir is null/undefined/empty or state.json is missing', () => {
+    expect(readJobState(null)).toBeNull();
+    expect(readJobState(undefined)).toBeNull();
+    expect(readJobState('')).toBeNull();
+    expect(readJobState(jobDir)).toBeNull();
+  });
+
+  it('returns null when state.json is invalid JSON', () => {
+    writeFileSync(resolve(jobDir, 'state.json'), 'not json');
+    expect(readJobState(jobDir)).toBeNull();
+  });
+
+  it('reads name, nameSource, and an explicit sessionId, gating intent behind recordContent', () => {
+    writeFileSync(
+      resolve(jobDir, 'state.json'),
+      JSON.stringify({
+        sessionId: 'abc-123-def',
+        name: 'refactor auth flow',
+        nameSource: 'user',
+        intent: 'please refactor the auth flow',
+        linkScanPath: '/somewhere/other-uuid.jsonl',
+      }),
+    );
+    // Default (no recordContent) and recordContent:false both keep the
+    // sensitive intent null; only recordContent:true surfaces it.
+    expect(readJobState(jobDir)).toEqual({
+      sessionId: 'abc-123-def',
+      name: 'refactor auth flow',
+      nameSource: 'user',
+      intent: null,
+    });
+    expect(readJobState(jobDir, { recordContent: false })).toEqual({
+      sessionId: 'abc-123-def',
+      name: 'refactor auth flow',
+      nameSource: 'user',
+      intent: null,
+    });
+    expect(readJobState(jobDir, { recordContent: true })).toEqual({
+      sessionId: 'abc-123-def',
+      name: 'refactor auth flow',
+      nameSource: 'user',
+      intent: 'please refactor the auth flow',
+    });
+  });
+
+  it('falls back to the linkScanPath UUID when no explicit sessionId field', () => {
+    writeFileSync(
+      resolve(jobDir, 'state.json'),
+      JSON.stringify({ name: 'x', nameSource: 'auto', linkScanPath: '/dir/link-uuid.jsonl' }),
+    );
+    expect(readJobState(jobDir)?.sessionId).toBe('link-uuid');
+  });
+
+  it('normalizes an invalid nameSource, empty name, and empty intent to null', () => {
+    writeFileSync(
+      resolve(jobDir, 'state.json'),
+      JSON.stringify({ sessionId: 'sess-1', name: '', nameSource: 'bogus', intent: '' }),
+    );
+    // recordContent:true so the empty-string intent is normalized to null by
+    // the length check, not merely suppressed by the recordContent gate.
+    expect(readJobState(jobDir, { recordContent: true })).toEqual({
+      sessionId: 'sess-1',
+      name: null,
+      nameSource: null,
+      intent: null,
+    });
+  });
+});
+
+describe('findLastAiTitleInText', () => {
+  it('returns the LAST ai-title when several are present', () => {
+    const text = [
+      '{"type":"user","text":"hi"}',
+      '{"type":"ai-title","aiTitle":"first guess"}',
+      '{"type":"assistant","text":"work"}',
+      '{"type":"ai-title","aiTitle":"refined title"}',
+      '',
+    ].join('\n');
+    expect(findLastAiTitleInText(text, true)).toBe('refined title');
+  });
+
+  it('ignores non-ai-title records (e.g. agent-name)', () => {
+    const text = [
+      '{"type":"ai-title","aiTitle":"the title"}',
+      '{"type":"agent-name","agentName":"explorer"}',
+      '',
+    ].join('\n');
+    expect(findLastAiTitleInText(text, true)).toBe('the title');
+  });
+
+  it('skips malformed JSON lines', () => {
+    const text = ['{"type":"ai-title","aiTitle":"good"}', 'this is not json', ''].join('\n');
+    expect(findLastAiTitleInText(text, true)).toBe('good');
+  });
+
+  it('skips the partial leading fragment when firstFragmentComplete is false', () => {
+    // The leading fragment is a truncated ai-title whose start is unread; it
+    // must be ignored, yielding null (no complete ai-title follows it).
+    const text = 'e":"ai-title","aiTitle":"truncated"}\n{"type":"user","text":"hi"}\n';
+    expect(findLastAiTitleInText(text, false)).toBeNull();
+  });
+
+  it('returns null when no ai-title is present', () => {
+    expect(findLastAiTitleInText('{"type":"user","text":"hi"}\n', true)).toBeNull();
+  });
+});
+
+describe('readTranscriptTitle', () => {
+  let stderrSpy: ReturnType<typeof jest.spyOn>;
+  let projectsDir: string;
+  // Deliberately contains a dot (a worktree/hidden dir) so the slug below
+  // exercises the dot-replacement that the OLD cwd-derived path missed.
+  const cwd = '/Users/dev/projects/.worktrees/preflight';
+  const sessionId = 'sess-transcript-1';
+
+  // Build the fixture under a Claude-Code-style slug that REPLACES dots (which
+  // our breadcrumb sanitizer does not) — the transcript is located by matching
+  // <sessionId>.jsonl across slugs, so the exact slug must not matter.
+  const slug = cwd.replace(/[\\/:.]/g, '-');
+  const writeTranscript = (content: string): void => {
+    const dir = resolve(projectsDir, slug);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(resolve(dir, `${sessionId}.jsonl`), content);
+  };
+
+  beforeEach(() => {
+    stderrSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    projectsDir = resolve(
+      tmpdir(),
+      `nr-transcript-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
+    mkdirSync(projectsDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    if (existsSync(projectsDir)) rmSync(projectsDir, { recursive: true, force: true });
+  });
+
+  it('returns null when the transcript file is missing', () => {
+    expect(readTranscriptTitle({ projectsDir, sessionId })).toBeNull();
+  });
+
+  it('returns null for an invalid sessionId (never builds a path)', () => {
+    expect(readTranscriptTitle({ projectsDir, sessionId: 'has spaces' })).toBeNull();
+  });
+
+  it('returns the last ai-title, locating the transcript by sessionId under a dot-replacing slug', () => {
+    writeTranscript(
+      [
+        '{"type":"ai-title","aiTitle":"first title","sessionId":"sess-transcript-1"}',
+        '{"type":"assistant","message":{"content":[]}}',
+        '{"type":"ai-title","aiTitle":"session naming logic","sessionId":"sess-transcript-1"}',
+        '{"type":"agent-name","agentName":"explorer","sessionId":"sess-transcript-1"}',
+        '',
+      ].join('\n'),
+    );
+    expect(readTranscriptTitle({ projectsDir, sessionId })).toBe('session naming logic');
+  });
+
+  it('finds the last ai-title even when it sits many chunks back from EOF', () => {
+    // Put the ai-title near the top, then >200KB of filler after it so the
+    // reverse chunk scan (64KB chunks) must cross several boundaries to reach
+    // it — exercises the partial-line carry between chunks.
+    const filler = `${'{"type":"assistant","message":{"content":[]}}'}\n`.repeat(5000);
+    writeTranscript(`{"type":"ai-title","aiTitle":"deep title"}\n${filler}`);
+    expect(readTranscriptTitle({ projectsDir, sessionId })).toBe('deep title');
+  });
+
+  it('returns null when the only ai-title is beyond the bounded scan window', () => {
+    // ai-title at the very start, followed by >1MB of filler (past
+    // TRANSCRIPT_TITLE_MAX_SCAN_BYTES) — the bounded scan stops before reaching it.
+    const filler = `${'{"type":"assistant","message":{"content":[]}}'}\n`.repeat(30_000);
+    writeTranscript(`{"type":"ai-title","aiTitle":"too far back"}\n${filler}`);
+    expect(readTranscriptTitle({ projectsDir, sessionId })).toBeNull();
+  });
+
+  it('redacts the returned title', () => {
+    const raw = 'debugging AKIAIOSFODNN7EXAMPLE key';
+    writeTranscript(`{"type":"ai-title","aiTitle":${JSON.stringify(raw)}}\n`);
+    // The reader must apply redactSensitive on the way out — assert against it
+    // directly so the test tracks whatever DEFAULT_REDACTION_PATTERNS match.
+    expect(readTranscriptTitle({ projectsDir, sessionId })).toBe(redactSensitive(raw));
+  });
+});
+
+describe('resolveSessionName', () => {
+  it('returns null when nothing is usable', () => {
+    expect(resolveSessionName({})).toBeNull();
+    expect(resolveSessionName({ jobState: null, transcriptTitle: null, cwd: null })).toBeNull();
+  });
+
+  it('1: a user-authored job-state name wins over everything', () => {
+    expect(
+      resolveSessionName({
+        jobState: { sessionId: 's', name: 'human name', nameSource: 'user', intent: null },
+        transcriptTitle: 'ai title',
+        cwd: '/Users/dev/projects/app',
+      }),
+    ).toEqual({ name: 'human name', source: 'user' });
+  });
+
+  it('2: the transcript ai-title wins over an auto job-state name and cwd', () => {
+    expect(
+      resolveSessionName({
+        jobState: { sessionId: 's', name: 'auto name', nameSource: 'auto', intent: null },
+        transcriptTitle: 'ai title',
+        cwd: '/Users/dev/projects/app',
+      }),
+    ).toEqual({ name: 'ai title', source: 'ai-title' });
+  });
+
+  it('3: an auto job-state name wins over cwd when there is no user name or ai-title', () => {
+    expect(
+      resolveSessionName({
+        jobState: { sessionId: 's', name: 'auto name', nameSource: 'auto', intent: null },
+        transcriptTitle: null,
+        cwd: '/Users/dev/projects/app',
+      }),
+    ).toEqual({ name: 'auto name', source: 'auto' });
+  });
+
+  it('4: falls back to the cwd basename', () => {
+    expect(resolveSessionName({ cwd: '/Users/dev/projects/my-app' })).toEqual({
+      name: 'my-app',
+      source: 'cwd',
+    });
+  });
+
+  it('4: a degenerate cwd basename falls through to null (streaming fallback can do better)', () => {
+    expect(resolveSessionName({ cwd: '/tmp' })).toBeNull();
+    expect(resolveSessionName({ cwd: '/var' })).toBeNull();
+  });
+
+  it('4: the degenerate-cwd guard is case-insensitive', () => {
+    // Exercises the DEGENERATE_NAMES.has(base.toLowerCase()) lowering branch.
+    expect(resolveSessionName({ cwd: '/TMP' })).toBeNull();
+    expect(resolveSessionName({ cwd: '/Users/dev/VAR' })).toBeNull();
+  });
+
+  it('1: a user nameSource with an empty name falls through to the next tier', () => {
+    // nameSource is 'user' but name is empty → tier 1 must not fire; the
+    // transcript ai-title should win instead.
+    expect(
+      resolveSessionName({
+        jobState: { sessionId: 's', name: '', nameSource: 'user', intent: null },
+        transcriptTitle: 'ai title',
+        cwd: '/Users/dev/projects/app',
+      }),
+    ).toEqual({ name: 'ai title', source: 'ai-title' });
+  });
+
+  it('does not use a job-state name whose nameSource is null', () => {
+    // name present but nameSource unknown/null → skip to next tier (cwd here).
+    expect(
+      resolveSessionName({
+        jobState: { sessionId: 's', name: 'unlabeled', nameSource: null, intent: null },
+        cwd: '/Users/dev/projects/app',
+      }),
+    ).toEqual({ name: 'app', source: 'cwd' });
+  });
+});
+
+describe('sessionNameSourceRank', () => {
+  it('ranks sources most-trusted-first, mirroring resolveSessionName precedence', () => {
+    expect(sessionNameSourceRank('user')).toBe(0);
+    expect(sessionNameSourceRank('ai-title')).toBe(1);
+    expect(sessionNameSourceRank('auto')).toBe(2);
+    expect(sessionNameSourceRank('cwd')).toBe(3);
+    // Strictly ordered: user < ai-title < auto < cwd.
+    expect(sessionNameSourceRank('user')).toBeLessThan(sessionNameSourceRank('ai-title'));
+    expect(sessionNameSourceRank('ai-title')).toBeLessThan(sessionNameSourceRank('auto'));
+    expect(sessionNameSourceRank('auto')).toBeLessThan(sessionNameSourceRank('cwd'));
+  });
+});
+
+describe('shouldReplaceSessionName', () => {
+  it('always accepts when the session is not yet named (current === null)', () => {
+    expect(shouldReplaceSessionName(null, 'cwd')).toBe(true);
+    expect(shouldReplaceSessionName(null, 'user')).toBe(true);
+  });
+
+  it('accepts an upgrade to a more-trusted source', () => {
+    expect(shouldReplaceSessionName('cwd', 'auto')).toBe(true);
+    expect(shouldReplaceSessionName('auto', 'ai-title')).toBe(true);
+    expect(shouldReplaceSessionName('ai-title', 'user')).toBe(true);
+    // And the full jump end-to-end.
+    expect(shouldReplaceSessionName('cwd', 'user')).toBe(true);
+  });
+
+  it('accepts a refresh at the same source (equal rank)', () => {
+    expect(shouldReplaceSessionName('ai-title', 'ai-title')).toBe(true);
+    expect(shouldReplaceSessionName('user', 'user')).toBe(true);
+    expect(shouldReplaceSessionName('cwd', 'cwd')).toBe(true);
+  });
+
+  it('refuses a downgrade to a less-trusted source', () => {
+    // The load-bearing invariant: a user name is never demoted.
+    expect(shouldReplaceSessionName('user', 'ai-title')).toBe(false);
+    expect(shouldReplaceSessionName('user', 'auto')).toBe(false);
+    expect(shouldReplaceSessionName('user', 'cwd')).toBe(false);
+    expect(shouldReplaceSessionName('ai-title', 'auto')).toBe(false);
+    expect(shouldReplaceSessionName('ai-title', 'cwd')).toBe(false);
+    expect(shouldReplaceSessionName('auto', 'cwd')).toBe(false);
   });
 });

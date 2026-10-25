@@ -2,7 +2,7 @@ name: newrelic-preflight
 description: >-
   AI coding observability for Claude Code. Tracks tool calls, cost,
   anti-patterns, and efficiency metrics — and ships them to New Relic.
-  Works across Claude Code, Cursor, Windsurf, and 6 other platforms.
+  Works across Claude Code, Cursor, Windsurf, Codex, Copilot, and more.
 
 startCommand:
   type: stdio
@@ -42,7 +42,7 @@ startCommand:
     (config) => {
       const env = {};
       if (config.licenseKey) env.NEW_RELIC_LICENSE_KEY = config.licenseKey;
-      if (config.accountId)  env.NEW_RELIC_AI_ACCOUNT_ID = config.accountId;
+      if (config.accountId)  env.NEW_RELIC_ACCOUNT_ID = config.accountId;
       if (config.developer)  env.NEW_RELIC_AI_MCP_DEVELOPER = config.developer;
       if (config.mode)       env.NR_AI_MODE = config.mode;
       return {

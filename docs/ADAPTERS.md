@@ -1,6 +1,11 @@
+---
+title: Platform Adapters
+description: Per-platform reference for what each Preflight adapter can and can't observe, detection, setup, and known gaps.
+---
+
 # Platform Adapters
 
-Preflight supports 13 named AI coding platforms plus a generic MCP fallback, each via a `PlatformAdapter` in `src/platforms/`. Adapters differ in one fundamental way: **what the platform actually exposes to a third-party observer.** Some platforms have a real hook/callback mechanism that fires on every built-in tool call; others only support MCP as a client, which means Preflight can see calls the platform's agent chooses to make to Preflight's own tools, but never a callback for the platform's _built-in_ tools (file reads, edits, terminal commands, etc).
+Preflight supports 18 named AI coding platforms plus a generic MCP fallback, each via a `PlatformAdapter` in `src/platforms/`. Adapters differ in one fundamental way: **what the platform actually exposes to a third-party observer.** Some platforms have a real hook/callback mechanism that fires on every built-in tool call; others only support MCP as a client, which means Preflight can see calls the platform's agent chooses to make to Preflight's own tools, but never a callback for the platform's _built-in_ tools (file reads, edits, terminal commands, etc).
 
 This doc is the canonical reference for what each adapter can and can't observe, how detection and setup actually work, and where the gaps are. It mirrors `src/platforms/*.ts` and the hook-event handling in `src/hooks/collector-script.ts` — if you change either, update this doc in the same PR.
 
@@ -8,28 +13,33 @@ This doc is the canonical reference for what each adapter can and can't observe,
 
 ## Integration mechanisms
 
-| Mechanism                                                                                                      | Platforms                                           | What's captured                                                                        | `visibilityLevel` |
-| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------- | ----------------- |
-| **Uniform hook events** (`tool_name`/`tool_input`, PreToolUse/PostToolUse-shaped, case-insensitive event name) | Claude Code, Kiro, Amazon Q, Droid, Codex, opencode | All built-in tool calls                                                                | `full-hooks`      |
-| **Own event names, Claude-Code-shaped fields**[^gemini-hybrid]                                                 | Gemini CLI                                          | All built-in tool calls (and third-party MCP tool calls)                               | `full-hooks`      |
-| **Platform-specific hook events** (own field vocabulary, own branches in `collector-script.ts`)                | Cursor, Windsurf                                    | All built-in tool calls                                                                | `full-hooks`      |
-| **MCP-client-only** (no hook/callback mechanism exists)                                                        | Zed, Continue.dev, Cline                            | Only calls routed to Preflight's own MCP tools — **not** the platform's built-in tools | `mcp-tools-only`  |
-| **HTTP push from an extension**                                                                                | GitHub Copilot                                      | Whatever the (user-supplied) extension forwards                                        | `self-reported`   |
-| **Self-report via MCP tools**                                                                                  | Generic MCP fallback                                | Whatever the caller reports via `nr_observe_report_tool_call`                          | `self-reported`   |
+| Mechanism                                                                                                      | Platforms                                                                                                                                              | What's captured                                                                        | `visibilityLevel` |
+| -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- | ----------------- |
+| **Uniform hook events** (`tool_name`/`tool_input`, PreToolUse/PostToolUse-shaped, case-insensitive event name) | Claude Code, Kiro, Amazon Q, Droid, Codex, opencode, Kilo Code, Pi[^pi-no-mcp], GitHub Copilot[^copilot-camel], GitHub Copilot SDK, GitHub Copilot app | All built-in tool calls                                                                | `full-hooks`      |
+| **Own event names, Claude-Code-shaped fields**[^gemini-hybrid]                                                 | Gemini CLI                                                                                                                                             | All built-in tool calls (and third-party MCP tool calls)                               | `full-hooks`      |
+| **Platform-specific hook events** (own field vocabulary, own branches in `collector-script.ts`)                | Cursor, Windsurf, Antigravity[^agy-event-arg]                                                                                                          | All built-in tool calls                                                                | `full-hooks`      |
+| **MCP-client-only** (no hook/callback mechanism exists)                                                        | Zed, Continue.dev, Cline                                                                                                                               | Only calls routed to Preflight's own MCP tools — **not** the platform's built-in tools | `mcp-tools-only`  |
+| **Self-report via MCP tools**                                                                                  | Generic MCP fallback                                                                                                                                   | Whatever the caller reports via `nr_observe_report_tool_call`                          | `self-reported`   |
+
+[^copilot-camel]: VS Code Copilot sends the uniform `hook_event_name`/`tool_name`/`tool_input`/`session_id` envelope but with VS Code's own tool names and camelCase `tool_input` keys — both deltas documented in the hooks FAQ ([code.visualstudio.com/docs/copilot/customization/hooks](https://code.visualstudio.com/docs/copilot/customization/hooks)). Copilot also retains a legacy HTTP-push fallback path (see its section below).
 
 [^gemini-hybrid]: Gemini CLI's hook _event names_ (`BeforeTool`/`AfterTool`) don't match `PreToolUse`/`PostToolUse`, so it needs its own branches in `collector-script.ts` — but the _fields_ inside those events (`tool_name`, `tool_input`, `tool_response`) are shaped exactly like Claude Code's, so those branches reuse the existing field-extraction helpers rather than needing new ones.
 
+[^pi-no-mcp]: Pi has no MCP client support at all, by its own explicit design choice — unlike every other `full-hooks` platform in this row, its setup does not register an MCP server. See the Pi section below for its `--local`-mode-only setup path.
+
+[^agy-event-arg]: Antigravity's hook payloads have no field whose _value_ names the event (unlike every other row in this table), and `PreToolUse` and `PostToolUse` share the same shape — the setup passes the event name as `preflight-collector`'s argument instead. See the Antigravity section below.
+
 Every `PlatformAdapter` (`src/platforms/types.ts`) declares a `visibilityLevel` field encoding this table in code, not just prose — `full-hooks` (automatic, deterministic capture), `self-reported` (built-in-tool-shaped events are observable, but only if an external party — a third-party extension, or the calling MCP client itself — actually reports them), or `mcp-tools-only` (structurally cannot see built-in tool calls at all). Consumers that blend metrics across platforms (`nr_observe_get_platform_comparison`, the weekly digest's per-platform breakdown) use `getPlatformVisibilityMap()` (`src/platforms/platform-registry.ts`) to tag results and caveat comparisons that span more than one level.
 
-Detection order matters: `createDefaultRegistry()` (`src/platforms/platform-registry.ts`) registers adapters in a fixed order — Claude Code, Cursor, Windsurf, Copilot, Zed, Continue, Amazon Q, Kiro, Droid, Gemini CLI, Cline, Codex, opencode, then the generic MCP fallback (always last, `isSupported()` always `true`). `PlatformRegistry.detect()` returns the **first** adapter whose `isSupported()` returns `true`; there is no `NEW_RELIC_AI_PLATFORM`-driven override for most platforms (see per-platform detection below).
+Detection order matters: `createDefaultRegistry()` (`src/platforms/platform-registry.ts`) registers adapters in a fixed order — Claude Code, Cursor, Windsurf, Copilot, Copilot App, Copilot SDK, Zed, Continue, Amazon Q, Kiro, Droid, Gemini CLI, Cline, Codex, opencode, Kilo Code, Pi, Antigravity, then the generic MCP fallback (always last, `isSupported()` always `true`). `PlatformRegistry.detect()` returns the **first** adapter whose `isSupported()` returns `true`; there is no `NEW_RELIC_AI_PLATFORM`-driven override for most platforms (see per-platform detection below).
 
 ---
 
 ## Claude Code (`claude-code`)
 
-**Mechanism:** Native `PreToolUse`/`PostToolUse`/`PostToolUseFailure` hooks, installed by Preflight itself.
+**Mechanism:** Native `PreToolUse`/`PostToolUse`/`PostToolUseFailure` hooks, installed by Preflight itself, plus six separate top-level settings.json hooks keys (not `PostToolUse` payload variants): `StopFailure`, which feeds `ApiFailureTracker` with model-API-call failures; `SessionStart`, which fires on every session but is only actionable when Claude Code reports resume-cost fields (`source: 'resume'`/`'fork'` with a prior response) — those feed `SessionResumeTracker`, surfaced in `nr_observe_get_cost_forecast`'s `resumeContext`; `InstructionsLoaded`, which feeds `InstructionDriftTracker` the exact moment a CLAUDE.md/`.claude/rules/*.md` file enters context — including session-start eager loads, which have no visible `Read` tool call at all; `PostModelSwitch`, which feeds `ModelUsageTracker` a discrete switch event (deliberate `/model` changes, and persistent automatic changes tagged `source: 'auto'`) — `PreModelSwitch` is intentionally not installed, since Preflight has no reason to block or confirm a switch; and `UserPromptSubmit`/`Stop`, which feed precise turn/task-boundary timestamps into `TurnTracker.finalizeTurnAt()`/`TaskDetector.startTaskIfNone()`/`TaskDetector.markBoundary()` — corroborating signals for the existing idle-gap heuristics, not replacements (`Stop` doesn't fire on a user interrupt, so the heuristics stay as the fallback). No prompt/response content is captured from either hook, only timestamp and session ID.
 
-**Detection (`isSupported()`):** `CLAUDE_CODE` env var set, or `CLAUDE_CODE_VERSION` set, or `MCP_CLIENT === 'claude-code'`.
+**Detection (`isSupported()`):** any of `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, or `CLAUDE_CODE_SESSION_ID` set (the vars current Claude Code actually sets in child process envs), or the legacy `CLAUDE_CODE`/`CLAUDE_CODE_VERSION`, or `MCP_CLIENT === 'claude-code'`. The list is the exported `CLAUDE_CODE_ENV_SIGNALS` const, shared with `collector-script.ts`'s hook-time platform stamping.
 
 **Setup:**
 
@@ -231,11 +241,27 @@ Detection order matters: `createDefaultRegistry()` (`src/platforms/platform-regi
 
 ## Amazon Kiro (`kiro`)
 
-**Mechanism:** MCP stdio protocol, plus real hook events — [kiro.dev/docs/cli/hooks](https://kiro.dev/docs/cli/hooks). Kiro sends the hook event name in lower-camelCase (`preToolUse`) rather than Claude Code's PascalCase (`PreToolUse`); `collector-script.ts` matches case-insensitively so both are handled by the same generic branches as Claude Code and Amazon Q.
+**Mechanism:** MCP stdio protocol, plus real hook events — [kiro.dev/docs/cli/hooks](https://kiro.dev/docs/cli/hooks). Kiro's docs describe the event name in lower-camelCase (`preToolUse`), but a live install (42.08, macOS) was observed sending **PascalCase** (`PreToolUse`/`PostToolUse`), same as Claude Code. `collector-script.ts` matches case-insensitively, so both spellings work and neither needs a dedicated branch — but don't rely on the camelCase form being what actually arrives.
+
+**Observed payload shape** (captured live, 42.08 macOS): top-level keys are `session_id`, `hook_event_name`, `cwd`, `tool_name`, `tool_input`, and `tool_response` on the post event. Note what's absent — there is no `tool_use_id`, so pre/post pairing relies on the collector's own ordering rather than an id echoed back by the platform.
 
 **Detection (`isSupported()`):** `KIRO_SESSION_ID` set, or `KIRO_IDE` set, or `MCP_CLIENT === 'kiro'`, or `NEW_RELIC_AI_PLATFORM === 'kiro'`.
 
-**Tool-map:** `tool_name` may arrive as either a tool's canonical name (`fs_read`) or a documented alias (`read`) — both forms are covered in `KIRO_TOOL_MAP`. Some entries (`fsRead`, `fsCreate`, etc.) have no confirmed source in Kiro's public docs and are kept as best-effort coverage for IDE-surface tool names — don't remove them without positive evidence they're wrong.
+**Known gap — detection needs an explicit opt-in in practice.** Verified against a live Kiro install (42.08, macOS): Kiro passes a Power's MCP server 16 environment variables and _none_ are Kiro-specific (`PWD`, `INIT_CWD`, `PLUGIN_ROOT`, `PLUGIN_DATA`, `NODE`, `PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME`, `EDITOR`, `COLOR`, `SHLVL`, `_`, `__CF_USER_TEXT_ENCODING`, plus whatever `mcp.json` declares). So the first three signals above never fire on their own and detection falls through to the generic MCP adapter, which records `platform: "generic-mcp"` and leaves tool names unmapped — quietly zeroing every metric keyed on a normalized name while the raw tool-call count still looks right. Set `NEW_RELIC_AI_PLATFORM: "kiro"` in the MCP server's `env` to force it; [`kiro-power/mcp.json`](../kiro-power/mcp.json) does this, and [KIRO_POWER.md](./KIRO_POWER.md) explains why.
+
+**Tool-map:** `tool_name` may arrive as either a tool's canonical name (`fs_read`) or a documented alias (`read`) — both forms are covered in `KIRO_TOOL_MAP`. Some entries (`fsRead`, `fsCreate`, etc.) have no confirmed source in Kiro's public docs and are kept as best-effort coverage for IDE-surface tool names — don't remove them without positive evidence they're wrong. Entries marked `// OBSERVED` are different: they were captured from that same live install's session records, and they are snake_case (`read_file`, `read_files`, `str_replace`, `list_directory`, `grep_search`, `web_fetch`) where the map had previously only guessed camelCase — treat those spellings as authoritative. Kiro's own meta tools (`kiro_powers`, `update_session_information`, `createHook`) are intentionally left unmapped, since mapping them to a file verb would inflate file metrics with activity that never touched a file.
+
+**`tool_input` field names differ from Claude Code's** — captured live, so these are facts rather than inferences:
+
+| Tool          | `tool_input`                                                                    | Note                                                                              |
+| ------------- | ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `read_file`   | `{path, offset, limit}`                                                         | file key is `path`, not `file_path`; `offset`/`limit` arrive as `null` when unset |
+| `str_replace` | `{path, oldStr, newStr, replace_all}`                                           | `oldStr`/`newStr`, not `old_string`/`new_string`                                  |
+| `kiro_powers` | `{action, powerName, serverName, toolName, arguments, steeringFile, skillName}` | meta tool, no file                                                                |
+
+`collector-script.ts` has explicit `read_file` and `str_replace` cases for this, which is what makes `unique_files_read` / `unique_files_modified` non-zero on Kiro. They are separate cases rather than a generic `path` → `file_path` promotion because Grep/Glob also send `path`, where it means a search root — promoting that would misreport searches as file access on every platform. Also note Kiro's `path` is **sometimes workspace-relative and sometimes absolute** — both forms were observed in the same session (`cloudformation/export-env.sh` from `str_replace`, a full `/Users/...` path from `read_file`). Don't assume either; anything comparing paths across calls has to normalize first, or the same file counts twice.
+
+**Remaining gap:** `bash_calls_by_category` is still empty on Kiro. It needs the command string, which lives in `execute_bash`'s `tool_input` — a shape not yet captured first-hand, so no case is guessed for it. `bash_commands_run` is unaffected (it keys on the mapped name alone). The same applies to `read_files`, `list_directory`, `grep_search` and any write/delete tool: they map correctly for counting, but contribute no structured metadata until their input shapes are observed.
 
 **Setup:**
 
@@ -247,12 +273,23 @@ Detection order matters: `createDefaultRegistry()` (`src/platforms/platform-regi
        "args": ["preflight", "--stdio"],
        "env": {
          "NEW_RELIC_LICENSE_KEY": "<your-key>",
-         "NEW_RELIC_ACCOUNT_ID": "<your-account-id>"
+         "NEW_RELIC_ACCOUNT_ID": "<your-account-id>",
+         "NEW_RELIC_AI_PLATFORM": "kiro"
        }
      }
    }
    ```
+   `NEW_RELIC_AI_PLATFORM: "kiro"` is required here, not optional — see the
+   "Known gap" note above: none of the 16 env vars Kiro passes this
+   subprocess are Kiro-specific, so without this forced stamp, detection
+   falls through to `generic-mcp` and every normalized-name metric reports
+   zero while the raw tool-call count still looks fine.
 2. Restart Kiro (or reconnect MCP servers from the Kiro MCP panel).
+
+Alternatively, install Preflight as a [Kiro Power](./KIRO_POWER.md) — it
+provisions the same MCP server without manually editing `mcp.json`, plus a
+documented step for wiring Kiro's native `.kiro/hooks/` system
+([kiro.dev/docs/hooks/](https://kiro.dev/docs/hooks/)) for automatic capture.
 
 ---
 
@@ -264,7 +301,7 @@ Detection order matters: `createDefaultRegistry()` (`src/platforms/platform-regi
 
 **Tool-map:** Droid's documented `PreToolUse`/`PostToolUse` matchers are `Task`, `Execute`, `Glob`, `Grep`, `Read`, `Edit`, `Create`, `FetchUrl`, `WebSearch`. `Read`, `Glob`, `Grep`, `Edit` already match Preflight's canonical vocabulary and are listed as explicit identity entries in `DROID_TOOL_MAP` (there is no pass-through fallback). `Task`→Agent, `Execute`→Bash, `Create`→Write, `FetchUrl`→WebFetch, `WebSearch`→WebSearch.
 
-**Known gap:** `collector-script.ts`'s per-tool metadata extractors (`extractInputMeta`/`extractOutputMeta`) switch on the raw, unmapped tool name written into the buffer — so Droid's `Create`/`Execute`/`Task` calls don't get the extra structured fields (content length, command classification, etc.) that `Write`/`Bash`/`Agent` get for Claude Code. This is the same situation Kiro's `fsWrite`/`fsCreate`/etc. are already in; `Read`/`Glob`/`Grep`/`Edit` (matching exactly) are unaffected.
+**Known gap:** `collector-script.ts`'s per-tool metadata extractors (`extractInputMeta`/`extractOutputMeta`) switch on the raw, unmapped tool name written into the buffer — so Droid's `Create`/`Execute`/`Task` calls don't get the extra structured fields (content length, command classification, etc.) that `Write`/`Bash`/`Agent` get for Claude Code. `Read`/`Glob`/`Grep`/`Edit` (matching exactly) are unaffected. Kiro shared this gap until explicit cases were added for its tool names — see the Kiro section.
 
 **Setup:**
 
@@ -415,23 +452,286 @@ Detection order matters: `createDefaultRegistry()` (`src/platforms/platform-regi
 
 ---
 
-## GitHub Copilot (`copilot`)
+## Kilo Code (`kilocode`)
 
-**Mechanism:** Copilot does not use MCP natively. Data arrives from a Copilot-compatible VS Code extension via HTTP push to a local Preflight endpoint (`http://localhost:9847`). This adapter only consumes events — it doesn't ship the extension itself.
+**Mechanism:** Kilo CLI (`@kilocode/cli`) is a confirmed literal fork of opencode — Kilo's own docs state directly: "The Kilo CLI is a fork of OpenCode." It shares opencode's exact interception mechanism: no external hooks.json, only an in-process JS/TS plugin loaded from `.kilo/plugin/` (project) or `~/.config/kilo/plugin/` (global) — **not** `.opencode/`, since Kilo CLI 1.0 no longer reads legacy `.opencode`/`.kilocode` directories ([kilocode.ai/docs/automate/extending/plugins](https://kilocode.ai/docs/automate/extending/plugins)). Preflight ships a documented plugin snippet (see Setup below) that translates Kilo's real `tool.execute.before`/`tool.execute.after` hook payloads — confirmed from `packages/plugin/src/index.ts` in [Kilo-Org/kilocode](https://github.com/Kilo-Org/kilocode), the actual source backing the published `@kilocode/plugin` npm package: `input: {tool, sessionID, callID}` / `output: {args}` for `before`, `input: {tool, sessionID, callID, args}` / `output: {title, output, metadata}` for `after` — byte-identical field names to opencode's confirmed shapes. `collector-script.ts`'s existing generic branches handle it as a result — **no changes to that file were needed.**
 
-**Detection (`isSupported()`):** `MCP_CLIENT === 'copilot'`, or `NEW_RELIC_AI_PLATFORM === 'copilot'` (the only adapter besides Kiro that actually reads `NEW_RELIC_AI_PLATFORM`).
+**Detection (`isSupported()`):** `MCP_CLIENT === 'kilocode'`, or `NEW_RELIC_AI_PLATFORM === 'kilocode'`. Checked Kilo's full documented "Environment Variable Overrides" set ([kilocode.ai/docs/code-with-ai/platforms/cli](https://kilocode.ai/docs/code-with-ai/platforms/cli)) — `KILO_PROVIDER`, `KILOCODE_<FIELD>`/`KILO_<FIELD_NAME>`, `KILO_ORG_ID`, `KILO_CONFIG`/`KILO_CONFIG_CONTENT`, `KILO_PURE` — every one is an optional user-set config override or a plugin-disable switch, none is an ambient "running under Kilo" marker a spawned MCP server process could rely on. Detection is explicit-opt-in only, same as opencode/Droid/Gemini CLI/Cline/Codex.
 
-**Event vocabulary:** `file_edit`→Edit, `file_open`→Read, `file_create`→Write, `file_delete`→Delete, `terminal_command`→Bash, `task`→Bash.
+**Tool coverage, confirmed via Kilo's own tools docs ([kilocode.ai/docs/automate/tools](https://kilocode.ai/docs/automate/tools), [/docs/automate/how-tools-work](https://kilocode.ai/docs/automate/how-tools-work)):** `read`, `glob`, `grep`, `edit`, `write`, `bash`, `webfetch`, `websearch` map directly. `apply_patch` collapses to `'Edit'` — same precedent as `CodexAdapter`/`OpencodeAdapter`. `skill` maps to `'Skill'`, `question` maps to `'AskUserQuestion'`, and `todowrite` maps to `'TaskCreate'` — all reusing `OpencodeAdapter`'s precedents directly. `task` (spawns a sub-agent/child session) maps to `'Agent'` — same precedent as Zed/Codex's `spawn_agent` and Cursor/Droid's `Task`. `todoread` maps to `'TaskList'` and `plan` maps to `'EnterPlanMode'` — both real, pre-existing entries in Preflight's canonical tool vocabulary with no adapter-map precedent before this one. `agent_manager` (a VS-Code-specific UI action starting Agent Manager local/worktree sessions) has no clean canonical equivalent and is left unmapped, same treatment as opencode's `lsp` and Codex's `update_plan`. Kilo's built-in Playwright MCP server tools (namespaced `kilo-playwright_*`) are not fixed map keys and fall through to `'Unknown'`, same as any other platform's MCP-server tool calls.
 
-**Known gap:** tool-call timing is approximate — inferred from VS Code event timestamps, not a precise pre/post pair.
+**Known gaps:**
+
+- **No success/error signal exists in Kilo's hook payload at all**, same gap as opencode — every Kilo tool call reports `success: true` unconditionally.
+- **Only `bash`/`read`/`edit`/`write` get structured input metadata.** The plugin snippet's `toClaudeShape()` function special-cases these four. `apply_patch`/`glob`/`grep`/`webfetch`/`websearch`/`todowrite`/`todoread`/`plan`/`task`/`skill`/`question`/`agent_manager`'s `args` are forwarded as-is — for `apply_patch` specifically, its (unconfirmed but presumed opencode-identical) `patchText` field never reaches `collector-script.ts`'s `Edit`-case extractors, so despite being mapped to the `Edit` tool name it gets no structured metadata.
+- **No output-side metadata at all** (`exitCode`, `editSuccess`, etc.) — `output.output`/`output.metadata` are opaque, so the `PostToolUse` payload intentionally omits `tool_response`.
+- **`kilo-playwright_*` tool calls report as `'Unknown'`** with the dynamic name preserved as `platformToolName` — they're observable through this same plugin mechanism but aren't translated by the snippet's static tool map.
+- **Requires a user-installed plugin file, not a JSON hooks config** — same setup burden as opencode.
 
 **Setup:**
 
-1. Set `NEW_RELIC_AI_PLATFORM=copilot` in your environment
-2. Set `NEW_RELIC_LICENSE_KEY` and `NEW_RELIC_ACCOUNT_ID`
-3. Configure your Copilot extension to forward events to `http://localhost:9847` (`"preflight.endpoint": "http://localhost:9847"` in VS Code settings)
+1. Register the Preflight MCP server in `kilo.json`:
+   ```json
+   {
+     "mcp": {
+       "preflight": {
+         "type": "local",
+         "command": ["npx", "preflight", "--stdio"],
+         "environment": {
+           "MCP_CLIENT": "kilocode",
+           "NEW_RELIC_LICENSE_KEY": "<your-key>",
+           "NEW_RELIC_ACCOUNT_ID": "<your-account-id>"
+         }
+       }
+     }
+   }
+   ```
+2. Ensure `preflight-collector` is on `PATH` (`npm link`, or `npm install -g @newrelic/preflight`)
+3. Create `.kilo/plugin/preflight.ts` (project) or `~/.config/kilo/plugin/preflight.ts` (global) with the snippet in `KiloCodeAdapter.getHookInstallInstructions()` (`src/platforms/kilo-code-adapter.ts`) — reproduced there in full, using Kilo's current plugin module descriptor shape (`export default { id, server }`).
+4. Restart Kilo Code.
 
-Unlike every other adapter in this document, Copilot has no first-party extension that forwards tool-call events — Preflight only receives what a third-party or user-authored extension chooses to send to the endpoint above. Treat this integration's fidelity as bounded by that extension, not by this adapter's own code.
+---
+
+## Pi (`pi`)
+
+**Mechanism:** [Pi](https://pi.dev) (`@earendil-works/pi-coding-agent`) ships a native Extension API — TypeScript modules in `~/.pi/agent/extensions/` (global) or `.pi/extensions/` (project-local), auto-discovered and hot-reloadable via `/reload`. Confirmed from `docs/extensions.md`'s "Tool Events" section (`github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md`): `pi.on("tool_call", (event, ctx) => {...})` fires before every built-in or custom tool executes, exposing `event.toolName`/`event.toolCallId`/mutable `event.input`, and can block via `return { block: true, reason? }`. `pi.on("tool_result", (event, ctx) => {...})` fires after, exposing `event.content`/`event.details`/**`event.isError`**/`event.usage`, and can modify the result. Preflight ships a documented extension snippet (see Setup below) that translates these into Claude Code's exact `PreToolUse`/`PostToolUse` hook JSON shape before piping to `preflight-collector` — `collector-script.ts`'s existing generic branches handle it as a result, **no changes to that file were needed.**
+
+Pi has **no MCP client support at all**, confirmed as deliberate, stated philosophy on `pi.dev` and in the README's "Philosophy" section: _"No MCP. Build CLI tools with READMEs (see Skills), or build an extension that adds MCP support."_ This makes Pi's setup path structurally different from every other `full-hooks` adapter: there is no MCP server registration step, and `--stdio` mode (the mode every other `full-hooks` adapter pairs with) is categorically unusable. Setup instead uses Preflight's `--local` mode (`ARCHITECTURE.md`: "Collection plane + Processing pipeline + Dashboard HTTP server. No MCP connection") plus the existing macOS dashboard daemon (`installDashboardDaemon()` in `src/install/schedule.ts`) to keep a `--local` process running persistently, since nothing else spawns or owns one for Pi sessions.
+
+**Detection (`isSupported()`):** `PI_CODING_AGENT === 'true'` — confirmed from the README's Environment Variables table: _"Set to `true` by the CLI and RPC entry points so child processes can detect that they run inside Pi."_ A real, documented, first-party ambient signal — not an invented one, and no explicit-opt-in fallback is needed.
+
+**Tool coverage, confirmed from the README's CLI Reference (`Available built-in tools: read, bash, edit, write, grep, find, ls`):** `bash`/`read`/`write`/`edit`/`grep` map directly. `find` maps to `'Glob'` — same precedent as Gemini CLI's `glob` → `'Glob'`. `ls` has no confirmed canonical Preflight tool-name equivalent and is left unmapped → falls through to `'Unknown'`, same treatment as `ZedAdapter`'s `create_directory`/`move_path`. Only `read`/`write`/`edit`/`bash` are enabled **by default** — `grep`/`find`/`ls` are real built-ins but require explicit `--tools` enabling to produce any events.
+
+**Known gaps:**
+
+- **No MCP client support exists in Pi at all**, by the platform's own explicit design choice — this adapter's setup path (`--local` mode + the macOS dashboard daemon) is structurally different from every other adapter's "register the MCP server + install a hook" two-step.
+- **The persistent-process daemon is macOS-only.** `installDashboardDaemon()` installs a `launchd` LaunchAgent; no systemd unit or Windows Task Scheduler equivalent exists in this codebase today. Linux/Windows users must keep `preflight --local` running manually.
+- **`ls` has no confirmed canonical Preflight tool-name equivalent** and reports as `'Unknown'`.
+- **`grep`/`find`/`ls` are disabled by default** — they only produce events in sessions that explicitly enable them via `--tools`.
+- **`event.input`'s exact per-tool field shapes are confirmed only for `bash` and `read`** in `docs/extensions.md`'s own example. The extension snippet forwards `event.input` as-is for every tool rather than remapping field names, so `collector-script.ts`'s tool-specific input extractors (which expect Claude Code's own field names, e.g. `file_path`) won't populate for Pi's calls — an honest gap, not a broken mapping.
+
+**Setup:**
+
+1. Run `preflight setup` once to configure `NEW_RELIC_LICENSE_KEY`/`NEW_RELIC_ACCOUNT_ID` and, on macOS, install the background dashboard daemon that keeps a `--local` process running persistently.
+2. On Linux/Windows (no daemon support yet): run `preflight --local &` yourself in a persistent terminal/tmux session and keep it running.
+3. Ensure `preflight-collector` is on `PATH` (`npm link`, or `npm install -g @newrelic/preflight`).
+4. Create `~/.pi/agent/extensions/preflight.ts` (global) or `.pi/extensions/preflight.ts` (project) with the snippet in `PiAdapter.getHookInstallInstructions()` (`src/platforms/pi-adapter.ts`) — reproduced there in full.
+5. Restart Pi (or run `/reload` in an active session).
+
+---
+
+## Google Antigravity (`antigravity`)
+
+**Mechanism:** Google Antigravity (2.0 / IDE / CLI — the Python SDK is out of scope, see Known gaps) ships a real, first-party, documented `hooks.json` mechanism: [antigravity.google/docs/hooks](https://antigravity.google/docs/hooks) (identical content on [/docs/ide/hooks](https://antigravity.google/docs/ide/hooks)). `PreToolUse`/`PostToolUse` fire around every built-in tool call, matched by regex against tool name; handlers receive JSON on stdin and must reply with JSON on stdout. This is a `full-hooks` mechanism, not the `mcp-tools-only` tier a platform lacking any hook mechanism would get — Antigravity's `hooks.json` is real, first-party, and documented, confirmed by fetching Google's own docs directly. Antigravity also supports MCP separately and natively — [/docs/mcp](https://antigravity.google/docs/mcp) — via `mcp_config.json`.
+
+Antigravity's hook payloads have **no field naming the event type at all**, and per the [Input/Output Contract](https://antigravity.google/docs/hooks#inputoutput-contract) both events carry the same keys: `PreToolUse` is `{ toolCall: { name, args }, stepIdx, conversationId, ... }` and `PostToolUse` is the same plus an optional `error` ("Empty if successful"). Payload shape therefore cannot tell them apart, so the setup below registers `preflight-collector PreToolUse` and `preflight-collector PostToolUse` as separate `hooks.json` commands and `collector-script.ts` reads the event from that argument. The replies differ too: `PreToolUse` must return a `decision` (Preflight always sends `{"decision":"allow"}`), while `PostToolUse` returns `{}` — its schema has no `decision` field, and sending one fails Antigravity's protojson unmarshaling and the tool call with it ([#793](https://github.com/newrelic-experimental/preflight/issues/793)). A `hooks.json` without the argument still works on a best-effort basis: a payload carrying an `error` key is read as `PostToolUse`, anything else with `toolCall` as `PreToolUse` — so a successful `PostToolUse` that omits `error` is misread and gets the `decision` reply. Both events set `toolUseId` from `stepIdx` when it is a number, so `HookEventProcessor` pairs them by ID; when it is not, neither event carries a `toolUseId` and pairing falls back to the tool-name FIFO. With an ID, a misread `PostToolUse` replaces its real `PreToolUse` in `HookEventProcessor`'s pending map, so the call is recorded as a timed-out failure.
+
+**Detection (`isSupported()`):** `MCP_CLIENT === 'antigravity'`. No ambient environment variable is confirmed to exist for Antigravity (checked `/docs/cli/reference`, `/docs/cli/settings`, `/docs/ide/settings`, `/docs/cli/sandbox`, `/docs/sidecars`) — explicit opt-in only, same as opencode/Kilo Code/Codex.
+
+**Tool coverage, confirmed from the Hooks page's "Supported Tools" section:** `view_file`→`Read`, `write_to_file`→`Write`, `replace_file_content`→`Edit`, `multi_replace_file_content`→`MultiEdit`, `list_dir`/`find_by_name`→`Glob`, `grep_search`→`Grep`, `search_web`→`WebSearch`, `read_url_content`→`WebFetch`, `run_command`→`Bash`, `invoke_subagent`→`Agent`. `manage_task`, `schedule`, `list_permissions`, `ask_permission`, `define_subagent`, `send_message`, `manage_subagents`, `ask_question`, and `generate_image` are real Antigravity built-ins with no canonical Preflight equivalent, deliberately left unmapped.
+
+**Known gaps:**
+
+- **`PreToolUse`'s `toolCall.args` field names** (`CommandLine`, `TargetFile`, `ReplacementChunks`, etc.) **are not remapped through `extractInputMeta()`'s tool-specific extractors** — `toolInput` metadata is absent for Antigravity calls until that mapping is added; an honest gap, not a guess.
+- **`PostToolUse` carries no output content/exit-code field at all** (only `toolCall`/`stepIdx`/`error`) — `toolOutput` metadata (e.g. Bash exit codes) can never be populated for Antigravity, a platform limitation, not an implementation gap.
+- **The Antigravity SDK (Python, for building custom agents on Antigravity's own runtime) is out of scope** — it documents MCP support but no interactive hooks surface of its own.
+- **No confirmed ambient env var** — detection is explicit-opt-in only (`MCP_CLIENT=antigravity`).
+
+**Setup:**
+
+1. Register Preflight as an MCP server for its own `nr_observe_*` tools — add to `mcp_config.json` (global `~/.gemini/config/mcp_config.json`, or per-workspace `.agents/mcp_config.json`):
+   ```json
+   {
+     "mcpServers": {
+       "preflight": {
+         "command": "npx",
+         "args": ["preflight", "--stdio"],
+         "env": {
+           "MCP_CLIENT": "antigravity",
+           "NEW_RELIC_LICENSE_KEY": "<your-key>",
+           "NEW_RELIC_ACCOUNT_ID": "<your-account-id>"
+         }
+       }
+     }
+   }
+   ```
+2. Capture built-in tool calls via `hooks.json` (same global/workspace locations):
+   ```json
+   {
+     "preflight": {
+       "PreToolUse": [
+         { "matcher": "*", "hooks": [{ "command": "preflight-collector PreToolUse" }] }
+       ],
+       "PostToolUse": [
+         { "matcher": "*", "hooks": [{ "command": "preflight-collector PostToolUse" }] }
+       ]
+     }
+   }
+   ```
+   Keep the event name after `preflight-collector` — it is how Preflight tells the two events apart (see above). If your `hooks.json` predates this, add it.
+3. Ensure `preflight-collector` is on `PATH` (`npm link`, or `npm install -g @newrelic/preflight`).
+4. Restart Antigravity (or reload the workspace).
+
+---
+
+## GitHub Copilot (`copilot`)
+
+**Mechanism:** VS Code agent hooks ([code.visualstudio.com/docs/copilot/customization/hooks](https://code.visualstudio.com/docs/copilot/customization/hooks), Preview) — `PreToolUse`/`PostToolUse` (plus 6 other lifecycle events) fire on every built-in tool call and pass JSON on stdin with the uniform `hook_event_name`/`tool_name`/`tool_input`/`tool_use_id`/`session_id` envelope, parsed by `collector-script.ts`'s uniform branch. This section covers **VS Code Copilot Chat only** — for the GitHub Copilot CLI/SDK runtime, see the "GitHub Copilot SDK" (`copilot-sdk`) section below, not this one: Copilot CLI's native lowerCamelCase hook config (`preToolUse`) emits a different, incompatible payload shape with no `hook_event_name` field at all (confirmed against GitHub's own hooks reference), so it does **not** "just work" against this adapter's PascalCase-only setup — only the PascalCase `PreToolUse`/`PostToolUse` config the `copilot-sdk` section documents is supported for that host. VS Code also reads Claude-format hook files (`~/.claude/settings.json`) by default via `chat.hookFilesLocations`, so a `preflight install` done for Claude Code is picked up by VS Code Copilot automatically (matchers are parsed but ignored; Preflight's matcher is empty anyway).
+
+**Documented deltas from Claude Code (hooks FAQ, same page):**
+
+- `tool_input` keys are **camelCase** (`filePath`, `oldString`), not snake_case — handled in `extractInputMeta`.
+- Tool names are **VS Code's own** (`create_file`, `replace_string_in_file`, `run_in_terminal`), not Claude's (`Write`, `Edit`, `Bash`). `COPILOT_TOOL_MAP` sources its inventory from the `ToolName` enum in microsoft/vscode `extensions/copilot/src/extension/tools/common/toolNames.ts`; `editFiles` appears in the [hooks reference](https://code.visualstudio.com/docs/agents/reference/hooks-reference) example payloads. Names with no clear canonical correspondence (`semantic_search`, `get_errors`, …) are deliberately unmapped so the original name is preserved.
+- `tool_response` can be a plain string (`"File edited successfully"` per the hooks reference); success then defaults to `true`.
+
+**Detection (`isSupported()`):** `MCP_CLIENT === 'copilot'`, or `NEW_RELIC_AI_PLATFORM === 'copilot'` (the only adapter besides Kiro that actually reads `NEW_RELIC_AI_PLATFORM`).
+
+**Token-exact cost:** `CopilotUsageWatcher` (`src/hooks/copilot-usage-watcher.ts`) tails VS Code's per-session Copilot debug log (`<userDataDir>/workspaceStorage/<hash>/GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`), whose `llm_request` records carry exact `inputTokens`/`outputTokens`/`cachedTokens` per model request, and emits `mode: 'token'` events into the same session buffer the hooks write to — the Copilot analog of the Claude Code parent-transcript watcher. The path + record schema come from VS Code's `chatDebugFileLoggerService.ts` (formerly `microsoft/vscode-copilot-chat`, now merged into `microsoft/vscode` under `extensions/copilot/` and archived) and its `otel-data-flow.html`. Both desktop user-data dirs and the VS Code Remote server dirs (`~/.vscode-server`, `~/.vscode-server-insiders`, `~/.vscode-remote`) are searched, so WSL/SSH/dev-container sessions are covered. The log format is not a stable API (same stability tier as the Claude Code transcript format the other watchers depend on); schema drift degrades to estimation-based cost, never a crash. Opt out with `NR_AI_ENABLE_COPILOT_USAGE_WATCHER=0`.
+
+**Required setting (prerequisite for token-exact cost):** this debug log is **off by default**, gated behind `github.copilot.chat.agentDebugLog.fileLogging.enabled` — an `advanced`/`experimental` setting hidden from the normal Settings UI and still labelled "(Preview)". Users must add it to their VS Code **User `settings.json`**:
+
+```jsonc
+"github.copilot.chat.agentDebugLog.fileLogging.enabled": true
+```
+
+then **reload the window** (`Developer: Reload Window`). Until then the debug-logs directory never exists and cost falls back to content-size estimation. `CopilotUsageWatcher` detects this case (a VS Code workspaceStorage root present but no `debug-logs` directory anywhere), logs a one-time warning naming the setting, and surfaces it as `copilotDebugLoggingDisabled` in the dashboard observability-health snapshot — so a zero-cost session reads as a missing prerequisite rather than a broken integration.
+
+**Known gaps:** agent hooks are a Preview feature and may change; organizations can disable hooks via enterprise policy. Hook matchers are ignored by VS Code, so per-tool matcher filtering is unavailable (irrelevant to Preflight's empty matcher). Token-exact cost additionally requires the off-by-default `github.copilot.chat.agentDebugLog.fileLogging.enabled` setting (see above); without it, cost is estimation-based. Cache-**creation** (cache-write) tokens are a known estimation gap: VS Code's debug-log schema exposes only a single cache-read `cachedTokens` figure, so cache-write tokens are folded into base-rate input and slightly under-billed on cache-write turns.
+
+**Setup:**
+
+0. Or just run `preflight setup` (or `preflight install --copilot` directly) — it automates every step below for both VS Code Copilot Chat and the Copilot CLI, including the double-capture fix in step 1b.
+1. Create a hooks file — user-level `~/.copilot/hooks/preflight.json` (applies to all workspaces) or workspace-level `.github/hooks/preflight.json` (both are documented hook locations in VS Code's location table):
+   ```json
+   {
+     "version": 1,
+     "hooks": {
+       "PreToolUse": [
+         {
+           "type": "command",
+           "command": "NEW_RELIC_AI_PLATFORM=copilot preflight-collector pre-tool"
+         }
+       ],
+       "PostToolUse": [
+         {
+           "type": "command",
+           "command": "NEW_RELIC_AI_PLATFORM=copilot preflight-collector post-tool"
+         }
+       ]
+     }
+   }
+   ```
+   The `NEW_RELIC_AI_PLATFORM=copilot` prefix is required: Copilot's hooks-runner process is spawned separately from the MCP server process and does not inherit env vars set on an MCP registration (e.g. `copilot mcp add --env MCP_CLIENT=...`), so without embedding the tag directly in the command string, every event silently falls through to the `claude-code` platform default.
+   1b. VS Code also reads Claude-format hooks from `~/.claude/settings.json` by default, so a `preflight install` done for Claude Code is picked up automatically — but hooks from all locations are _collected_, so same-event hooks in both files double-capture every tool call. The installer (step 0) fixes this automatically by writing `"chat.hookFilesLocations": { "<claude-settings-path>": false }` into VS Code's `settings.json`; doing it by hand means disabling the Claude location for Copilot the same way.
+2. Ensure `preflight-collector` is on `PATH` (`npm link`, or `npm install -g @newrelic/preflight`).
+3. Register the Preflight MCP server for `nr_observe_*` tools with env `MCP_CLIENT=copilot`, `NEW_RELIC_LICENSE_KEY`, `NEW_RELIC_ACCOUNT_ID`.
+4. For token-exact cost, add `"github.copilot.chat.agentDebugLog.fileLogging.enabled": true` to VS Code User `settings.json` and reload the window (see **Required setting** above). Not needed for tool-call/session telemetry, only for exact cost.
+5. For the GitHub Copilot CLI/SDK runtime instead of VS Code, use the `copilot-sdk` adapter's own setup (see the "GitHub Copilot SDK" section below) — Copilot CLI's native lowerCamelCase hooks are not compatible with this adapter.
+
+**Legacy fallback (HTTP push):** the previous integration path remains — a Copilot-compatible VS Code extension pushing events to `http://localhost:9847` (`"preflight.endpoint"` in VS Code settings), with the `file_edit`/`file_open`/`file_create`/`file_delete`/`terminal_command`/`task` event vocabulary. Preflight only receives what such an extension chooses to send; treat that path's fidelity as bounded by the extension.
+
+---
+
+## GitHub Copilot SDK (`copilot-sdk`)
+
+**Mechanism:** The Copilot SDK / agent-host runtime — distinct from the VS Code Copilot Chat adapter above (`copilot`): different session-id space (`~/.copilot/session-state/<id>/`, no `workspaceStorage`) and a different tool-name vocabulary. The GitHub Copilot CLI is the confirmed host of this runtime. The GitHub Copilot desktop app is a confirmed second host — it runs a warm pool of Copilot CLI processes — but it gets its own adapter (`copilot-app`, see its section below) because two assumptions this section makes for the CLI do not hold there: the app cannot load the `.mjs` extension mechanism documented under "Token-exact cost" (it is a Rust binary with no `extensions/` loading), and `~/.copilot/session-state/<id>/` is not unique to the standalone CLI (the app's pooled CLI processes create it too). Tool calls arrive via the host's own `PreToolUse`/`PostToolUse` hooks, parsed by `preflight-collector` (the same uniform hook envelope `collector-script.ts` already handles for other hook-based platforms).
+
+**Detection (`isSupported()`):** `MCP_CLIENT === 'copilot-sdk'`, or `NEW_RELIC_AI_PLATFORM === 'copilot-sdk'`.
+
+**Event vocabulary:** the adapter's setup requires the PascalCase `PreToolUse`/`PostToolUse` hook config, under which GitHub's CLI already canonicalizes `tool_name` to Claude-shaped names before Preflight ever sees them: `bash`/`powershell`→Bash, `view`→Read, `create`→Write, `edit`/`str_replace_editor`/`apply_patch`→Edit, `grep`/`rg`→Grep, `glob`→Glob, `web_fetch`→WebFetch, `web_search`→WebSearch, `ask_user`→AskUserQuestion, `update_todo`→TodoWrite, `task`→Agent. Source: GitHub's Copilot hooks reference, "Claude-format matchers (PascalCase PreToolUse)" section. The adapter's own tool map keeps these canonical names as the primary (identity) lookup and the raw runtime names as a defensive fallback only. Deliberately left unmapped (no Claude equivalent, preserved as-is): the background shell session-management tools (`list_bash`/`read_bash`/`stop_bash`/`write_bash` and their PowerShell equivalents), `list_agents`/`read_agent`/`write_agent`, `skill`.
+
+**Instruction files:** `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.github/copilot-instructions.md` (repo-relative, matched against a tool call's file path). The host also reads a user-level `$HOME/.copilot/copilot-instructions.md` and glob-based `.github/instructions/**/*.instructions.md`, neither of which is modeled here — every other adapter's `instructionFilePaths` entry is a repo-relative exact filename, which supports neither a global per-user path nor a glob pattern.
+
+**Token-exact cost (optional):** tool-call hooks alone don't carry per-call token counts. A small, hand-written plain-JavaScript Copilot SDK extension (`copilot-sdk-extension/extension.mjs`, shipped alongside Preflight and installable into `~/.copilot/extensions/preflight/`) subscribes to the SDK's `assistant.usage` event and appends a `mode: 'token'` buffer line per API call — the same buffer-line contract `CopilotUsageWatcher` uses for VS Code. It captures usage only (no tool calls, to avoid double-counting against the hooks above). Copilot SDK extensions must be plain JavaScript — TypeScript isn't supported — so this file hand-mirrors the tested logic in `src/hooks/copilot-sdk-usage-mapper.ts`; keep the two in sync when changing either. Extensions are an experimental feature, requiring `--experimental` or `/experimental on`.
+
+**Known gap:** without the extension above, cost is estimated from tool-call counts rather than exact tokens (same limitation as most other hook-based adapters).
+
+**Setup:**
+
+0. Or just run `preflight setup` (or `preflight install --copilot` directly) — it automates every step below, including the hooks file, MCP registration, and (optionally) the SDK usage extension in step 4.
+1. Create a hooks file for tool-call capture — user-level `~/.copilot/hooks/preflight.json` or workspace-level `.github/hooks/preflight.json`:
+   ```json
+   {
+     "version": 1,
+     "hooks": {
+       "PreToolUse": [
+         {
+           "type": "command",
+           "command": "NEW_RELIC_AI_PLATFORM=copilot preflight-collector pre-tool"
+         }
+       ],
+       "PostToolUse": [
+         {
+           "type": "command",
+           "command": "NEW_RELIC_AI_PLATFORM=copilot preflight-collector post-tool"
+         }
+       ]
+     }
+   }
+   ```
+   The `NEW_RELIC_AI_PLATFORM=copilot` prefix is required — the hooks-runner does not inherit env vars set on the MCP server registration in step 3 below, so without it every event falls through to the `claude-code` platform default.
+2. Ensure `preflight-collector` is on `PATH` (`npm link`, or `npm install -g @newrelic/preflight`)
+3. Register the Preflight MCP server:
+   ```bash
+   copilot mcp add preflight \
+     --env MCP_CLIENT=copilot-sdk \
+     --env NEW_RELIC_LICENSE_KEY=<your-key> \
+     --env NEW_RELIC_ACCOUNT_ID=<your-account-id> \
+     -- npx preflight --stdio
+   ```
+4. (Optional, for token-exact cost) Copy the bundled extension to `~/.copilot/extensions/preflight/extension.mjs`
+5. Restart the host with `--experimental` (or run `/experimental on` in an already-open session) — extensions load at startup; asking Copilot to reload extensions or running `/clear` may also pick up a newly-copied extension
+
+---
+
+## GitHub Copilot app (`copilot-app`)
+
+**Mechanism:** The GitHub Copilot desktop app is a Rust GUI over a warm pool of Copilot CLI processes running in server/stdio mode — the app's own lifecycle logs name the component (`github_app::session::manager::cli_pool`) and show it spawning CLI processes with `enable_config_discovery=true`. Every empirical claim in this section was verified live on macOS against Copilot app v1.1.14 (commit `0d498e8`, `data.db` schema v100) on 2026-09-01, except the `session-state/` observation dated below. Because the pooled processes are the same Copilot CLI runtime the `copilot-sdk` adapter targets, a `~/.copilot/hooks/preflight.json` with PascalCase `PreToolUse`/`PostToolUse` fires on every tool call, with `tool_name` already canonicalized to Claude-shaped names (`Grep`, `Read`, `Edit`, `Bash`, `Glob` all observed live) and full Bash command text included — full-hooks-grade capture, handled by `collector-script.ts`'s existing uniform branch with **no changes to that file needed.**
+
+**Detection (`isSupported()`):** `MCP_CLIENT === 'copilot-app'`, or `NEW_RELIC_AI_PLATFORM === 'copilot-app'`, or ambient: `~/.copilot/data.db` exists **and was modified within the last 7 days** (directory overridable via `NEW_RELIC_AI_COPILOT_DIR`, for tests and non-default installs). The recency requirement exists because bare existence is sticky — uninstalling the app leaves `data.db` behind, and the app writes the file continuously while running, so mtime tracks actual app activity. `data.db` is created only by the desktop app — the standalone CLI's documented config dir has no such file, and the app's `~/.copilot` on this host also lacked the CLI's documented `extensions/` and `mcp-config.json`. One nuance the adapter's comments spell out: `session-state/` is **not** a usable discriminator despite being in the CLI's docs — the app's own pooled CLI processes create it too after the first app session (verified live 2026-08-31; the directory held exactly the app's own session ids), so `data.db` alone discriminates.
+
+**Event vocabulary:** reuses `COPILOT_SDK_TOOL_MAP` directly (`src/platforms/copilot-app-adapter.ts` imports it) — the pooled CLI is the same runtime, so the canonicalized names documented in the `copilot-sdk` section apply unchanged. Two app-level tool names with no Claude equivalent came through live: `rename_session` and `rename_branch` — deliberately left unmapped, falling through to `'Unknown'` with the original name preserved.
+
+**Session correlation:** the `session_id` in the hook events is byte-identical to `sessions.id` in the app's `~/.copilot/data.db` — hook-side actions and DB-side economics join on session id directly, with no correlation key or mapping table needed.
+
+**Token-exact cost:** the `.mjs` SDK-extension path the `copilot-sdk` section documents is unavailable on this host — the Rust app has no `extensions/` loading. Instead, `data.db` (SQLite, WAL mode, schema v100, held open by the app) carries the economics: its `sessions` table has cumulative per-session `total_input_tokens`/`total_output_tokens`/`total_cached_tokens`/`total_reasoning_tokens`, plus `total_nano_aiu` (GitHub's billing meter, AIU × 1e9 — its exact semantics are not yet established, so Preflight does not read it yet), `model` (which can be the literal string `auto`), `execution_location` (local vs cloud sandbox), and ISO-8601 `created_at`/`updated_at`. There is no tool-call/event table — the hooks give actions with zero economics, the DB gives economics with zero actions; the shared session id joins them. `CopilotAppUsageWatcher` (`src/hooks/copilot-app-usage-watcher.ts`) polls `data.db` read-only and emits the same `mode: 'token'` buffer lines `CopilotUsageWatcher` emits for VS Code, inheriting that pipeline's cache-inclusive-input assumption: `total_input_tokens` is presumed to include `total_cached_tokens` (as VS Code's `inputTokens` verifiably does — see the comment above `inputTokens` in `src/hooks/copilot-usage-watcher.ts`), so cached tokens are billed once at the cache-read rate and only the remainder at the base input rate. That assumption is inherited, not independently verified against the app's DB. Opt out with `NR_AI_ENABLE_COPILOT_APP_USAGE_WATCHER=0`.
+
+**Known gaps:**
+
+- **All empirical claims are macOS-only.** Windows/Linux install paths and directory layout are unverified.
+- **Cloud-sandbox sessions are unconfirmed.** A session with `execution_location != 'local'` runs where local hooks cannot fire; whether its economics still appear in the local `data.db` is unconfirmed.
+- **Session end is never observed.** The collector has no `Stop`/`SessionEnd` branch for this platform, so a session's outcome stays "in progress".
+- **MCP-server propagation to the pooled CLI processes is unconfirmed.** The app spawned its CLI pool with `observed_process_mcp_config=0`, so whether servers registered via `copilot mcp add` reach those processes — and therefore whether the `nr_observe_*` tools are callable inside app sessions — is unconfirmed.
+- **Concurrent multi-session capture is untested.** Multiple simultaneous app sessions on one machine have not been exercised.
+
+**Setup** (mirroring `CopilotAppAdapter.getHookInstallInstructions()`):
+
+1. Create `~/.copilot/hooks/preflight.json`:
+   ```json
+   {
+     "version": 1,
+     "hooks": {
+       "PreToolUse": [
+         { "type": "command", "command": "MCP_CLIENT=copilot-app preflight-collector pre-tool" }
+       ],
+       "PostToolUse": [
+         { "type": "command", "command": "MCP_CLIENT=copilot-app preflight-collector post-tool" }
+       ]
+     }
+   }
+   ```
+   The `MCP_CLIENT=copilot-app` stamp on each command is what routes the events to this adapter rather than `copilot-sdk`.
+2. Ensure `preflight-collector` is on `PATH` (`npm link`, or `npm install -g @newrelic/preflight`) — the app resolves hook commands through your login shell, so `PATH` entries only visible in interactive shell startup files may not apply.
+3. Register the Preflight MCP server:
+   ```bash
+   copilot mcp add preflight \
+     --env MCP_CLIENT=copilot-app \
+     --env NEW_RELIC_LICENSE_KEY=<your-key> \
+     --env NEW_RELIC_ACCOUNT_ID=<your-account-id> \
+     -- npx preflight --stdio
+   ```
+   Whether this registration reaches the app's pooled CLI processes is unconfirmed (see Known gaps).
+4. There is no extension step — the Rust app cannot load the `copilot-sdk` `.mjs` extension. Token-exact cost comes from the app's own `~/.copilot/data.db`, read automatically by `CopilotAppUsageWatcher` inside the Preflight MCP/dashboard process.
 
 ---
 

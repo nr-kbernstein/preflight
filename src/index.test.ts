@@ -1,7 +1,19 @@
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, existsSync, utimesSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  existsSync,
+  readdirSync,
+  utimesSync,
+  realpathSync,
+  readFileSync,
+  appendFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   parseArgs,
   maskCredential,
@@ -11,13 +23,19 @@ import {
   setupDashboardPostBind,
   getDashboardRepollIntervalMs,
   DEFAULT_DASHBOARD_REPOLL_MS,
+  getSessionPersistIntervalMs,
+  DEFAULT_SESSION_PERSIST_INTERVAL_MS,
+  getPendingConfirmationCapMs,
+  DEFAULT_PENDING_CONFIRMATION_CAP_MS,
   startRetentionSweep,
   startMaintenanceGc,
+  dispatchSubcommand,
 } from './index.js';
 import type { DashboardServer } from './dashboard/dashboard-server.js';
 import type { LocalStore } from './storage/index.js';
 import type { ProxyToolCallRecord, ProxyRequestRecord } from './proxy/index.js';
 import type { NrIngestManager } from './transport/nr-ingest.js';
+import { UNFORWARDED_SESSIONS_HINT } from './transport/unforwarded-session-monitor.js';
 
 let stderrSpy: ReturnType<typeof jest.spyOn>;
 
@@ -393,6 +411,70 @@ describe('getDashboardRepollIntervalMs()', () => {
   });
 });
 
+describe('getSessionPersistIntervalMs()', () => {
+  const ORIGINAL = process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS;
+
+  afterEach(() => {
+    if (ORIGINAL === undefined) {
+      delete process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS;
+    } else {
+      process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS = ORIGINAL;
+    }
+  });
+
+  it('returns DEFAULT_SESSION_PERSIST_INTERVAL_MS (30s) when env is unset', () => {
+    delete process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS;
+    expect(getSessionPersistIntervalMs()).toBe(DEFAULT_SESSION_PERSIST_INTERVAL_MS);
+    expect(DEFAULT_SESSION_PERSIST_INTERVAL_MS).toBe(30_000);
+  });
+
+  it('parses a numeric override from NR_AI_SESSION_PERSIST_INTERVAL_MS', () => {
+    process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS = '50';
+    expect(getSessionPersistIntervalMs()).toBe(50);
+  });
+
+  it('falls back to default for non-numeric / non-positive overrides', () => {
+    process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS = 'abc';
+    expect(getSessionPersistIntervalMs()).toBe(DEFAULT_SESSION_PERSIST_INTERVAL_MS);
+    process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS = '0';
+    expect(getSessionPersistIntervalMs()).toBe(DEFAULT_SESSION_PERSIST_INTERVAL_MS);
+    process.env.NR_AI_SESSION_PERSIST_INTERVAL_MS = '-100';
+    expect(getSessionPersistIntervalMs()).toBe(DEFAULT_SESSION_PERSIST_INTERVAL_MS);
+  });
+});
+
+describe('getPendingConfirmationCapMs()', () => {
+  const ORIGINAL = process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS;
+
+  afterEach(() => {
+    if (ORIGINAL === undefined) {
+      delete process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS;
+    } else {
+      process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS = ORIGINAL;
+    }
+  });
+
+  it('returns DEFAULT_PENDING_CONFIRMATION_CAP_MS (2 minutes) when env is unset', () => {
+    delete process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS;
+    expect(getPendingConfirmationCapMs()).toBe(DEFAULT_PENDING_CONFIRMATION_CAP_MS);
+    expect(DEFAULT_PENDING_CONFIRMATION_CAP_MS).toBe(120_000);
+  });
+
+  it('parses a numeric override from NR_AI_PENDING_CONFIRMATION_CAP_MS', () => {
+    process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS = '50';
+    expect(getPendingConfirmationCapMs()).toBe(50);
+  });
+
+  it('falls back to default for non-numeric / non-positive overrides', () => {
+    process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS = 'abc';
+    expect(getPendingConfirmationCapMs()).toBe(DEFAULT_PENDING_CONFIRMATION_CAP_MS);
+    process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS = '0';
+    expect(getPendingConfirmationCapMs()).toBe(DEFAULT_PENDING_CONFIRMATION_CAP_MS);
+    process.env.NR_AI_PENDING_CONFIRMATION_CAP_MS = '-100';
+    expect(getPendingConfirmationCapMs()).toBe(DEFAULT_PENDING_CONFIRMATION_CAP_MS);
+  });
+});
+
 describe('setupDashboardPostBind()', () => {
   function makeLocalStore(): {
     store: LocalStore;
@@ -491,6 +573,7 @@ describe('startMaintenanceGc()', () => {
     getActiveSessionIdsFromHeartbeats.mockReturnValue(new Set(['heartbeat-only']));
     const liveSessionRegistry = {
       getLiveSessions: jest.fn(() => new Set(['registry-only'])),
+      getTodaySessionIds: jest.fn(() => []),
     } as unknown as Parameters<typeof startMaintenanceGc>[0]['liveSessionRegistry'];
     const handle = startMaintenanceGc({ localStore: store, liveSessionRegistry });
     const liveArg = gcOrphanBuffers.mock.calls[0]?.[0] as Set<string>;
@@ -510,11 +593,29 @@ describe('startMaintenanceGc()', () => {
     );
     const liveSessionRegistry = {
       getLiveSessions,
+      getTodaySessionIds: jest.fn(() => []),
     } as unknown as Parameters<typeof startMaintenanceGc>[0]['liveSessionRegistry'];
     const handle = startMaintenanceGc({ localStore: store, liveSessionRegistry });
     expect(getLiveSessions).toHaveBeenCalledWith({ includeSynthetic: true });
     const liveArg = gcOrphanBuffers.mock.calls[0]?.[0] as Set<string>;
     expect(liveArg.has('proxy-1234567890')).toBe(true);
+    clearInterval(handle);
+  });
+
+  it("merges today-seen session ids from the registry into the GC live-set, so an idle-but-open window is not GC'd as orphaned", () => {
+    const { store, gcOrphanBuffers } = makeLocalStore();
+    const liveSessionRegistry = {
+      getLiveSessions: jest.fn(() => []),
+      getTodaySessionIds: jest.fn((_options?: { includeSynthetic?: boolean }) => [
+        'idle-but-open-today',
+      ]),
+    } as unknown as Parameters<typeof startMaintenanceGc>[0]['liveSessionRegistry'];
+    const handle = startMaintenanceGc({ localStore: store, liveSessionRegistry });
+    expect(liveSessionRegistry?.getTodaySessionIds).toHaveBeenCalledWith({
+      includeSynthetic: true,
+    });
+    const liveArg = gcOrphanBuffers.mock.calls[0]?.[0] as Set<string>;
+    expect(liveArg.has('idle-but-open-today')).toBe(true);
     clearInterval(handle);
   });
 
@@ -758,6 +859,10 @@ describe('stdio integration', () => {
       JSON.stringify({ linkScanPath: '/tmp/stdio-test-session.jsonl' }),
     );
 
+    // Isolate storage to a temp directory to prevent GC operations from
+    // affecting the real ~/.newrelic-preflight storage.
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-stdio-storage-'));
+
     const transport = new StdioClientTransport({
       command: 'node',
       args: [binPath, '--stdio'],
@@ -771,6 +876,7 @@ describe('stdio integration', () => {
         NR_AI_DASHBOARD_PORT: '0',
         CLAUDE_JOB_DIR: tmpJobDir,
         NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
       },
     });
 
@@ -792,6 +898,152 @@ describe('stdio integration', () => {
       await client.close();
     } finally {
       rmSync(tmpJobDir, { recursive: true, force: true });
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('resolves session_id synchronously from the cwd breadcrumb when no CLAUDE_JOB_DIR or PPID breadcrumb is available', async () => {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+    const { resolveFromCwd } = await import('./hooks/session-resolver.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-cwd-sync-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-cwd-sync-project-'));
+    // The spawned child's process.cwd() returns the *canonicalized* path
+    // (e.g. macOS resolves /var/folders/... to /private/var/folders/...) —
+    // resolve that here too so the breadcrumb filename matches what the
+    // child's own resolveFromCwd() call derives, not the raw temp path.
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    // Pre-write a cwd breadcrumb (as the hook collector would, via
+    // writeCwdBreadcrumb()) for the spawned MCP's own working directory —
+    // this is the platform-independent equivalent of "native Windows, where
+    // the PPID breadcrumb never matches, but the cwd one does". Deliberately
+    // omit CLAUDE_JOB_DIR and any PPID breadcrumb so only the cwd fallback in
+    // the *synchronous* resolution chain can succeed.
+    const breadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(breadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(breadcrumbDir, `${sanitizedCwd}.txt`), 'resolved-via-cwd-session-id');
+
+    // Sanity check against the real resolver so this test fails loudly (not
+    // mysteriously) if the sanitization scheme ever drifts between the
+    // collector's write side and resolveFromCwd()'s read side.
+    expect(resolveFromCwd(tmpStoragePath, realProjectCwd)).toBe('resolved-via-cwd-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+
+      // If the cwd fallback resolved synchronously, the full tool set is
+      // registered immediately — no pending-tools window to poll through.
+      const tools = await client.listTools();
+      const toolNames = tools.tools.map((t) => t.name);
+      expect(toolNames).toContain('nr_observe_get_session_stats');
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('self-corrects a synchronously-resolved cwd session id once the real PPID breadcrumb appears', async () => {
+    // A stale cwd breadcrumb (leftover from an unrelated prior session in
+    // the same directory) can win the synchronous resolution race at
+    // startup; it must self-correct once the real, precise ppid breadcrumb
+    // shows up moments later.
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-cwd-correction-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-cwd-correction-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    // Pre-write only a cwd breadcrumb — deliberately a value that looks
+    // like it belongs to a different, unrelated session — and no
+    // CLAUDE_JOB_DIR or ppid breadcrumb, so only the synchronous cwd
+    // fallback can resolve at startup.
+    const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'stale-cwd-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+
+      // Full tool set immediately — confirms this is the synchronous cwd
+      // entry point (isProvisional === false), not the pending/async one.
+      const tools = await client.listTools();
+      expect(tools.tools.map((t) => t.name)).toContain('nr_observe_get_session_stats');
+
+      const readSessionId = async (): Promise<string> => {
+        const result = await client.callTool({
+          name: 'nr_observe_get_session_stats',
+          arguments: {},
+        });
+        const content = result.content as Array<{ type: string; text: string }>;
+        const text = content[0]?.text ?? '{}';
+        return (JSON.parse(text) as { session_id: string }).session_id;
+      };
+
+      // Confirms the stale cwd value really was adopted before correction.
+      expect(await readSessionId()).toBe('stale-cwd-session-id');
+
+      // The spawned child sees this test process as its ppid, matching
+      // resolveSessionId()'s default `options.ppid ?? process.ppid` inside
+      // the child — same convention as the existing pending-tools test.
+      const ppidBreadcrumbDir = resolve(tmpStoragePath, 'session-by-ppid');
+      mkdirSync(ppidBreadcrumbDir, { recursive: true });
+      writeFileSync(resolve(ppidBreadcrumbDir, `${process.pid}.txt`), 'corrected-ppid-session-id');
+
+      let corrected = false;
+      for (let i = 0; i < 20; i++) {
+        if ((await readSessionId()) === 'corrected-ppid-session-id') {
+          corrected = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      expect(corrected).toBe(true);
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
     }
   }, 30000);
 
@@ -858,4 +1110,1047 @@ describe('stdio integration', () => {
       rmSync(tmpStoragePath, { recursive: true, force: true });
     }
   }, 30000);
+
+  it('self-corrects when the pending path resolves via the cwd fallback and a differing PPID breadcrumb appears later', async () => {
+    // The pending -> async poller flow (not the eager synchronous one) can
+    // also resolve via cwd instead of ppid. Mirrors the provisional-path
+    // test above, but supplies only a cwd breadcrumb first — the poller can
+    // only resolve via the fallback — then a *different* ppid breadcrumb
+    // later, and expects a correction.
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-pending-cwd-correction-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-pending-cwd-correction-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+
+      // Neither CLAUDE_JOB_DIR nor any breadcrumb exists yet — the pending
+      // tool set is served immediately (isProvisional === true).
+      const pendingTools = await client.listTools();
+      expect(pendingTools.tools.map((t) => t.name)).not.toContain('nr_observe_get_session_stats');
+
+      const readSessionId = async (): Promise<string | null> => {
+        const tools = await client.listTools();
+        if (!tools.tools.map((t) => t.name).includes('nr_observe_get_session_stats')) return null;
+        const result = await client.callTool({
+          name: 'nr_observe_get_session_stats',
+          arguments: {},
+        });
+        const content = result.content as Array<{ type: string; text: string }>;
+        const text = content[0]?.text ?? '{}';
+        return (JSON.parse(text) as { session_id: string }).session_id;
+      };
+
+      // Supply only the cwd breadcrumb — the poller's ppid check keeps
+      // missing, so it must fall back to this.
+      const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+      mkdirSync(cwdBreadcrumbDir, { recursive: true });
+      const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+      writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'stale-cwd-via-pending');
+
+      let sawStale = false;
+      for (let i = 0; i < 20; i++) {
+        if ((await readSessionId()) === 'stale-cwd-via-pending') {
+          sawStale = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      expect(sawStale).toBe(true);
+
+      // Now supply a *different* ppid breadcrumb — the correction watch
+      // should pick it up and re-adopt.
+      const ppidBreadcrumbDir = resolve(tmpStoragePath, 'session-by-ppid');
+      mkdirSync(ppidBreadcrumbDir, { recursive: true });
+      writeFileSync(resolve(ppidBreadcrumbDir, `${process.pid}.txt`), 'corrected-ppid-via-pending');
+
+      let corrected = false;
+      for (let i = 0; i < 20; i++) {
+        if ((await readSessionId()) === 'corrected-ppid-via-pending') {
+          corrected = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      expect(corrected).toBe(true);
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('suppresses the periodic checkpoint while a cwd-resolved session id is unconfirmed', async () => {
+    // No ppid breadcrumb is ever supplied in this test, so the session stays
+    // in the "pending confirmation" state for its whole lifetime — proving
+    // the periodic checkpoint interval skips writing under the stale id.
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-pending-suppress-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-pending-suppress-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'unconfirmed-cwd-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+        NR_AI_SESSION_PERSIST_INTERVAL_MS: '200',
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      await client.listTools();
+
+      // Let several 200ms persist ticks elapse while unconfirmed.
+      await new Promise((r) => setTimeout(r, 900));
+
+      const sessionsDir = resolve(tmpStoragePath, 'sessions');
+      const files = existsSync(sessionsDir) ? readdirSync(sessionsDir) : [];
+      expect(files.some((f) => f.includes('unconfirmed-cwd-session-id'))).toBe(false);
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('resumes periodic checkpointing after the pending-confirmation cap elapses with no correction', async () => {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-cap-timeout-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-cap-timeout-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'cap-timeout-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+        NR_AI_SESSION_PERSIST_INTERVAL_MS: '200',
+        NR_AI_PENDING_CONFIRMATION_CAP_MS: '500',
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      await client.listTools();
+      // An idle session is not persisted, so give the checkpoint something to write.
+      await client.callTool({
+        name: 'nr_observe_report_tokens',
+        arguments: { input_tokens: 100, output_tokens: 50, model: 'claude-sonnet-5' },
+      });
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const expectedFile = resolve(
+        tmpStoragePath,
+        'sessions',
+        `${dateStr}_cap-timeout-session-id.json`,
+      );
+
+      let appeared = false;
+      for (let i = 0; i < 20; i++) {
+        if (existsSync(expectedFile)) {
+          appeared = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(appeared).toBe(true);
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('clears pending confirmation immediately when the PPID breadcrumb confirms the same id as the cwd guess', async () => {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-confirmed-same-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-confirmed-same-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'confirmed-same-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+        NR_AI_SESSION_PERSIST_INTERVAL_MS: '200',
+        // Deliberately left at the (2-minute) default: if pendingConfirmation
+        // only cleared via the cap, the checkpoint below could not appear
+        // within this test's short poll window.
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      await client.listTools();
+      // An idle session is not persisted, so give the checkpoint something to write.
+      await client.callTool({
+        name: 'nr_observe_report_tokens',
+        arguments: { input_tokens: 100, output_tokens: 50, model: 'claude-sonnet-5' },
+      });
+
+      // The spawned child sees this test process as its ppid — same
+      // convention as the existing correction tests.
+      const ppidBreadcrumbDir = resolve(tmpStoragePath, 'session-by-ppid');
+      mkdirSync(ppidBreadcrumbDir, { recursive: true });
+      writeFileSync(resolve(ppidBreadcrumbDir, `${process.pid}.txt`), 'confirmed-same-session-id');
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const expectedFile = resolve(
+        tmpStoragePath,
+        'sessions',
+        `${dateStr}_confirmed-same-session-id.json`,
+      );
+
+      let appeared = false;
+      for (let i = 0; i < 20; i++) {
+        if (existsSync(expectedFile)) {
+          appeared = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(appeared).toBe(true);
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  // The correction watch reads the parent level only off Linux and Windows,
+  // so these skip in CI, which relies on the session-resolver.test.ts cases
+  // that inject platform 'darwin'. On a Mac they run the real `ps` lookup.
+  const itOffLinux = process.platform === 'linux' || process.platform === 'win32' ? it.skip : it;
+
+  /** Titles itself like npm's `npx` process, then runs its args as a child. */
+  const NPM_EXEC_WRAPPER = [
+    "process.title = 'npm exec @newrelic/preflight --stdio';",
+    "const child = require('node:child_process').spawn(process.execPath, process.argv.slice(1), { stdio: 'inherit' });",
+    "for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => child.kill(sig));",
+    "child.on('exit', (code) => process.exit(code ?? 1));",
+  ].join('\n');
+
+  /**
+   * Starts an engine whose session id is a cwd guess ('neighbour-session-id'),
+   * which arms its correction watch. With `viaNpmExec` it runs behind
+   * NPM_EXEC_WRAPPER, as an `npx`-launched engine does, so this test process
+   * is its parent-of-ppid; otherwise this test process is its ppid.
+   * `nodeArgs` go to the engine's own node process, which also pipes its
+   * stderr into `stderr()` when they are set.
+   */
+  async function startCwdGuessedEngine(
+    viaNpmExec: boolean,
+    options: { readonly nodeArgs?: readonly string[] } = {},
+  ): Promise<{
+    readonly storagePath: string;
+    readonly ppidBreadcrumbDir: string;
+    readonly readSessionId: () => Promise<string>;
+    readonly waitForSessionId: (sessionId: string) => Promise<boolean>;
+    /**
+     * Appends one tool call under `sessionId` to `buffer-<bufferSessionId>.jsonl`
+     * (default: the same id) and waits until the engine has drained it.
+     */
+    readonly drainToolCall: (sessionId: string, bufferSessionId?: string) => Promise<void>;
+    /** The engine's stderr so far; empty unless `nodeArgs` were set. */
+    readonly stderr: () => string;
+    readonly close: () => Promise<void>;
+  }> {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const storagePath = mkdtempSync(join(tmpdir(), 'nr-ancestor-confirm-storage-'));
+    const projectCwd = mkdtempSync(join(tmpdir(), 'nr-ancestor-confirm-project-'));
+    const cwdBreadcrumbDir = resolve(storagePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realpathSync(projectCwd).replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'neighbour-session-id');
+    const ppidBreadcrumbDir = resolve(storagePath, 'session-by-ppid');
+    mkdirSync(ppidBreadcrumbDir, { recursive: true });
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+    const engineArgs = [...(options.nodeArgs ?? []), binPath, '--stdio'];
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: viaNpmExec ? ['-e', NPM_EXEC_WRAPPER, '--', ...engineArgs] : engineArgs,
+      ...(options.nodeArgs ? { stderr: 'pipe' as const } : {}),
+      cwd: projectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: storagePath,
+        NR_AI_SESSION_PERSIST_INTERVAL_MS: '200',
+      },
+    });
+    let stderr = '';
+    transport.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    const cleanup = (): void => {
+      rmSync(storagePath, { recursive: true, force: true });
+      rmSync(projectCwd, { recursive: true, force: true });
+    };
+    try {
+      await client.connect(transport);
+      await client.listTools();
+      // An idle session is not persisted, so give the checkpoint something to write.
+      await client.callTool({
+        name: 'nr_observe_report_tokens',
+        arguments: { input_tokens: 100, output_tokens: 50, model: 'claude-sonnet-5' },
+      });
+    } catch (err) {
+      cleanup();
+      throw err;
+    }
+
+    const readStats = async (): Promise<{ session_id: string; tool_calls: number }> => {
+      const result = await client.callTool({ name: 'nr_observe_get_session_stats', arguments: {} });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return JSON.parse(content[0]?.text ?? '{}') as { session_id: string; tool_calls: number };
+    };
+    const readSessionId = async (): Promise<string> => (await readStats()).session_id;
+    let toolUseCount = 0;
+    return {
+      storagePath,
+      ppidBreadcrumbDir,
+      readSessionId,
+      waitForSessionId: async (sessionId) => {
+        for (let i = 0; i < 20; i++) {
+          if ((await readSessionId()) === sessionId) return true;
+          await new Promise((r) => setTimeout(r, 500));
+        }
+        return false;
+      },
+      drainToolCall: async (sessionId, bufferSessionId = sessionId) => {
+        const before = (await readStats()).tool_calls;
+        const toolUseId = `toolu_drain_${++toolUseCount}`;
+        const ts = Date.now();
+        appendFileSync(
+          resolve(storagePath, `buffer-${bufferSessionId}.jsonl`),
+          [
+            { mode: 'pre', tool: 'Bash', timestamp: ts, sessionId, toolUseId },
+            { mode: 'post', tool: 'Bash', timestamp: ts + 1, sessionId, toolUseId, success: true },
+          ]
+            .map((e) => JSON.stringify(e))
+            .join('\n') + '\n',
+          { mode: 0o600 },
+        );
+        for (let i = 0; i < 100; i++) {
+          if ((await readStats()).tool_calls > before) return;
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        throw new Error(`engine never drained the tool call under ${sessionId}`);
+      },
+      stderr: () => stderr,
+      close: async () => {
+        try {
+          await client.close();
+        } finally {
+          cleanup();
+        }
+      },
+    };
+  }
+
+  itOffLinux(
+    'does not read the parent-of-ppid breadcrumb of an engine its host launched directly (#479)',
+    async () => {
+      // This engine's ppid is this test process, not an `npm exec` wrapper,
+      // so the level above it can hold another host's session: one whose
+      // hooks run as that process's children (Copilot in a VS Code extension
+      // host shared with the Claude Code extension, say). The id there is
+      // ownerless and differs from the cwd guess, so only the gate keeps it
+      // from being adopted.
+      const engine = await startCwdGuessedEngine(false);
+      try {
+        writeFileSync(
+          resolve(engine.ppidBreadcrumbDir, `${process.ppid}.txt`),
+          'copilot-session-id',
+        );
+        // The watch ticks at most 2s apart.
+        await new Promise((r) => setTimeout(r, 3500));
+        expect(await engine.readSessionId()).toBe('neighbour-session-id');
+
+        // The host's own breadcrumb still corrects the guess.
+        writeFileSync(resolve(engine.ppidBreadcrumbDir, `${process.pid}.txt`), 'own-session-id');
+        expect(await engine.waitForSessionId('own-session-id')).toBe(true);
+      } finally {
+        await engine.close();
+      }
+    },
+    30000,
+  );
+
+  itOffLinux(
+    'corrects a wrong cwd guess from the host breadcrumb behind an npm exec wrapper (#479)',
+    async () => {
+      // Behind the wrapper the level above ppid is the host that ran npx: this
+      // test process. Its breadcrumb naming another session is the correction.
+      const engine = await startCwdGuessedEngine(true);
+      try {
+        writeFileSync(resolve(engine.ppidBreadcrumbDir, `${process.pid}.txt`), 'own-session-id');
+        expect(await engine.waitForSessionId('own-session-id')).toBe(true);
+      } finally {
+        await engine.close();
+      }
+    },
+    30000,
+  );
+
+  itOffLinux(
+    'does not follow the host to a new session once its breadcrumb matched the cwd guess, behind an npm exec wrapper (#479)',
+    async () => {
+      // The default plugin launch: the cwd guess is right, so the host's slot
+      // names it. That is not a confirmation (only our own ppid's breadcrumb
+      // is), and a later /clear rewriting the slot is the host switching
+      // sessions. Adopting it as a correction would reset the cost trackers
+      // but keep the old session's tool calls under the new id.
+      const engine = await startCwdGuessedEngine(true);
+      try {
+        const hostBreadcrumb = resolve(engine.ppidBreadcrumbDir, `${process.pid}.txt`);
+        writeFileSync(hostBreadcrumb, 'neighbour-session-id');
+        // The watch ticks at most 2s apart, and a confirmation would
+        // checkpoint within the 200ms persist interval after that.
+        await new Promise((r) => setTimeout(r, 3500));
+        const dateStr = new Date().toISOString().slice(0, 10);
+        expect(
+          existsSync(
+            resolve(engine.storagePath, 'sessions', `${dateStr}_neighbour-session-id.json`),
+          ),
+        ).toBe(false);
+
+        writeFileSync(hostBreadcrumb, 'cleared-session-id');
+        await new Promise((r) => setTimeout(r, 3500));
+        expect(await engine.readSessionId()).toBe('neighbour-session-id');
+      } finally {
+        await engine.close();
+      }
+    },
+    30000,
+  );
+
+  itOffLinux(
+    'does not follow the host to a new session after a tool call drained under the cwd guess, behind an npm exec wrapper (#479)',
+    async () => {
+      // The host's slot names the guess only until its tool call is drained,
+      // then a /clear rewrites it, all between two ticks of the watch. The
+      // drained tool call is what stops the parent level.
+      const engine = await startCwdGuessedEngine(true);
+      try {
+        // Past the watch's early ticks, which come faster than every 2s.
+        await new Promise((r) => setTimeout(r, 4000));
+        const hostBreadcrumb = resolve(engine.ppidBreadcrumbDir, `${process.pid}.txt`);
+        writeFileSync(hostBreadcrumb, 'neighbour-session-id');
+        await engine.drainToolCall('neighbour-session-id');
+        writeFileSync(hostBreadcrumb, 'cleared-session-id');
+        await new Promise((r) => setTimeout(r, 3500));
+        expect(await engine.readSessionId()).toBe('neighbour-session-id');
+      } finally {
+        await engine.close();
+      }
+    },
+    30000,
+  );
+
+  itOffLinux(
+    'corrects a wrong cwd guess after draining tool calls of the guessed session, behind an npm exec wrapper (#479)',
+    async () => {
+      // A wrong guess drains the guessed session's tool calls under the
+      // guess. They don't stop the host's own breadcrumb correcting it.
+      const engine = await startCwdGuessedEngine(true);
+      try {
+        await engine.drainToolCall('neighbour-session-id');
+        writeFileSync(resolve(engine.ppidBreadcrumbDir, `${process.pid}.txt`), 'own-session-id');
+        expect(await engine.waitForSessionId('own-session-id')).toBe(true);
+      } finally {
+        await engine.close();
+      }
+    },
+    30000,
+  );
+
+  it('reports each tool call drained under the cwd guess to the correction watch, and no other', async () => {
+    // The watch acts on that report only off Linux and Windows, so this checks
+    // the drain-path wiring itself, on every platform: a loader hook wraps
+    // the listener the engine subscribes, and marks each call on stderr.
+    // The hook files are fixed text, with no paths or values spliced in: the
+    // hook finds the built resolver by its URL suffix, hands its importers the
+    // shim, and resolves the shim's own sentinel import to the real module.
+    const hookDir = mkdtempSync(join(tmpdir(), 'nr-staleid-activity-hook-'));
+    const marker = 'pf-test: staleId activity reported';
+    writeFileSync(
+      resolve(hookDir, 'session-resolver-shim.mjs'),
+      [
+        "export * from 'pf-test-real-session-resolver';",
+        "import { watchPpidBreadcrumb as realWatch } from 'pf-test-real-session-resolver';",
+        'export function watchPpidBreadcrumb(options = {}) {',
+        '  const subscribe = options.subscribeToStaleIdActivity;',
+        '  if (!subscribe) return realWatch(options);',
+        '  return realWatch({',
+        '    ...options,',
+        '    subscribeToStaleIdActivity: (onActivity) =>',
+        "      subscribe(() => { process.stderr.write('pf-test: staleId activity reported\\n'); onActivity(); }),",
+        '  });',
+        '}',
+      ].join('\n'),
+    );
+    writeFileSync(
+      resolve(hookDir, 'hooks.mjs'),
+      [
+        "const SHIM = new URL('./session-resolver-shim.mjs', import.meta.url).href;",
+        'let realUrl;',
+        'export async function resolve(specifier, context, next) {',
+        "  if (specifier === 'pf-test-real-session-resolver') return { url: realUrl, shortCircuit: true };",
+        '  const result = await next(specifier, context);',
+        "  if (result.url.endsWith('/dist/hooks/session-resolver.js')) {",
+        '    realUrl = result.url;',
+        '    return { ...result, url: SHIM, shortCircuit: true };',
+        '  }',
+        '  return result;',
+        '}',
+      ].join('\n'),
+    );
+    writeFileSync(
+      resolve(hookDir, 'register.mjs'),
+      "import { register } from 'node:module';\nregister('./hooks.mjs', import.meta.url);\n",
+    );
+
+    let engine: Awaited<ReturnType<typeof startCwdGuessedEngine>> | undefined;
+    try {
+      engine = await startCwdGuessedEngine(false, {
+        nodeArgs: ['--import', pathToFileURL(resolve(hookDir, 'register.mjs')).href],
+      });
+      const { stderr } = engine;
+      const reports = (): number => stderr().split(marker).length - 1;
+      const settledReports = async (expected: number): Promise<number> => {
+        for (let i = 0; i < 50 && reports() < expected; i++) {
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        return reports();
+      };
+      // Filed in the guessed session's buffer, but under another session id.
+      await engine.drainToolCall('other-session-id', 'neighbour-session-id');
+      // No report is due for it; the wait gives a wrong one time to arrive.
+      expect(await settledReports(1)).toBe(0);
+      await engine.drainToolCall('neighbour-session-id');
+      expect(await settledReports(1)).toBe(1);
+    } finally {
+      await engine?.close();
+      rmSync(hookDir, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('does not follow the host to a new session once its ppid breadcrumb confirmed the cwd guess', async () => {
+    // Pins the direct-launch side of the /clear case: the watch resolves on the
+    // confirmation and is not re-armed, so a later rewrite of the breadcrumb
+    // (the host starting a new session) leaves the engine on the confirmed id.
+    const engine = await startCwdGuessedEngine(false);
+    try {
+      const hostBreadcrumb = resolve(engine.ppidBreadcrumbDir, `${process.pid}.txt`);
+      writeFileSync(hostBreadcrumb, 'neighbour-session-id');
+      // Confirmation ends checkpoint suppression, so the session file appears.
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const sessionFile = (id: string): string =>
+        resolve(engine.storagePath, 'sessions', `${dateStr}_${id}.json`);
+      let confirmed = false;
+      for (let i = 0; i < 20 && !confirmed; i++) {
+        confirmed = existsSync(sessionFile('neighbour-session-id'));
+        if (!confirmed) await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(confirmed).toBe(true);
+
+      writeFileSync(hostBreadcrumb, 'cleared-session-id');
+      await new Promise((r) => setTimeout(r, 3500));
+      expect(await engine.readSessionId()).toBe('neighbour-session-id');
+      expect(existsSync(sessionFile('cleared-session-id'))).toBe(false);
+    } finally {
+      await engine.close();
+    }
+  }, 30000);
+
+  it('resets accumulated cost when the PPID breadcrumb corrects to a different session id', async () => {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-cost-reset-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-cost-reset-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'stale-cost-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      await client.listTools();
+
+      // Simulate the wrong-identity backfill: while still on the stale cwd
+      // id, real cost gets recorded through the same shared CostTracker the
+      // parent-transcript watcher would feed.
+      await client.callTool({
+        name: 'nr_observe_report_tokens',
+        arguments: { input_tokens: 10000, output_tokens: 2000, model: 'claude-sonnet-5' },
+      });
+
+      const readTotalUsd = async (): Promise<number> => {
+        const result = await client.callTool({
+          name: 'nr_observe_get_cost_breakdown',
+          arguments: {},
+        });
+        const content = result.content as Array<{ type: string; text: string }>;
+        const text = content[0]?.text ?? '{}';
+        return (JSON.parse(text) as { total_usd: number }).total_usd;
+      };
+
+      expect(await readTotalUsd()).toBeGreaterThan(0);
+
+      // Now correct to a different ppid-derived id.
+      const ppidBreadcrumbDir = resolve(tmpStoragePath, 'session-by-ppid');
+      mkdirSync(ppidBreadcrumbDir, { recursive: true });
+      writeFileSync(resolve(ppidBreadcrumbDir, `${process.pid}.txt`), 'corrected-cost-session-id');
+
+      const readSessionId = async (): Promise<string> => {
+        const result = await client.callTool({
+          name: 'nr_observe_get_session_stats',
+          arguments: {},
+        });
+        const content = result.content as Array<{ type: string; text: string }>;
+        const text = content[0]?.text ?? '{}';
+        return (JSON.parse(text) as { session_id: string }).session_id;
+      };
+
+      let corrected = false;
+      for (let i = 0; i < 20; i++) {
+        if ((await readSessionId()) === 'corrected-cost-session-id') {
+          corrected = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      expect(corrected).toBe(true);
+      expect(await readTotalUsd()).toBe(0);
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('resumes checkpointing promptly after a real correction, not after the full pending-confirmation cap', async () => {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-correction-resume-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-correction-resume-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'stale-resume-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+        NR_AI_SESSION_PERSIST_INTERVAL_MS: '200',
+        // Left at the 2-minute default deliberately — see the sibling
+        // "confirmed same id" test's identical rationale.
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      await client.listTools();
+
+      const ppidBreadcrumbDir = resolve(tmpStoragePath, 'session-by-ppid');
+      mkdirSync(ppidBreadcrumbDir, { recursive: true });
+      writeFileSync(
+        resolve(ppidBreadcrumbDir, `${process.pid}.txt`),
+        'corrected-resume-session-id',
+      );
+
+      // The correction resets accumulated cost, so usage has to land after it
+      // for the corrected session to be worth a checkpoint file.
+      let corrected = false;
+      for (let i = 0; i < 20 && !corrected; i++) {
+        const stats = await client.callTool({
+          name: 'nr_observe_get_session_stats',
+          arguments: {},
+        });
+        const text = (stats.content as Array<{ text: string }>)[0]?.text ?? '{}';
+        corrected =
+          (JSON.parse(text) as { session_id: string }).session_id === 'corrected-resume-session-id';
+        if (!corrected) await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(corrected).toBe(true);
+      await client.callTool({
+        name: 'nr_observe_report_tokens',
+        arguments: { input_tokens: 100, output_tokens: 50, model: 'claude-sonnet-5' },
+      });
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const expectedFile = resolve(
+        tmpStoragePath,
+        'sessions',
+        `${dateStr}_corrected-resume-session-id.json`,
+      );
+
+      let appeared = false;
+      for (let i = 0; i < 20; i++) {
+        if (existsSync(expectedFile)) {
+          appeared = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(appeared).toBe(true);
+
+      await client.close();
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  it('still writes the terminal session save on shutdown even while pending confirmation', async () => {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-shutdown-pending-storage-'));
+    const tmpProjectCwd = mkdtempSync(join(tmpdir(), 'nr-shutdown-pending-project-'));
+    const realProjectCwd = realpathSync(tmpProjectCwd);
+
+    const cwdBreadcrumbDir = resolve(tmpStoragePath, 'session-by-cwd');
+    mkdirSync(cwdBreadcrumbDir, { recursive: true });
+    const sanitizedCwd = realProjectCwd.replace(/[\\/:]/g, '-');
+    writeFileSync(resolve(cwdBreadcrumbDir, `${sanitizedCwd}.txt`), 'shutdown-pending-session-id');
+
+    const env = { ...process.env };
+    delete env.CLAUDE_JOB_DIR;
+
+    const transport = new StdioClientTransport({
+      command: 'node',
+      args: [binPath, '--stdio'],
+      cwd: tmpProjectCwd,
+      env: {
+        ...env,
+        NR_AI_DASHBOARD_PORT: '0',
+        NR_AI_MODE: 'local',
+        NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+        // No ppid breadcrumb is ever supplied, and the cap is left at its
+        // 2-minute default, so the session is still pendingConfirmation when
+        // we close the client below (which ends the child's stdin and
+        // triggers its shutdown handler).
+      },
+    });
+
+    const client = new Client({ name: 'test-client', version: '1.0.0' });
+    try {
+      await client.connect(transport);
+      await client.listTools();
+      // An idle session is not persisted, so give the checkpoint something to write.
+      await client.callTool({
+        name: 'nr_observe_report_tokens',
+        arguments: { input_tokens: 100, output_tokens: 50, model: 'claude-sonnet-5' },
+      });
+
+      await client.close();
+
+      const dateStr = new Date().toISOString().slice(0, 10);
+      const expectedFile = resolve(
+        tmpStoragePath,
+        'sessions',
+        `${dateStr}_shutdown-pending-session-id.json`,
+      );
+
+      let appeared = false;
+      for (let i = 0; i < 20; i++) {
+        if (existsSync(expectedFile)) {
+          appeared = true;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      expect(appeared).toBe(true);
+    } finally {
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpProjectCwd, { recursive: true, force: true });
+    }
+  }, 30000);
+});
+
+describe('--local with cloud export configured but no credentials (#479)', () => {
+  it('reports the ownerless sessions it drains as unforwarded on /api/health', async () => {
+    const { spawn } = await import('node:child_process');
+    const { createServer: createNetServer } = await import('node:net');
+
+    const binPath = resolve(__dirname, '..', 'dist', 'index.js');
+    const tmpStoragePath = mkdtempSync(join(tmpdir(), 'nr-local-unfwd-storage-'));
+    const tmpConfigDir = mkdtempSync(join(tmpdir(), 'nr-local-unfwd-config-'));
+    const configPath = resolve(tmpConfigDir, 'config.json');
+    // Cloud export requested, credentials left to the (absent) environment —
+    // the dashboard LaunchAgent case.
+    writeFileSync(configPath, JSON.stringify({ mode: 'both' }));
+
+    // Ownerless buffers: no active-<id>.pid heartbeat, so --local drains them.
+    const sessionIds = ['copilot-orphan-session', 'copilot-orphan-session-2'];
+    const ts = Date.now() - 1000;
+    for (const sessionId of sessionIds) {
+      writeFileSync(
+        resolve(tmpStoragePath, `buffer-${sessionId}.jsonl`),
+        [
+          { mode: 'pre', tool: 'Bash', timestamp: ts, sessionId, toolUseId: 'toolu_1' },
+          {
+            mode: 'post',
+            tool: 'Bash',
+            timestamp: ts + 1,
+            sessionId,
+            toolUseId: 'toolu_1',
+            success: true,
+          },
+        ]
+          .map((e) => JSON.stringify(e))
+          .join('\n') + '\n',
+        { mode: 0o600 },
+      );
+    }
+
+    const port = await new Promise<number>((resolvePort, reject) => {
+      const srv = createNetServer();
+      srv.listen(0, '127.0.0.1', () => {
+        const p = (srv.address() as { port: number }).port;
+        srv.close((err) => (err ? reject(err) : resolvePort(p)));
+      });
+      srv.on('error', reject);
+    });
+
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      NEW_RELIC_AI_MCP_STORAGE_PATH: tmpStoragePath,
+      NR_AI_DASHBOARD_PORT: String(port),
+      NR_AI_ALERTS_ENABLED: 'false',
+      NEW_RELIC_LICENSE_KEY: '',
+      NEW_RELIC_ACCOUNT_ID: '',
+    };
+    delete env.NR_AI_MODE;
+
+    const child = spawn(process.execPath, [binPath, '--local', '--config', configPath], {
+      env,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    try {
+      let unforwarded: Record<string, unknown> | undefined;
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+          const body = (await res.json()) as { unforwardedSessions?: Record<string, unknown> };
+          if ((body.unforwardedSessions?.count as number | undefined) === 2) {
+            unforwarded = body.unforwardedSessions;
+            break;
+          }
+        } catch {
+          // Not listening yet.
+        }
+        await new Promise((r) => setTimeout(r, 300));
+      }
+
+      expect(unforwarded).toMatchObject({
+        reason: 'missing-license-key',
+        requestedMode: 'both',
+        count: 2,
+        hint: UNFORWARDED_SESSIONS_HINT,
+      });
+      expect(unforwarded?.sessions).toEqual(
+        expect.arrayContaining(
+          sessionIds.map((sessionId) => expect.objectContaining({ sessionId, toolCalls: 1 })),
+        ),
+      );
+
+      // One warning per session, and the fix-it hint only once, at startup.
+      const occurrences = (needle: string): number => stderr.split(needle).length - 1;
+      const perSession = 'Session has no owning --stdio engine and is not reaching New Relic';
+      const stderrDeadline = Date.now() + 5_000;
+      while (occurrences(perSession) < 2 && Date.now() < stderrDeadline) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(occurrences(perSession)).toBe(2);
+      expect(occurrences(UNFORWARDED_SESSIONS_HINT)).toBe(1);
+    } finally {
+      child.kill('SIGKILL');
+      rmSync(tmpStoragePath, { recursive: true, force: true });
+      rmSync(tmpConfigDir, { recursive: true, force: true });
+    }
+  }, 30000);
+});
+
+describe('deploy-dashboards/deploy-alerts --staging is hidden from --help', () => {
+  async function expectHelpHidesStaging(sub: 'deploy-dashboards' | 'deploy-alerts'): Promise<void> {
+    const exitSpy = jest
+      .spyOn(process, 'exit')
+      .mockImplementation((_code?: string | number | null): never => {
+        throw new Error(`exit:${_code}`);
+      });
+    const chunks: string[] = [];
+    const stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation((chunk) => {
+      chunks.push(String(chunk));
+      return true;
+    });
+    try {
+      await expect(dispatchSubcommand(['node', 'preflight', sub, '--help'])).rejects.toThrow();
+    } finally {
+      expect(chunks.join('')).not.toContain('--staging');
+      stdoutSpy.mockRestore();
+      exitSpy.mockRestore();
+    }
+  }
+
+  it('deploy-dashboards --help does not list --staging', async () => {
+    await expectHelpHidesStaging('deploy-dashboards');
+  });
+
+  it('deploy-alerts --help does not list --staging', async () => {
+    await expectHelpHidesStaging('deploy-alerts');
+  });
+});
+
+describe('preflight server subcommand', () => {
+  // Not automated: starting the full CLI dispatch (env var wiring, config
+  // load, DashboardServer boot, /ingest auth against the real token) is out
+  // of scope for this port. Only the Host-header bypass this subcommand
+  // relies on is covered by an automated test — 'serverMode accepts a
+  // non-loopback Host header...' in dashboard-server.test.ts. Everything
+  // else here — including this endpoint — is exercised only by the manual
+  // smoke test in docs/homelab.md. it.todo (rather than a placeholder
+  // assertion) so this doesn't silently report as a passing test.
+  it.todo('responds to GET /api/health with 200');
+});
+
+describe('NrIngestManager tier wiring', () => {
+  // NrIngestOptions.tiers is optional for backward compatibility, so a missing
+  // `tiers:` at a construction site compiles clean and silently degrades
+  // multi-tier routing to single-tier. src/index.privacy.test.ts documents why
+  // main()'s branches can't be driven in-process, so this asserts on source.
+  it('passes config.tiers at every NrIngestManager construction site', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/index.ts'), 'utf-8');
+
+    const constructionSites = source.match(/new NrIngestManager\(\{/g) ?? [];
+    const tierWirings = source.match(/^\s*tiers: config!?\.tiers,$/gm) ?? [];
+
+    expect(constructionSites).toHaveLength(3);
+    expect(tierWirings).toHaveLength(constructionSites.length);
+  });
 });

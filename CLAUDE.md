@@ -7,8 +7,9 @@ Flat single-package repo providing observability for AI coding assistants (MCP s
 ```bash
 npm run build              # TypeScript build
 npm run build:clean        # Clean build output
-npm test                   # Run all tests (Jest, maxWorkers: 1)
-npm run lint               # ESLint across src/
+npm test                   # Jest suite, everything outside src/web (maxWorkers: 1)
+npm run test:web           # Vitest suite, src/web
+npm run lint               # ESLint across src/, scripts/, e2e/ and the root configs
 npm run format             # Prettier (write)
 npm run format:check       # Prettier (check only)
 ```
@@ -33,102 +34,6 @@ npx jest -- src/shared/harvest/harvest-scheduler.test.ts
 **Rules:**
 
 1. **Never edit files under `src/shared/` in this repo.** It is a vendored snapshot. If you find a bug there, open an issue.
-
-## Project Structure
-
-```
-preflight/
-  src/
-    shared/                         # vendored snapshot — do not edit directly
-      config.ts                     # AgentConfig loader (env > file > defaults)
-      logger.ts                     # createLogger() — stderr JSON logger
-      pricing.ts / pricing-data.ts  # Token pricing tables (Anthropic, Gemini)
-      tokens.ts                     # Token extraction/accumulation
-      timing.ts                     # RequestTimer for latency measurement
-      errors.ts                     # Error classification, retry logic
-      events/                       # NR event creation and serialization
-      harvest/                      # EventBuffer, MetricAggregator, HarvestScheduler
-      transport/                    # HTTP clients for Events, Metric, and Logs APIs; OtlpTransport and OtlpEventBridge for OTLP/HTTP export
-    index.ts                        # CLI entry point (parseArgs, three modes: --stdio MCP transport, --local standalone dashboard, proxy)
-    server.ts                       # NrMcpServer — MCP server over stdio transport
-    config.ts                       # McpServerConfig loader
-    hooks/
-      collector-script.ts           # preflight binary (hook event collector)
-      event-processor.ts            # Pairs pre/post hook events into ToolCallRecords
-      tool-parsers.ts               # INPUT_PARSERS / OUTPUT_PARSERS for tool fields
-      bash-classifier.ts            # classifyBash() — coarse Bash command classifier (category/leading/isDestructive/isNetwork)
-    metrics/                        # metric analyzer classes
-      session-tracker.ts            # Per-session tool call tracking
-      cost-tracker.ts               # Token cost calculation (per-model)
-      cost-forecast.ts              # Burn-rate-based session/day/week cost projections
-      task-detector.ts              # Task boundary detection
-      anti-patterns.ts              # Thrashing, re-reads, blind edits, stuck loops
-      efficiency-score.ts           # Composite efficiency score
-      trend-analyzer.ts             # Weekly trend analysis
-      collaboration-profile.ts      # Developer collaboration patterns
-      claudemd-tracker.ts           # CLAUDE.md change impact tracking
-      cost-per-outcome.ts           # Cost breakdown by outcome type
-      prompt-feedback.ts            # Feedback collection engine
-      recommendation-engine.ts      # Personalized optimization recommendations
-      proxy-metrics.ts              # Proxy mode server latency and tool popularity tracking
-      budget-tracker.ts             # Session/daily/weekly budget monitoring
-      context-window-tracker.ts     # Context waste detection (repeated file reads)
-      latency-tracker.ts            # Tool call latency percentiles (p50/p95/p99)
-      task-completion-tracker.ts    # Task lifecycle tracking (completed/abandoned)
-      model-usage-tracker.ts        # Cost-efficiency per AI model
-      personal-coach.ts             # Narrative coaching report comparing weekly metrics to personal baseline
-    platforms/                      # 9 platform adapters
-      claude-code-adapter.ts        # Claude Code (default)
-      cursor-adapter.ts             # Cursor IDE
-      windsurf-adapter.ts           # Windsurf IDE
-      copilot-adapter.ts            # GitHub Copilot
-      zed-adapter.ts                # Zed IDE
-      continue-adapter.ts           # Continue.dev
-      amazon-q-adapter.ts           # Amazon Q Developer
-      kiro-adapter.ts               # Amazon Kiro (agentic IDE, MCP-native)
-      generic-mcp-adapter.ts        # Generic fallback adapter for any MCP-speaking client
-      platform-registry.ts          # Registry + factory
-    proxy/                          # HTTP proxy layer
-      proxy-manager.ts              # HTTP server, routing, interception
-      upstream-http.ts              # HTTP upstream transport
-      upstream-stdio.ts             # Stdio upstream transport (child process)
-    storage/                        # Local file persistence
-      local-store.ts                # JSONL buffer file + atomic drain
-      session-store.ts              # Session history (YYYY-MM-DD_sessionId.json)
-      weekly-summary.ts             # Cross-session weekly aggregation
-      retention.ts                  # purgeOldSessions() — delete sessions older than N days
-    digest/                         # Weekly digest formatting and delivery
-      digest-formatter.ts           # formatSlackDigest() — Slack Block Kit payload builder
-      digest-sender.ts              # sendSlackDigest() — HTTP POST to Slack webhook
-    security/
-      audit-trail.ts                # Security audit trail (sensitive files, destructive commands)
-    tools/                          # MCP tool handlers
-      session-stats.ts              # registerTools() + session stat tools
-      cost-tools.ts                 # Cost analysis tools
-      workflow-tools.ts             # Workflow analysis + feedback tools
-      cross-session-tools.ts        # Cross-session analysis tools
-    tracing/                        # OTel span management for MCP tool call tracing
-      mcp-tracer.ts                 # getMcpTracer() / initMcpTracer() — tracer singleton
-      session-span.ts               # SessionSpan — root span lifecycle (start at startup, end at shutdown)
-      tool-call-span.ts             # emitToolCallSpan() — one child span per ToolCallRecord
-      task-span-tracker.ts          # TaskSpanTracker — intermediate task span lifecycle
-    transport/
-      nr-ingest.ts                  # NrIngestManager (events + metrics + logs)
-      log-ingest.ts                 # Log ingestion with buffering
-    install/                        # Claude Code hook installation CLI
-      cli.ts                        # preflight install/uninstall commands
-      setup-wizard.ts               # preflight setup interactive wizard
-      migrate.ts                    # migrateStoragePath() — one-time rename ~/.nr-ai-observe → ~/.newrelic-preflight
-      headless-install.ts           # installHooksHeadless() — no-TTY hook install for the Smithery self-install MCP flow
-    alerts/                         # Alert TypeScript types + validation tests
-      types.ts                      # AlertConditionDefinition, AlertPolicyDefinition interfaces
-      alerts.test.ts                # JSON structure validation (reads from ../alerts/)
-  alerts/                           # Alert policy and condition JSON definitions (data, not source)
-    policy.json                     # Policy metadata (name, incident preference)
-    conditions/                     # NRQL alert condition JSON files
-  dashboards/                       # Pre-built NR dashboard JSON files (data, not source)
-  scripts/                          # backfill-sessions.ts, check-bundle-size.ts
-```
 
 ## Architecture
 
@@ -161,11 +66,6 @@ Claude Code
                  ├─ nr_observe_get_recommendations
                  └─ ... (tools listed below)
 ```
-
-### Package Dependencies
-
-- Runtime dependencies: `@modelcontextprotocol/sdk`, `zod`, `commander`, `@opentelemetry/*`
-- Shared code in `src/shared/` has no additional dependencies (pure TypeScript)
 
 ## TypeScript Conventions
 
@@ -216,7 +116,7 @@ Logger writes to stderr as JSON. Never write to stdout (reserved for MCP stdio t
 Trackers in `src/metrics/` do not share one input shape — they fall into four families depending on how data reaches them:
 
 - **Streaming push (void)** — `recordToolCall(record: ToolCallRecord): void`. The majority shape: `SessionTracker`, `TaskDetector`, `WorkflowRunTracker`, `ContextTracker`, `GitEfficiencyTracker`, and most others.
-- **Streaming push (signaling)** — `recordToolCall(record: ToolCallRecord): T`, returning a value the caller acts on immediately instead of only accumulating: `TurnTracker` (returns the turn id), `RetryDetector` (returns `ThrashingAlert | null`).
+- **Streaming push (signaling)** — `recordToolCall(record: ToolCallRecord): T`, returning a value the caller acts on immediately instead of only accumulating: `TurnTracker` (returns the turn id), `RetryDetector` (returns `ThrashingAlert | null`). `TurnCostAttributor` fits this same shape but on its other input method — `recordTokenEvent(event: TokenEvent): ClosedTurn | null` — since a turn's cost closes on the token event, not the tool call.
 - **Primitive accumulator** — a domain-named method taking specific values instead of a full `ToolCallRecord`, because the input is self-reported (tokens, cost) rather than a raw tool call: `ModelUsageTracker.recordUsage(model, inputTokens, outputTokens, costUsd)`, `CostTracker.recordTokenUsage(usage, model, ctx?)` / `recordEstimatedTokens(...)`, `BudgetTracker.updateCost(...)`.
 - **Batch/pull analyzer** — invoked periodically over accumulated history rather than per-call: `AntiPatternDetector.analyze(toolCalls: ToolCallRecord[])`, `EfficiencyScorer.computeScore(task, antiPatterns?)` / `updateScore(...)`.
 
@@ -238,7 +138,7 @@ Whichever family a tracker belongs to, it still:
 
 Each adapter in `src/platforms/` implements `PlatformAdapter` (`types.ts`): `normalizeToolCall()`, `mapToolName()`, `getSessionMetadata()`, `getHookInstallInstructions()`, `isSupported()`. `PlatformRegistry.detect()` (`platform-registry.ts`) returns the first registered adapter whose `isSupported()` is `true` — registration order matters, and the generic MCP fallback is always registered last with `isSupported()` hardcoded `true`.
 
-Platform capabilities are not uniform: Claude Code, Kiro, and Amazon Q expose a uniform hook shape that `src/hooks/collector-script.ts` parses into every built-in tool call; Cursor and Windsurf expose their own platform-specific hook events, handled by dedicated branches in the same file — all five are `full-hooks` platforms with real, automatic capture. Zed and Continue.dev have no hook/callback mechanism at all, so Preflight can observe calls made to its own MCP tools but never the platform's built-in file/shell tools (`mcp-tools-only`). Copilot and the generic-mcp fallback are `self-reported` — observable in principle, but only when an external party (a third-party extension, or the calling MCP client itself) actually reports them. Never invent a tool-name map or setup instructions — every entry must trace to the platform's own documentation or source, cited in a comment. See [ADAPTERS.md](./docs/ADAPTERS.md) for the full per-platform reference (mechanism, detection env vars, tool-map sourcing, known gaps, setup steps).
+Platform capabilities are not uniform: Claude Code, Kiro, Amazon Q, GitHub Copilot, and GitHub Copilot SDK expose a uniform hook shape that `src/hooks/collector-script.ts` parses into every built-in tool call (Copilot with camelCase `tool_input` keys and VS Code tool names); Cursor and Windsurf expose their own platform-specific hook events, handled by dedicated branches in the same file — all seven are `full-hooks` platforms with real, automatic capture. Zed and Continue.dev have no hook/callback mechanism at all, so Preflight can observe calls made to its own MCP tools but never the platform's built-in file/shell tools (`mcp-tools-only`). The generic-mcp fallback is `self-reported` — observable in principle, but only when the calling MCP client actually reports them. Never invent a tool-name map or setup instructions — every entry must trace to the platform's own documentation or source, cited in a comment. See [ADAPTERS.md](./docs/ADAPTERS.md) for the full per-platform reference (mechanism, detection env vars, tool-map sourcing, known gaps, setup steps).
 
 ## MCP Tool Registration
 
@@ -252,70 +152,7 @@ Tools are conditionally registered based on available dependencies (e.g., cross-
 
 ### MCP Tools
 
-**Session Tools:**
-
-- `nr_observe_get_session_stats` — current session metrics
-- `nr_observe_get_session_timeline` — recent tool calls with timestamps
-- `nr_observe_get_efficiency_score` — composite efficiency scoring
-- `nr_observe_health` — server health check: version, uptime, session ID, hook install status
-- `nr_observe_install_hooks` — headlessly install PreToolUse/PostToolUse hooks into `~/.claude/settings.json` (Smithery self-install flow)
-- `nr_observe_get_config` — current server configuration with sensitive fields masked
-- `nr_observe_get_git_efficiency` — merge conflicts, aborted operations, force pushes, stale branch detection, actionable suggestions
-
-**Cost and Budget Tools:**
-
-- `nr_observe_report_tokens` — self-reported token usage with per-model cost calculation
-- `nr_observe_get_cost_breakdown` — cost by tool type and model
-- `nr_observe_get_prompt_cache_health` — cache hit rate, savings, and a concrete recommendation for improving cache efficiency
-- `nr_observe_get_cost_forecast` — project future spend
-- `nr_observe_get_budget_status` — current spend vs. budget caps
-- `nr_observe_get_cost_per_tool` — cost attribution per tool type (approximate, turn-level token correlation)
-
-**Workflow and Anti-Pattern Tools:**
-
-- `nr_observe_get_anti_patterns` — detected thrashing, re-reads, blind edits, stuck loops
-- `nr_observe_get_workflow_trace` — ordered sequence of recent tool calls
-- `nr_observe_report_feedback` — record user quality feedback (`good`/`bad`/`neutral`) for a task
-- `nr_observe_mark_task_boundary` — explicitly close the current task; the universal (and, outside Claude Code, the only) task-boundary signal
-
-**Analytics Tools:**
-
-- `nr_observe_get_context_efficiency` — context window waste (repeated reads)
-- `nr_observe_get_latency_percentiles` — p50/p95/p99 per tool type
-- `nr_observe_get_task_completion_rate` — task lifecycle (completed vs. abandoned)
-- `nr_observe_get_model_usage` — cost-efficiency per AI model
-
-**Extended Analytics Tools:**
-
-- `nr_observe_get_retry_alerts` — thrashing/retry detection alerts in a sliding window
-- `nr_observe_get_context_composition` — per-turn token breakdown by category with fill % and dominance alerts
-- `nr_observe_get_latency_decomposition` — LLM API vs tool execution vs overhead time split with p50/p95
-- `nr_observe_get_decision_tree` — decision branch analysis with failure chain post-mortem
-- `nr_observe_get_instruction_drift` — CLAUDE.md/system prompt change correlations with session outcomes
-- `nr_observe_get_tool_selection_score` — tool selection quality score (0–1) with penalty breakdown
-- `nr_observe_get_quality_proxy` — diff apply rate, test pass rate, backtrack count, degradation detection
-- `nr_observe_get_api_failures` — per-model reliability scorecards, tokens lost, throttle alerts, MTTR
-
-**Cross-Session Tools (require SessionStore + WeeklySummaryGenerator):**
-
-- `nr_observe_get_session_history` — paginated past-session list with summary metrics
-- `nr_observe_get_weekly_summary` — aggregated metrics across the week
-- `nr_observe_get_trends` — weekly metric trends (efficiency, cost, task success)
-- `nr_observe_get_team_summary` — team-level aggregations
-- `nr_observe_get_collaboration_profile` — developer working style classification
-- `nr_observe_get_claudemd_impact` — CLAUDE.md change impact analysis
-- `nr_observe_get_cost_per_outcome` — cost breakdown by task outcome type
-- `nr_observe_get_recommendations` — personalized optimization recommendations
-- `nr_observe_get_personal_insights` — narrative coaching report vs. personal weekly baseline
-- `nr_observe_get_platform_comparison` — side-by-side platform metrics
-
-**Digest and Subscription Tools:**
-
-- `nr_observe_subscribe_digest` — register webhook for weekly summaries
-- `nr_observe_unsubscribe_digest` — disable digest delivery
-- `nr_observe_send_digest` — generate and POST the current week's digest immediately
-
-See [COMMANDS_TABLE.md](./docs/COMMANDS_TABLE.md) for complete tool specifications.
+See [COMMANDS_TABLE.md](./docs/COMMANDS_TABLE.md) for the complete tool catalog (session, cost/budget, workflow/anti-pattern, analytics, cross-session, and digest tools).
 
 ## Configuration
 
@@ -330,37 +167,14 @@ Key config interfaces:
 
 ### Additional Configuration Fields
 
-| Field                      | Env Var                             | Type                                  | Purpose                                                                                                                                                                                                       |
-| -------------------------- | ----------------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `developer`                | `NEW_RELIC_AI_MCP_DEVELOPER`        | string                                | Developer identifier on all NR events. Normalised to lowercase with underscores via `normalizeDeveloperName()`. Falls back to `$USER` → `$USERNAME` → `git config user.name` → `'unknown'` when unset.        |
-| `sessionBudgetUsd`         | `NEW_RELIC_AI_SESSION_BUDGET_USD`   | number                                | Session spend limit (USD)                                                                                                                                                                                     |
-| `dailyBudgetUsd`           | `NEW_RELIC_AI_DAILY_BUDGET_USD`     | number                                | Daily spend limit (USD)                                                                                                                                                                                       |
-| `weeklyBudgetUsd`          | `NEW_RELIC_AI_WEEKLY_BUDGET_USD`    | number                                | Weekly spend limit (USD)                                                                                                                                                                                      |
-| `teamId`                   | `NEW_RELIC_AI_TEAM_ID`              | string                                | Team identifier for aggregation                                                                                                                                                                               |
-| `projectId`                | `NEW_RELIC_AI_PROJECT_ID`           | string                                | Project identifier (auto-derived from git)                                                                                                                                                                    |
-| `orgId`                    | `NEW_RELIC_AI_ORG_ID`               | string                                | Organization identifier                                                                                                                                                                                       |
-| `nrApiKey`                 | `NEW_RELIC_API_KEY`                 | string                                | User API key (NRAK-...) for team summary NerdGraph queries                                                                                                                                                    |
-| `digestWebhookUrl`         | `NEW_RELIC_AI_DIGEST_WEBHOOK_URL`   | string                                | Slack/HTTP webhook for weekly digest                                                                                                                                                                          |
-| `digestSchedule`           | `NEW_RELIC_AI_DIGEST_SCHEDULE`      | string                                | Cron expression for digest delivery                                                                                                                                                                           |
-| `retainSessionsDays`       | `NEW_RELIC_AI_RETAIN_SESSIONS_DAYS` | number                                | Auto-purge sessions older than N days                                                                                                                                                                         |
-| `otlp.endpoint`            | `OTEL_EXPORTER_OTLP_ENDPOINT`       | string \| null                        | OTLP/HTTP endpoint URL (e.g. `https://otlp.nr-data.net` for NR US). When set, enables OTLP export.                                                                                                            |
-| `otlp.headers`             | `OTEL_EXPORTER_OTLP_HEADERS`        | Record\<string, string\>              | Auth headers for OTLP endpoint. Env var uses comma-separated `key=value` pairs.                                                                                                                               |
-| `otlp.transport`           | `NEW_RELIC_AI_TRANSPORT`            | `'nr-events-api' \| 'otlp' \| 'both'` | `nr-events-api` (default): NR APIs only. `otlp`: OTLP only. `both`: concurrent.                                                                                                                               |
-| `otlp.receiverEnabled`     | `NR_AI_OTLP_RECEIVER_ENABLED`       | boolean                               | Enable a local OTLP/HTTP receiver in proxy mode.                                                                                                                                                              |
-| `otlp.receiverPort`        | `NR_AI_OTLP_RECEIVER_PORT`          | number                                | Port for the local OTLP/HTTP receiver. Default `4318`.                                                                                                                                                        |
-| `otlp.receiverBindAddress` | `NR_AI_OTLP_RECEIVER_BIND_ADDRESS`  | string                                | Bind address for the local OTLP/HTTP receiver. Default `127.0.0.1`. Widening this beyond loopback increases exposure to the receiver's auth-timing and rate-limiter characteristics — see `docs/ADVANCED.md`. |
-| `otlp.forwardEndpoint`     | `NR_AI_OTLP_FORWARD_ENDPOINT`       | string \| null                        | Where the receiver forwards enriched payloads. Defaults to NR US OTLP when `licenseKey` is set; `null` to receive and enrich only.                                                                            |
-| `otlp.forwardHeaders`      | `NR_AI_OTLP_FORWARD_HEADERS`        | Record\<string, string\>              | HTTP headers added to every forwarded OTLP request. Defaults to `{ 'api-key': licenseKey }`.                                                                                                                  |
-
-The 8 `otlp.*` fields live under a nested `otlp: {...}` object on the resolved `McpServerConfig`, matching the `dashboard`/`alerts` nesting precedent. The config-file schema (`ConfigFileSchema`) also still accepts the corresponding legacy flat top-level keys (`otlpEndpoint`, `otlpHeaders`, `transport`, `otlpReceiverEnabled`, `otlpReceiverPort`, `otlpReceiverBindAddress`, `otlpForwardEndpoint`, `otlpForwardHeaders`) for backward compatibility — using one logs a deprecation warning naming the specific legacy keys consulted (`pickOtlpValue()` in `loadMcpConfig()`). Env var names are unchanged either way.
-
-`configVersion` (optional, defaults to `1`) is a config-file-only field with no env var or CLI flag — it exists purely as a documented convention (`CURRENT_CONFIG_VERSION` in `src/config.ts`) to bump when a future change to config.json's shape is non-additive (a field renamed, moved, or removed), so a migration path has something to branch on. Every change to date, including the `otlp` nesting above, has been additive.
+Beyond the fields above: per-developer/team/org identifiers, budget caps, digest delivery, session retention, the 8 `otlp.*` OTLP export/receiver fields, `companionMode` (suppresses `ai.cost.*` gauges and tags cost-bearing Claude Code events when the same org also runs Claude Code's built-in OTel export), and `tiers` (multi-tier telemetry routing — fan events out to several NR accounts and/or local JSONL directories, selected per `eventType`; requires `mode: 'cloud'` or `'both'`). See [ADVANCED.md](./docs/ADVANCED.md) for the full field reference, including the legacy flat-key backward-compatibility behavior and the `configVersion` convention.
 
 ### Event Types
 
-| Event Type        | Emitted By      | Use Case                                  |
-| ----------------- | --------------- | ----------------------------------------- |
-| `AiBudgetWarning` | `BudgetTracker` | Budget threshold crossed (50%, 80%, 100%) |
+| Event Type        | Emitted By           | Use Case                                    |
+| ----------------- | -------------------- | ------------------------------------------- |
+| `AiBudgetWarning` | `BudgetTracker`      | Budget threshold crossed (50%, 80%, 100%)   |
+| `AiTurnCost`      | `TurnCostAttributor` | Cost and tokens per tool call and per skill |
 
 ### Team Attribution Fields
 
@@ -393,6 +207,16 @@ All local persistence lives under `~/.newrelic-preflight/` by default:
 
 `NrIngestManager` (in `src/transport/`) wraps `HarvestScheduler` and adds log ingestion.
 
+### Multi-Tier Telemetry Routing
+
+`NrIngestManager` holds one `HarvestScheduler` per NR-type tier (`schedulers: Map<tierName, HarvestScheduler>`) and one `TierLocalWriter` per local-type tier (`localWriters: Map<tierName, TierLocalWriter>`). Every `ingestX()` method emits through the private `routeEvent(event)`, which asks the stateless `TierRouter` (`src/transport/tier-router.ts`) which tiers want that `eventType` and forwards to each. `HarvestScheduler` itself is unmodified — it is simply instantiated more than once, so each tier keeps its own independent retry buffer and backoff and one unreachable NR account never affects another tier.
+
+The **primary tier** is the first NR-type tier in array order. It alone carries the aggregated Metric API stream, the NR Logs API audit entries, the OTLP bridge/transport, and the `getEventSendHealth()` counters — per-tier metrics, logs, and OTLP are explicit non-goals.
+
+`src/transport/tier-types.ts` owns `KNOWN_EVENT_TYPES` (all 14 emitted `eventType` values) and `EVENT_TYPE_SENSITIVITY`, which classifies each as `safe-shared` (aggregate counts/durations/costs) or `personal-only` (raw or lightly-redacted per-call detail: bash commands, file paths, agent descriptions, audit specifics). **Adding a new event type to `nr-ingest.ts` requires adding it to both** — `EVENT_TYPE_SENSITIVITY`'s `Record<KnownEventType, …>` type turns a forgotten entry into a compile error. `validateTiers()` warns (never blocks) when a `personal-only` type is routed to any tier other than `default`.
+
+When the config file has no `tiers` array, `loadMcpConfig()` synthesizes one implicit tier (`name: 'default'`, `eventTypes: ['*']`) from the flat `licenseKey`/`accountId`, in memory only — existing single-account deployments behave exactly as before. An explicit `tiers` array while `mode === 'local'` is a config-load error.
+
 ## Security
 
 See [SECURITY.md](./SECURITY.md) for the full guidelines, invariants, and code review checklist. Key points:
@@ -420,6 +244,10 @@ Run `npm run lint` before committing to verify the lint target is still met.
 ## Testing Conventions
 
 - Co-located test files: `foo.ts` → `foo.test.ts` (same directory)
+- Vitest claims `src/web/**/*.test.{ts,tsx}` (`npm run test:web`); Jest claims
+  `*.test.ts` elsewhere under `src/` and `test/` (`npm test`). Inside `src/web` either
+  extension runs, so use `.tsx` when the file contains JSX. A `.test.tsx` outside
+  `src/web` is claimed by neither runner, so put JSX tests under `src/web`
 - Jest with `ts-jest/presets/default-esm` preset, `node` environment
 - `maxWorkers: 1` to avoid stdio deadlocks
 - Tests mock `process.stderr.write` to suppress logger output
@@ -427,6 +255,20 @@ Run `npm run lint` before committing to verify the lint target is still met.
 - Fake timers (`jest.useFakeTimers()`) for harvest scheduler and poll interval tests
 - Temp directories via `os.tmpdir()` + cleanup in `afterEach` for storage tests
 - See [TEST_PATTERNS.md](./docs/TEST_PATTERNS.md) for full conventions
+
+## Versioning and CHANGELOG
+
+**Never bump the version or edit `CHANGELOG.md` in a PR.** The version is written in `package.json`, `package-lock.json`, `server.json`, `plugin/.claude-plugin/plugin.json`, and `kiro-power/plugin.json`, and only the release PR (`npm run version-packages`) changes them. Instead, add a changeset holding the change's CHANGELOG entry:
+
+```md
+---
+'@newrelic/preflight': patch
+---
+
+The CHANGELOG entry, written for someone who uses Preflight: what changed for them and why.
+```
+
+Save it as `.changeset/<short-descriptive-name>.md`, or run `npx changeset --patch @newrelic/preflight -m "..."`. Use `patch` for fixes, `minor` for new things a user can use (config fields, CLI flags, MCP tools, event attributes), and `major` for breaking changes. A PR that touches only docs, tests, CI, or scripts needs no changeset. One that changes a shipped file without anything a user would notice gets an empty one (`npx changeset --empty`), but bumping a library the dashboard bundles (React, TanStack Query, and the rest of what Vite builds into `dist/web`) changes what users get, so it gets a `patch`. CI's `changeset` job checks that a PR changing a shipped file has a changeset, leaves the version and released CHANGELOG entries alone, and doesn't delete, empty, or lower another pending changeset's bump (edit its text in place instead); it can't check the bump level, so picking it is up to you and the reviewer. See [Changesets](./CONTRIBUTING.md#changesets) for which files count as shipped and how to write the entry.
 
 ## Git Commit Conventions
 
@@ -439,4 +281,4 @@ Run `npm run lint` before committing to verify the lint target is still met.
 
 - Title: short, under 72 characters
 - Body: Summary (bullet points), Test plan (checklist)
-- Always run `npm run build && npm test` before opening
+- Always run the checks in CONTRIBUTING.md's "Before opening a PR" first

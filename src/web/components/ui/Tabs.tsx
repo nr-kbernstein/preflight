@@ -37,7 +37,12 @@ export function Tabs<T extends string = string>({
   ariaLabel,
   className = '',
 }: TabsProps<T>): JSX.Element {
-  const wrapperClasses = ['inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-surface-8', className].filter(Boolean).join(' ');
+  const wrapperClasses = [
+    'inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-surface-8',
+    className,
+  ]
+    .filter(Boolean)
+    .join(' ');
   return (
     <div role="tablist" aria-label={ariaLabel} className={wrapperClasses}>
       {options.map((opt) => {
