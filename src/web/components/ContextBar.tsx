@@ -33,21 +33,21 @@ export interface ContextBarProps {
 const CATEGORIES = ['system', 'tools', 'user', 'assistant'] as const;
 
 const CATEGORY_COLORS: Record<string, string> = {
-  system: 'bg-accent-indigo',
+  system: 'bg-series-5',
   tools: 'bg-accent-amber',
   user: 'bg-accent-blue',
   assistant: 'bg-accent-green',
 };
 
 const CATEGORY_GLOW: Record<string, string> = {
-  system: 'shadow-[0_0_8px_rgba(99,102,241,0.4)]',
+  system: 'shadow-[0_0_8px_rgba(100,116,139,0.4)]',
   tools: 'shadow-[0_0_8px_rgba(255,178,36,0.4)]',
   user: 'shadow-[0_0_8px_rgba(0,149,255,0.4)]',
   assistant: 'shadow-[0_0_8px_rgba(28,231,131,0.4)]',
 };
 
 const CATEGORY_DOT_COLORS: Record<string, string> = {
-  system: 'bg-accent-indigo',
+  system: 'bg-series-5',
   tools: 'bg-accent-amber',
   user: 'bg-accent-blue',
   assistant: 'bg-accent-green',
@@ -61,10 +61,10 @@ const CATEGORY_LABELS: Record<string, string> = {
 };
 
 const CHART_COLORS: Record<string, string> = {
-  system: '#6366f1',
-  tools: '#ffb224',
-  user: '#0095ff',
-  assistant: '#1ce783',
+  system: 'var(--color-series-5)',
+  tools: 'var(--color-accent-amber)',
+  user: 'var(--color-accent-blue)',
+  assistant: 'var(--color-accent-green)',
 };
 
 const CHART_TICK_STYLE = { fontSize: 10, fill: '#6b7280' } as const;

@@ -90,7 +90,7 @@ function CelebrationBurst(): JSX.Element {
           left: '50%',
           top: '50%',
           // Hardcoded hex: short-lived celebration animation; light/dark divergence is acceptable.
-          backgroundColor: i % 3 === 0 ? '#1CE783' : i % 3 === 1 ? '#00D4AA' : '#9945FF',
+          backgroundColor: i % 3 === 0 ? '#1CE783' : i % 3 === 1 ? '#2DD4BF' : '#3B82F6',
           animation: `particle-burst 1s ease-out forwards`,
           animationDelay: `${i * 40}ms`,
           transform: `translate(-50%, -50%) rotate(${angle}deg) translateY(-${distance}px)`,

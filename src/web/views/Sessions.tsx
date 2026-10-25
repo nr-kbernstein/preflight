@@ -481,7 +481,7 @@ export function Sessions(): JSX.Element {
   }, []);
 
   return (
-    <section className="flex flex-col h-full">
+    <section>
       <h1 className="text-xl font-semibold text-ink-base mb-4 shrink-0">Sessions</h1>
 
       {/* Fleet workflow KPIs + filters (consolidated from the former Workflows
@@ -633,7 +633,7 @@ export function Sessions(): JSX.Element {
         )}
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-[300px_1fr] gap-4 flex-1 min-h-0">
+      <div className="grid grid-cols-1 md:grid-cols-[300px_1fr] gap-4 items-start">
         <Card padding="none" tone="static" className="overflow-hidden flex flex-col">
           <header className="px-4 py-3 border-b border-border-subtle">
             <div className="flex items-center justify-between">
@@ -650,7 +650,7 @@ export function Sessions(): JSX.Element {
               </select>
             </div>
           </header>
-          <div className="overflow-auto">
+          <div>
             {list.isLoading && (
               <EmptyState variant="loading" icon="timeline" title="Loading sessions" />
             )}
@@ -702,7 +702,7 @@ export function Sessions(): JSX.Element {
           </div>
         </Card>
 
-        <div className="surface-card p-4 overflow-auto">
+        <div className="surface-card p-4 overflow-auto md:sticky md:top-19 md:max-h-[calc(100dvh-100px)]">
           {!selectedId && (
             <EmptyState
               icon="timeline"

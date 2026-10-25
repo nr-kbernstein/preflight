@@ -37,25 +37,23 @@
 
   /* Semantic / categorical accents */
   --color-accent-green: #10b981;
-  --color-accent-purple: #a78bfa;
   --color-accent-blue: #3b82f6;
   --color-accent-teal: #2dd4bf;
   --color-accent-amber: #f59e0b;
   --color-accent-red: #ef4444;
-  --color-accent-pink: #ec4899;
   --color-accent-coral: #f87171;
-  --color-accent-indigo: #818cf8;
   --color-accent-cyan: #22d3ee;
 
-  /* Categorical ramp — Preline's chart palette (blue, purple, teal, sky,
-     indigo, gray). Use for CATEGORIES only (tool type, outcome, workflow
-     group); status stays on accent-green/amber/red, single-series charts
-     use --color-primary. */
+  /* Categorical ramp (blue, teal, orange, sky, slate, gray). Use for
+     CATEGORIES only (tool type, outcome, workflow group); status stays on
+     accent-green/amber/red, single-series charts use --color-primary.
+     No purple/violet/indigo anywhere in the UI: it reads as a competitor's
+     brand color. */
   --color-series-1: #3b82f6; /* blue */
-  --color-series-2: #a855f7; /* purple */
-  --color-series-3: #2dd4bf; /* teal */
-  --color-series-4: #60a5fa; /* sky */
-  --color-series-5: #818cf8; /* indigo */
+  --color-series-2: #2dd4bf; /* teal */
+  --color-series-3: #fb923c; /* orange */
+  --color-series-4: #7dd3fc; /* sky */
+  --color-series-5: #94a3b8; /* slate */
   --color-series-6: #737373; /* gray */
 
   /* Fonts */
@@ -107,19 +105,17 @@ html.light {
   --color-on-primary: #ffffff;
 
   --color-accent-green: #059669;
-  --color-accent-purple: #7c3aed;
   --color-accent-blue: #2563eb;
   --color-accent-teal: #0d9488;
   --color-accent-amber: #d97706;
   --color-accent-red: #dc2626;
   --color-accent-cyan: #0891b2;
-  --color-accent-indigo: #4f46e5;
 
   --color-series-1: #2563eb; /* blue */
-  --color-series-2: #9333ea; /* purple */
-  --color-series-3: #14b8a6; /* teal */
-  --color-series-4: #60a5fa; /* sky */
-  --color-series-5: #6366f1; /* indigo */
+  --color-series-2: #0d9488; /* teal */
+  --color-series-3: #ea580c; /* orange */
+  --color-series-4: #38bdf8; /* sky */
+  --color-series-5: #64748b; /* slate */
   --color-series-6: #d1d5db; /* gray */
 
   --color-chart-block: rgba(37, 99, 235, 0.65);
@@ -135,7 +131,7 @@ html.light {
 html,
 body,
 #root {
-  height: 100%;
+  min-height: 100%;
 }
 body {
   @apply bg-bg-deep text-ink-base font-sans antialiased;

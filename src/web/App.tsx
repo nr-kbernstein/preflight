@@ -43,14 +43,14 @@ export function App(): JSX.Element {
 
   return (
     <>
-      <div className="flex h-full">
+      <div className="min-h-full">
         <Sidebar
           currentPath={location}
           onNavigate={navigate}
           mobileOpen={mobileNavOpen}
           onCloseMobile={closeMobileNav}
         />
-        <div className="flex flex-col flex-1 min-w-0">
+        <div className="lg:ps-65">
           <TopBar
             currentPath={location}
             onNavigate={navigate}
@@ -62,8 +62,8 @@ export function App(): JSX.Element {
             onOpenMobileNav={() => setMobileNavOpen(true)}
           />
           <AlertBannerStack />
-          <main className="flex-1 overflow-auto">
-            <div className="max-w-screen-2xl mx-auto p-4 sm:p-6 h-full">
+          <main>
+            <div className="max-w-screen-2xl mx-auto p-4 sm:p-6">
               <ErrorBoundary resetKey={location}>
                 <Switch>
                   <Route path="/sessions" component={Sessions} />
