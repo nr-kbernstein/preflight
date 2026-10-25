@@ -804,12 +804,12 @@ function CoachMetricsTable({
 }
 
 function categoryBorderColor(category: string): string {
-  if (category === 'cost_optimization') return 'var(--color-accent-amber)';
-  if (category === 'efficiency') return 'var(--color-accent-red)';
-  if (category === 'prompt_engineering') return 'var(--color-accent-blue)';
-  if (category === 'claudemd') return 'var(--color-accent-purple)';
-  if (category === 'model_selection') return 'var(--color-accent-teal)';
-  return 'var(--color-ink-muted)';
+  if (category === 'cost_optimization') return 'var(--color-series-1)';
+  if (category === 'efficiency') return 'var(--color-series-2)';
+  if (category === 'prompt_engineering') return 'var(--color-series-3)';
+  if (category === 'claudemd') return 'var(--color-series-4)';
+  if (category === 'model_selection') return 'var(--color-series-5)';
+  return 'var(--color-series-6)';
 }
 
 function priorityDotColor(priority: 'high' | 'medium' | 'low'): string {

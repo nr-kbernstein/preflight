@@ -39,7 +39,7 @@ const TOOLTIP_STYLE = {
   color: 'var(--color-ink-base)',
 };
 const BAR_FILL = 'var(--color-chart-block)';
-const LINE_STROKE = 'var(--color-accent-green)';
+const LINE_STROKE = 'var(--color-series-2)';
 
 interface SpendBarsTooltipProps {
   readonly active?: boolean;

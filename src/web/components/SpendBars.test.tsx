@@ -80,7 +80,7 @@ describe('SpendBars', () => {
       const paths = Array.from(container.querySelectorAll('path'));
       const solidLine = paths.some(
         (el) =>
-          el.getAttribute('stroke') === 'var(--color-accent-green)' &&
+          el.getAttribute('stroke') === 'var(--color-series-2)' &&
           !el.hasAttribute('stroke-dasharray'),
       );
       const dashedLine = paths.some((el) => el.getAttribute('stroke-dasharray') === '4 3');
@@ -116,8 +116,8 @@ describe('SpendBars', () => {
       const hasProjectedLine = allElements.some(
         (el) =>
           (el.getAttribute('stroke-dasharray') === '4 3' &&
-            el.getAttribute('stroke') === 'var(--color-accent-green)') ||
-          el.getAttribute('stroke') === 'var(--color-accent-green)',
+            el.getAttribute('stroke') === 'var(--color-series-2)') ||
+          el.getAttribute('stroke') === 'var(--color-series-2)',
       );
       expect(hasProjectedLine).toBe(true);
     });

@@ -2617,7 +2617,9 @@ describe('Today view — Activity today panel', () => {
 
     renderToday();
 
-    const panel = (await screen.findByText('Activity today')).closest('.surface-card') as HTMLElement;
+    const panel = (await screen.findByText('Activity today')).closest(
+      '.surface-card',
+    ) as HTMLElement;
     expect(within(panel).getByText('Tool calls')).toBeInTheDocument();
     expect(within(panel).getByText('Concurrent sessions')).toBeInTheDocument();
     expect(within(panel).queryByText('Spend by hour')).toBeNull();
