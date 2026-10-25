@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import type { JSX } from 'react';
+import { useMemo, useRef, useState } from 'react';
+import type { JSX, KeyboardEvent } from 'react';
 
 export interface ActivityHeatmapProps {
   readonly variant: 'strip' | 'grid';
@@ -13,6 +13,8 @@ export interface ActivityHeatmapProps {
   readonly ariaLabel?: string;
   /** For grid variant: array of {date, count} */
   readonly days?: ReadonlyArray<{ date: string; count: number }>;
+  /** Grid variant: completes the "N tool calls …" header. */
+  readonly periodLabel?: string;
 }
 
 const INTENSITY_LEVELS = 5;
@@ -47,6 +49,7 @@ export function ActivityHeatmap({
   height,
   ariaLabel,
   days,
+  periodLabel,
 }: ActivityHeatmapProps): JSX.Element {
   if (variant === 'grid' && days) {
     return (
@@ -56,6 +59,7 @@ export function ActivityHeatmap({
         width={width}
         height={height}
         ariaLabel={ariaLabel}
+        periodLabel={periodLabel}
       />
     );
   }
@@ -152,12 +156,42 @@ interface GridProps {
   readonly width?: number;
   readonly height?: number;
   readonly ariaLabel?: string;
+  /** Completes "N tool calls …" in the header, e.g. "in the last 12 months". */
+  readonly periodLabel?: string;
 }
 
 const DAY_LABELS = ['Mon', '', 'Wed', '', 'Fri', '', 'Sun'];
 
-function GridHeatmap({ days, maxCount, ariaLabel }: GridProps): JSX.Element {
-  const [tooltip, setTooltip] = useState<{ x: number; y: number; text: string } | null>(null);
+const TOOLTIP_ALIGN = {
+  start: '-translate-x-2',
+  center: '-translate-x-1/2',
+  end: '-translate-x-[calc(100%-0.5rem)]',
+} as const;
+
+function formatGridDate(date: string): string {
+  // UTC-anchored day key — format in UTC so the label matches the cell's row.
+  return new Date(date).toLocaleDateString(undefined, {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    timeZone: 'UTC',
+  });
+}
+
+function GridHeatmap({ days, maxCount, ariaLabel, periodLabel }: GridProps): JSX.Element {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const cellRefs = useRef<Array<SVGRectElement | null>>([]);
+  // One shared tooltip that glides between cells (CSS transition on left/top)
+  // instead of a fresh tooltip per hover.
+  const [active, setActive] = useState<{
+    index: number;
+    x: number;
+    y: number;
+    align: 'start' | 'center' | 'end';
+  } | null>(null);
+  // Roving tabindex: one cell is in the tab order (the newest by default), and
+  // arrow keys move between days, so the grid is one tab stop, not 364.
+  const [focusIndex, setFocusIndex] = useState<number | null>(null);
 
   const grid = useMemo(() => {
     if (days.length === 0) return { weeks: 0, cells: [] };
@@ -178,6 +212,8 @@ function GridHeatmap({ days, maxCount, ariaLabel }: GridProps): JSX.Element {
     const weeks = cells.length > 0 ? cells[cells.length - 1]!.col + 1 : 0;
     return { weeks, cells };
   }, [days]);
+
+  const total = useMemo(() => days.reduce((sum, d) => sum + d.count, 0), [days]);
 
   const cellSize = 10;
   const cellGap = 2;
@@ -202,19 +238,90 @@ function GridHeatmap({ days, maxCount, ariaLabel }: GridProps): JSX.Element {
         lastMonth = month;
       }
     }
-    return labels;
+    // A partial first month can start one column before the next month's
+    // label, and the two words overprint ("OctNov"). Drop the cramped one.
+    return labels.filter((l, i) => {
+      const next = labels[i + 1];
+      return !next || next.col - l.col >= 3;
+    });
   }, [grid.cells]);
 
+  const lastIndex = grid.cells.length - 1;
+  const tabIndexCell = focusIndex ?? lastIndex;
+
+  function showTooltip(index: number): void {
+    const rect = cellRefs.current[index];
+    const container = containerRef.current;
+    if (!rect || !container) return;
+    // Measure in CSS pixels: the SVG scales to its container, so viewBox units
+    // (rect.x.baseVal) don't match where the cell actually sits on screen.
+    const r = rect.getBoundingClientRect();
+    const c = container.getBoundingClientRect();
+    const x = r.left - c.left + r.width / 2;
+    // Anchor the tooltip's edge instead of its center near the panel's sides
+    // so it isn't clipped by the card.
+    const align = x < 110 ? 'start' : x > c.width - 110 ? 'end' : 'center';
+    setActive({ index, x, y: r.top - c.top, align });
+  }
+
+  function moveFocus(index: number): void {
+    const clamped = Math.min(Math.max(index, 0), lastIndex);
+    setFocusIndex(clamped);
+    cellRefs.current[clamped]?.focus();
+    // Focus moved from inside a keydown handler doesn't reliably re-enter
+    // React's onFocus, so move the tooltip explicitly.
+    showTooltip(clamped);
+  }
+
+  function handleKeyDown(e: KeyboardEvent<SVGRectElement>, index: number): void {
+    const step: Record<string, number> = {
+      ArrowUp: -1,
+      ArrowDown: 1,
+      ArrowLeft: -7,
+      ArrowRight: 7,
+      Home: -index,
+      End: lastIndex - index,
+    };
+    const delta = step[e.key];
+    if (delta === undefined) return;
+    e.preventDefault();
+    moveFocus(index + delta);
+  }
+
+  const activeCell = active ? grid.cells[active.index] : undefined;
+
   return (
-    <div className="relative flex justify-center">
+    <div ref={containerRef} className="relative">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <div className="text-sm text-ink-subtle">
+          <span data-testid="heatmap-total" className="font-semibold text-ink-base tabular-nums">
+            {total.toLocaleString()}
+          </span>{' '}
+          tool calls {periodLabel ?? `over ${days.length} days`}
+        </div>
+        <div className="flex items-center gap-1 text-[11px] text-ink-muted">
+          <span>Less</span>
+          {COLORS.map((color, i) => (
+            <span
+              key={i}
+              className="inline-block size-2.5 rounded-sm"
+              style={{ backgroundColor: color }}
+            />
+          ))}
+          <span>More</span>
+        </div>
+      </div>
+      {/* Width-driven: the grid scales up to fill a full-width panel (height
+          follows from the viewBox) instead of sitting tiny and centered. */}
       <svg
         width="100%"
-        height={svgHeight}
-        role="img"
+        style={{ height: 'auto', maxHeight: svgHeight * 2.2 }}
+        role="group"
         aria-label={ariaLabel ?? `Activity grid: ${days.length} days`}
         viewBox={`0 0 ${svgWidth} ${svgHeight}`}
         preserveAspectRatio="xMidYMid meet"
-        onMouseLeave={() => setTooltip(null)}
+        className="overflow-visible"
+        onMouseLeave={() => setActive(null)}
       >
         {/* Day-of-week labels */}
         {DAY_LABELS.map((label, i) =>
@@ -244,49 +351,47 @@ function GridHeatmap({ days, maxCount, ariaLabel }: GridProps): JSX.Element {
           </text>
         ))}
 
-        {/* Cells */}
+        {/* Cells — the reveal ripples outward from today (the last cell). */}
         {grid.cells.map((cell, i) => (
           <rect
             key={i}
+            ref={(el) => {
+              cellRefs.current[i] = el;
+            }}
             x={labelWidth + cell.col * (cellSize + cellGap)}
             y={headerHeight + cell.row * (cellSize + cellGap)}
             width={cellSize}
             height={cellSize}
             rx={2}
             fill={intensityColor(cell.count, maxCount)}
-            className="heatmap-cell"
-            style={{ animationDelay: `${Math.min(i * 3, 300)}ms` }}
-            onMouseEnter={(e) => {
-              const rect = e.currentTarget as SVGRectElement;
-              setTooltip({
-                x: rect.x.baseVal.value,
-                y: rect.y.baseVal.value - 16,
-                text: `${cell.date}: ${cell.count} calls`,
-              });
+            tabIndex={i === tabIndexCell ? 0 : -1}
+            role="img"
+            aria-label={`${formatGridDate(cell.date)}: ${cell.count.toLocaleString()} tool calls`}
+            className={
+              'heatmap-cell outline-none focus-visible:stroke-primary focus-visible:[stroke-width:1.5] ' +
+              (active?.index === i ? 'stroke-ink-base [stroke-width:1]' : '')
+            }
+            style={{ animationDelay: `${Math.min((lastIndex - i) * 2, 600)}ms` }}
+            onMouseEnter={() => showTooltip(i)}
+            onFocus={() => {
+              setFocusIndex(i);
+              showTooltip(i);
             }}
+            onBlur={() => setActive(null)}
+            onKeyDown={(e) => handleKeyDown(e, i)}
           />
         ))}
       </svg>
-      {tooltip && (
+      {active && activeCell && (
         <div
-          className="absolute px-1.5 py-0.5 bg-bg-elevated border border-border-subtle text-[10px] text-ink-base rounded-md shadow-md pointer-events-none whitespace-nowrap tabular-nums"
-          style={{ left: tooltip.x, top: tooltip.y }}
+          role="tooltip"
+          className={`absolute z-10 ${TOOLTIP_ALIGN[active.align]} -translate-y-full -mt-2 px-2 py-1 bg-bg-elevated border border-border-subtle text-xs text-ink-base rounded-md shadow-md pointer-events-none whitespace-nowrap tabular-nums transition-[left,top] duration-150 ease-out motion-reduce:transition-none`}
+          style={{ left: active.x, top: active.y }}
         >
-          {tooltip.text}
+          <span className="font-semibold">{activeCell.count.toLocaleString()} tool calls</span>
+          <span className="text-ink-muted"> · {formatGridDate(activeCell.date)}</span>
         </div>
       )}
-      {/* Color legend */}
-      <div className="flex items-center gap-1 mt-1.5 text-[10px] text-ink-muted">
-        <span>Less</span>
-        {COLORS.map((color, i) => (
-          <span
-            key={i}
-            className="inline-block w-2.5 h-2.5 rounded-sm"
-            style={{ backgroundColor: color }}
-          />
-        ))}
-        <span>More</span>
-      </div>
     </div>
   );
 }

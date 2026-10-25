@@ -87,6 +87,7 @@ import {
 } from '../lib/format';
 import { isSameLocalDay, localStartOfDay, todayPortionRatio } from '../../lib/date.js';
 import { buildWeekForecast } from '../lib/forecast.js';
+import { cumulativeHourly } from '../lib/kpi-series';
 
 const HEADER_TIMESTAMP_FORMAT = {
   weekday: 'short',
@@ -279,6 +280,7 @@ export function Today(): JSX.Element {
     [todaySessions],
   );
   const hourlySpend = useMemo(() => buildHourlySpend(todaySessions ?? []), [todaySessions]);
+  const spendTrend = useMemo(() => cumulativeHourly(hourlySpend), [hourlySpend]);
 
   // Fallback source for the attention panel's anti-pattern flags when
   // neither the live SSE store nor this process's own /api/anti-patterns has
@@ -463,6 +465,11 @@ export function Today(): JSX.Element {
                 <Kpi
                   label="spend today"
                   value={spendLoading ? '…' : formatUsd(todayTotal)}
+                  series={spendTrend.values}
+                  seriesLabels={spendTrend.labels}
+                  seriesCaption="Cumulative, by hour"
+                  formatPoint={formatUsd}
+                  deltaPercent={null}
                   sub={
                     forecastKpiUsd != null && forecastKpiUsd > todayTotal
                       ? weekForecast != null

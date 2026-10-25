@@ -552,7 +552,7 @@ describe('History view', () => {
   it('uses the real 12-week window in the activity heatmap aria-label', async () => {
     renderHistory();
     await waitFor(() =>
-      expect(screen.getByLabelText('Daily activity heatmap for the last 12 weeks')).toBeTruthy(),
+      expect(screen.getByLabelText('Daily tool calls for the last 12 months')).toBeTruthy(),
     );
   });
 
@@ -751,9 +751,10 @@ describe('History — window', () => {
     }
   });
 
-  it('labels the three fixed-window panels "Last 12 weeks" instead of the page window', async () => {
+  it('labels the fixed-window panels with their own range instead of the page window', async () => {
     renderHistory();
-    await waitFor(() => expect(screen.getAllByText('Last 12 weeks').length).toBe(3));
+    await waitFor(() => expect(screen.getAllByText('Last 12 weeks').length).toBe(2));
+    expect(screen.getByText('Last 12 months')).toBeInTheDocument();
   });
 });
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { render } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { ActivityHeatmap } from './ActivityHeatmap';
 
 describe('ActivityHeatmap grid variant — timezone handling', () => {
@@ -58,5 +58,48 @@ describe('ActivityHeatmap strip variant', () => {
     const rects = container.querySelectorAll('rect');
     expect(rects[0]).toHaveAttribute('fill', 'var(--color-heatmap-0)');
     expect(rects[1]).toHaveAttribute('fill', 'var(--color-heatmap-4)');
+  });
+});
+
+describe('ActivityHeatmap grid variant interactions', () => {
+  const DAYS = [
+    { date: '2026-07-06', count: 1 },
+    { date: '2026-07-07', count: 0 },
+    { date: '2026-07-08', count: 4 },
+  ];
+
+  it('shows the total in the header with the period label', () => {
+    render(
+      <ActivityHeatmap
+        variant="grid"
+        buckets={[]}
+        maxCount={4}
+        days={DAYS}
+        periodLabel="in the last 12 months"
+      />,
+    );
+    expect(screen.getByTestId('heatmap-total').textContent).toBe('5');
+    expect(screen.getByText(/tool calls in the last 12 months/)).toBeInTheDocument();
+  });
+
+  it('puts only the newest cell in the tab order and labels every cell', () => {
+    const { container } = render(
+      <ActivityHeatmap variant="grid" buckets={[]} maxCount={4} days={DAYS} />,
+    );
+    const rects = Array.from(container.querySelectorAll('rect'));
+    expect(rects.map((r) => r.getAttribute('tabindex'))).toEqual(['-1', '-1', '0']);
+    expect(rects[2]!.getAttribute('aria-label')).toMatch(/4 tool calls$/);
+  });
+
+  it('moves focus between days with arrow keys and shows one tooltip', () => {
+    const { container } = render(
+      <ActivityHeatmap variant="grid" buckets={[]} maxCount={4} days={DAYS} />,
+    );
+    const rects = Array.from(container.querySelectorAll('rect'));
+    act(() => rects[2]!.focus());
+    fireEvent.keyDown(rects[2]!, { key: 'ArrowUp' });
+    expect(document.activeElement).toBe(rects[1]);
+    expect(screen.getAllByRole('tooltip')).toHaveLength(1);
+    expect(screen.getByRole('tooltip').textContent).toMatch(/^0 tool calls/);
   });
 });

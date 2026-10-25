@@ -62,6 +62,7 @@ import {
   formatUsdOrDash,
 } from '../lib/format';
 import { buildWeekForecast, buildMonthForecast } from '../lib/forecast.js';
+import { buildDailyKpiSeries, halfOverHalfPercent } from '../lib/kpi-series';
 
 interface SessionRow {
   readonly sessionId: string;
@@ -301,7 +302,7 @@ export function History(): JSX.Element {
 
   const activityGrid = useQuery<ActivityHeatmapHistoryResponse>({
     queryKey: qk.activityHeatmap('history'),
-    queryFn: ({ signal }) => fetchActivityHeatmap('history', 12, signal),
+    queryFn: ({ signal }) => fetchActivityHeatmap('history', 52, signal),
   });
 
   const concurrencyHistory = useQuery<ConcurrencyHistoryResponse>({
@@ -390,6 +391,8 @@ export function History(): JSX.Element {
       ? `Cost/token breakdown only available for ${attributedSessionCount} of ${totalSessionCount} sessions in this window — older sessions predate per-tool attribution.`
       : null;
   const kpis = computeHistoryKpis(windowSessions);
+  const trend = buildDailyKpiSeries(windowSessions, windowNum);
+  const trendCaption = `Daily · ${windowSubtitle(windowNum).toLowerCase()}`;
 
   return (
     <section>
@@ -422,6 +425,11 @@ export function History(): JSX.Element {
               animate
               numericValue={kpis.spendUsd}
               format={formatUsd}
+              series={trend.spend.values}
+              seriesLabels={trend.spend.labels}
+              seriesCaption={trendCaption}
+              deltaPercent={halfOverHalfPercent(trend.spend.values)}
+              trend="neutral"
             />
           </Card>
           <Card>
@@ -430,6 +438,11 @@ export function History(): JSX.Element {
               value={String(kpis.sessionCount)}
               animate
               numericValue={kpis.sessionCount}
+              series={trend.sessions.values}
+              seriesLabels={trend.sessions.labels}
+              seriesCaption={trendCaption}
+              deltaPercent={halfOverHalfPercent(trend.sessions.values)}
+              trend="neutral"
             />
           </Card>
           <Card>
@@ -439,10 +452,25 @@ export function History(): JSX.Element {
               {...(kpis.avgEfficiency !== null
                 ? { animate: true, numericValue: Math.round(kpis.avgEfficiency * 100), suffix: '%' }
                 : {})}
+              series={trend.efficiencyPct.values}
+              seriesLabels={trend.efficiencyPct.labels}
+              seriesCaption="Daily average, days with sessions"
+              formatPoint={(n) => formatPct(n)}
+              deltaPercent={halfOverHalfPercent(trend.efficiencyPct.values)}
+              trend="up-is-good"
             />
           </Card>
           <Card>
-            <Kpi label="avg cost / session" value={formatUsdOrDash(kpis.avgCostPerSession)} />
+            <Kpi
+              label="avg cost / session"
+              value={formatUsdOrDash(kpis.avgCostPerSession)}
+              series={trend.avgCost.values}
+              seriesLabels={trend.avgCost.labels}
+              seriesCaption="Daily average, days with sessions"
+              formatPoint={formatUsd}
+              deltaPercent={halfOverHalfPercent(trend.avgCost.values)}
+              trend="down-is-good"
+            />
           </Card>
           <Card>
             <Kpi
@@ -451,6 +479,11 @@ export function History(): JSX.Element {
               value={String(kpis.flags)}
               animate
               numericValue={kpis.flags}
+              series={trend.flags.values}
+              seriesLabels={trend.flags.labels}
+              seriesCaption={trendCaption}
+              deltaPercent={halfOverHalfPercent(trend.flags.values)}
+              trend="down-is-good"
             />
           </Card>
         </div>
@@ -621,7 +654,7 @@ export function History(): JSX.Element {
         </Panel>
       </div>
 
-      <div className="grid grid-cols-3 gap-3 mt-3">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
         <Panel title="Weekly efficiency" subtitle="Last 12 weeks">
           <div className="h-44 min-w-0">
             <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
@@ -686,11 +719,13 @@ export function History(): JSX.Element {
             </div>
           )}
         </Panel>
+      </div>
 
+      <div className="mt-4">
         <ActivityPanel data={activityGrid.data} />
       </div>
 
-      <div className="grid grid-cols-2 gap-3 mt-3">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
         <CoachCard data={coach.data} />
         <RecommendationsPanel data={recommendations.data} isError={recommendations.isError} />
       </div>
@@ -1085,7 +1120,7 @@ function ActivityPanel({
   data: ActivityHeatmapHistoryResponse | undefined;
 }): JSX.Element {
   return (
-    <Panel title="Activity heatmap" subtitle="Last 12 weeks">
+    <Panel title="Activity" subtitle="Last 12 months">
       {!data ? (
         <EmptyState variant="loading" title="Loading activity…" />
       ) : data.days.length === 0 ? (
@@ -1096,7 +1131,8 @@ function ActivityPanel({
           buckets={[]}
           maxCount={data.maxCount}
           days={data.days}
-          ariaLabel="Daily activity heatmap for the last 12 weeks"
+          ariaLabel="Daily tool calls for the last 12 months"
+          periodLabel="in the last 12 months"
         />
       )}
     </Panel>
