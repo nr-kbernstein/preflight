@@ -70,7 +70,7 @@ function Th({ column, label, sortKey, sortDir, onSort, className = '' }: ThProps
       <button
         type="button"
         onClick={() => onSort(column)}
-        className="inline-flex items-center gap-1 cursor-pointer hover:text-ink-subtle transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded-sm"
+        className="inline-flex items-center gap-1 cursor-pointer hover:text-ink-subtle transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
       >
         {label}
         <SortIcon column={column} sortKey={sortKey} sortDir={sortDir} />
@@ -185,7 +185,7 @@ export function AgentTable({ agents }: AgentTableProps): JSX.Element {
                     title={agent.agentId}
                     aria-label={`Copy agent ID ${agent.agentId}`}
                     onClick={() => void handleCopyAgentId(agent.agentId)}
-                    className="text-left text-ink-base font-medium truncate hover:text-accent-cyan transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded"
+                    className="text-left text-ink-base font-medium truncate hover:text-primary transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded"
                   >
                     {copied === agent.agentId ? (
                       <span className="text-accent-green">Copied!</span>

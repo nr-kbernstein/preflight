@@ -19,9 +19,9 @@ export function SectionHeader({
   return (
     <div className={wrapperClasses}>
       <div className="min-w-0">
-        <div className="text-sm font-medium text-ink-base">{title}</div>
+        <div className="text-base font-semibold text-ink-base">{title}</div>
         {subtitle !== undefined && subtitle !== null && (
-          <div className="text-xs text-ink-muted">{subtitle}</div>
+          <div className="text-sm text-ink-muted">{subtitle}</div>
         )}
       </div>
       {action !== undefined && action !== null && (

@@ -58,14 +58,14 @@ export function Kpi({
       : value;
 
   const valueClass = hero
-    ? 'text-3xl font-bold mt-1 tabular-nums gradient-text'
-    : `text-3xl font-bold mt-1 tabular-nums ${TONE[tone]}`;
+    ? 'text-2xl font-semibold mt-1 tabular-nums text-primary'
+    : `text-2xl font-semibold mt-1 tabular-nums ${TONE[tone]}`;
 
   return (
-    <div className="px-1">
-      <div className="text-[10px] text-ink-muted uppercase tracking-wider font-medium">{label}</div>
+    <div>
+      <div className="text-xs text-ink-muted uppercase tracking-wide">{label}</div>
       <div className={valueClass}>{display}</div>
-      {sub && <div className="text-[10px] text-ink-muted mt-0.5">{sub}</div>}
+      {sub && <div className="text-xs text-ink-muted mt-1">{sub}</div>}
     </div>
   );
 }

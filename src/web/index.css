@@ -1,12 +1,17 @@
 @import 'tailwindcss';
 
 @theme {
-  /* Backgrounds — near-black charcoal (NR marketing site) */
-  --color-bg-deep: #07090d;
-  --color-bg-base: #0d1117;
-  --color-bg-panel: #161b22;
-  --color-bg-elevated: #1c2129;
-  --color-bg-line: #ffffff14;
+  /* Preline-style neutral layout palette. Dark mode is the @theme default;
+     html.light overrides below. Roles:
+       bg-deep     page canvas (behind cards)
+       bg-base     card / sidebar / header surface
+       bg-panel    inset tiles inside a card (gray-100 in light)
+       bg-elevated tooltips, kbd chips, popovers */
+  --color-bg-deep: #171717;
+  --color-bg-base: #262626;
+  --color-bg-panel: #2f2f2f;
+  --color-bg-elevated: #404040;
+  --color-bg-line: #404040;
 
   /* Surface overlays — white-based for dark, black-based for light */
   --color-surface-3: rgba(255, 255, 255, 0.03);
@@ -14,39 +19,44 @@
   --color-surface-8: rgba(255, 255, 255, 0.08);
 
   /* Border overlays */
-  --color-border-subtle: rgba(255, 255, 255, 0.06);
-  --color-border-medium: rgba(255, 255, 255, 0.1);
-  --color-border-strong: rgba(255, 255, 255, 0.15);
+  --color-border-subtle: #404040;
+  --color-border-medium: #525252;
+  --color-border-strong: #737373;
 
-  /* Text — high contrast white + muted gray-blue */
-  --color-ink-base: #ffffff;
-  --color-ink-subtle: #8e9bae;
-  --color-ink-muted: #4d5969;
+  /* Text — neutral-200 / 400 / 500 */
+  --color-ink-base: #e5e5e5;
+  --color-ink-subtle: #a3a3a3;
+  --color-ink-muted: #737373;
 
-  /* NR Signature Palette */
-  --color-accent-green: #1ce783;
-  --color-accent-purple: #9945ff;
-  --color-accent-blue: #0095ff;
-  --color-accent-teal: #00d4aa;
-  --color-accent-amber: #ffb224;
-  --color-accent-red: #ff4c4c;
-  --color-accent-pink: #e94e8a;
-  --color-accent-coral: #ff6b6b;
-  --color-accent-indigo: #6366f1;
+  /* Primary action color (Preline blue). Drives nav, buttons, tabs, focus,
+     and hero numbers; the accent-* palette below stays semantic. */
+  --color-primary: #3b82f6;
+  --color-primary-hover: #60a5fa;
+  --color-primary-soft: rgba(59, 130, 246, 0.15);
+  --color-on-primary: #ffffff;
 
-  /* Cyan is now a distinct color (no longer aliased to green) */
+  /* Semantic / categorical accents */
+  --color-accent-green: #10b981;
+  --color-accent-purple: #a78bfa;
+  --color-accent-blue: #3b82f6;
+  --color-accent-teal: #2dd4bf;
+  --color-accent-amber: #f59e0b;
+  --color-accent-red: #ef4444;
+  --color-accent-pink: #ec4899;
+  --color-accent-coral: #f87171;
+  --color-accent-indigo: #818cf8;
   --color-accent-cyan: #22d3ee;
 
-  /* Categorical "series" ramp — non-semantic, for grouping/categories only.
-     Deliberately lower-saturation than the status/tool accents so a series bar
-     reads as a CATEGORY, never as a status. Used by the agent swimlane chart to
-     color workflow-run groups. Tuned for bars sitting on #07090d / #161b22. */
-  --color-series-1: #6e8bd6; /* periwinkle */
-  --color-series-2: #b083d9; /* muted violet */
-  --color-series-3: #d98aa8; /* dusty rose */
-  --color-series-4: #5fa8a0; /* muted seafoam */
-  --color-series-5: #c2a25e; /* ochre */
-  --color-series-6: #8a93a6; /* slate */
+  /* Categorical ramp — Preline's chart palette (blue, purple, teal, sky,
+     indigo, gray). Use for CATEGORIES only (tool type, outcome, workflow
+     group); status stays on accent-green/amber/red, single-series charts
+     use --color-primary. */
+  --color-series-1: #3b82f6; /* blue */
+  --color-series-2: #a855f7; /* purple */
+  --color-series-3: #2dd4bf; /* teal */
+  --color-series-4: #60a5fa; /* sky */
+  --color-series-5: #818cf8; /* indigo */
+  --color-series-6: #737373; /* gray */
 
   /* Fonts */
   --font-sans: 'Inter', system-ui, sans-serif;
@@ -55,70 +65,71 @@
   /* Radius tokens — Tailwind v4 generates rounded-* utilities from these */
   --radius-sm: 4px;
   --radius-md: 8px;
-  --radius-lg: 12px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
   --radius-pill: 9999px;
 
   /* Chart fills — used inside SVG fill attributes for concurrency block charts */
-  --color-chart-block: rgba(0, 212, 170, 0.7);
-  --color-chart-block-peak: rgba(0, 212, 170, 1);
+  --color-chart-block: rgba(59, 130, 246, 0.7);
+  --color-chart-block-peak: rgba(59, 130, 246, 1);
 
-  /* Activity heatmap intensity scale — purple in dark mode */
-  --color-heatmap-0: rgba(255, 255, 255, 0.03);
-  --color-heatmap-1: rgba(153, 69, 255, 0.2);
-  --color-heatmap-2: rgba(153, 69, 255, 0.4);
-  --color-heatmap-3: rgba(153, 69, 255, 0.65);
-  --color-heatmap-4: rgba(153, 69, 255, 0.9);
+  /* Activity heatmap intensity scale */
+  --color-heatmap-0: rgba(255, 255, 255, 0.04);
+  --color-heatmap-1: rgba(59, 130, 246, 0.25);
+  --color-heatmap-2: rgba(59, 130, 246, 0.45);
+  --color-heatmap-3: rgba(59, 130, 246, 0.7);
+  --color-heatmap-4: rgba(59, 130, 246, 0.95);
 }
 
-/* ───── Light mode overrides ───── */
+/* ───── Light mode overrides (Tailwind gray scale, Preline defaults) ───── */
 html.light {
-  --color-bg-deep: #f7f8fa;
+  --color-bg-deep: #f9fafb;
   --color-bg-base: #ffffff;
-  --color-bg-panel: #f1f3f5;
-  --color-bg-elevated: #e9ecef;
-  --color-bg-line: rgba(0, 0, 0, 0.06);
+  --color-bg-panel: #f3f4f6;
+  --color-bg-elevated: #ffffff;
+  --color-bg-line: #e5e7eb;
 
   --color-surface-3: rgba(0, 0, 0, 0.02);
   --color-surface-5: rgba(0, 0, 0, 0.04);
   --color-surface-8: rgba(0, 0, 0, 0.06);
 
-  --color-border-subtle: rgba(0, 0, 0, 0.08);
-  --color-border-medium: rgba(0, 0, 0, 0.12);
-  --color-border-strong: rgba(0, 0, 0, 0.18);
+  --color-border-subtle: #e5e7eb;
+  --color-border-medium: #d1d5db;
+  --color-border-strong: #9ca3af;
 
-  --color-ink-base: #1a1a2e;
-  --color-ink-subtle: #495057;
-  --color-ink-muted: #868e96;
+  --color-ink-base: #1f2937;
+  --color-ink-subtle: #4b5563;
+  --color-ink-muted: #6b7280;
 
-  --color-accent-green: #0fa968;
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-primary-soft: #eff6ff;
+  --color-on-primary: #ffffff;
+
+  --color-accent-green: #059669;
   --color-accent-purple: #7c3aed;
-  --color-accent-blue: #0078d4;
-  --color-accent-teal: #0a9b80;
+  --color-accent-blue: #2563eb;
+  --color-accent-teal: #0d9488;
   --color-accent-amber: #d97706;
   --color-accent-red: #dc2626;
   --color-accent-cyan: #0891b2;
   --color-accent-indigo: #4f46e5;
 
-  /* Categorical "series" ramp — darkened for adequate contrast on light bg.
-     Same non-semantic, muted-vs-accents intent as the dark values above. Tuned
-     for bars sitting on #f7f8fa / #f1f3f5. */
-  --color-series-1: #4760b0; /* periwinkle */
-  --color-series-2: #8a55b8; /* muted violet */
-  --color-series-3: #b35878; /* dusty rose */
-  --color-series-4: #3f8077; /* muted seafoam */
-  --color-series-5: #927b3e; /* ochre */
-  --color-series-6: #5c6577; /* slate */
+  --color-series-1: #2563eb; /* blue */
+  --color-series-2: #9333ea; /* purple */
+  --color-series-3: #14b8a6; /* teal */
+  --color-series-4: #60a5fa; /* sky */
+  --color-series-5: #6366f1; /* indigo */
+  --color-series-6: #d1d5db; /* gray */
 
-  /* Chart fills in light mode — slightly darker teal for contrast on white */
-  --color-chart-block: rgba(10, 155, 128, 0.7);
-  --color-chart-block-peak: rgba(10, 155, 128, 1);
+  --color-chart-block: rgba(37, 99, 235, 0.65);
+  --color-chart-block-peak: rgba(37, 99, 235, 1);
 
-  /* Heatmap intensity in light mode — purple darkened so low intensities are visible on light bg */
-  --color-heatmap-0: rgba(0, 0, 0, 0.04);
-  --color-heatmap-1: rgba(124, 58, 237, 0.2);
-  --color-heatmap-2: rgba(124, 58, 237, 0.4);
-  --color-heatmap-3: rgba(124, 58, 237, 0.65);
-  --color-heatmap-4: rgba(124, 58, 237, 0.9);
+  --color-heatmap-0: #f3f4f6;
+  --color-heatmap-1: rgba(37, 99, 235, 0.2);
+  --color-heatmap-2: rgba(37, 99, 235, 0.4);
+  --color-heatmap-3: rgba(37, 99, 235, 0.65);
+  --color-heatmap-4: rgba(37, 99, 235, 0.9);
 }
 
 html,
@@ -127,135 +138,15 @@ body,
   height: 100%;
 }
 body {
-  @apply bg-bg-deep text-ink-base font-sans;
+  @apply bg-bg-deep text-ink-base font-sans antialiased;
 }
 
-/* NR Marketing Site - Glass card treatment */
-.glass-card {
-  background: var(--color-surface-3);
+/* Card surface — white panel, hairline border, 1px drop (Preline shadow-2xs) */
+.surface-card {
+  background: var(--color-bg-base);
   border: 1px solid var(--color-border-subtle);
   border-radius: 12px;
-  backdrop-filter: blur(12px);
-}
-
-.glass-card:not(.glass-card-static):hover {
-  background: var(--color-surface-5);
-  border-color: var(--color-border-medium);
-}
-
-/* Light mode: glass card uses subtle shadow instead of backdrop glow */
-html.light .glass-card {
-  backdrop-filter: none;
-  box-shadow:
-    0 1px 3px rgba(0, 0, 0, 0.04),
-    0 1px 2px rgba(0, 0, 0, 0.03);
-}
-
-html.light .glass-card:not(.glass-card-static):hover {
-  box-shadow:
-    0 2px 6px rgba(0, 0, 0, 0.06),
-    0 1px 3px rgba(0, 0, 0, 0.04);
-}
-
-/* Preflight brand text (yellow-green, matches logo gradient) */
-.brand-text {
-  width: fit-content;
-  background: linear-gradient(90deg, #d2fa37 0%, #1ce783 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-html.light .brand-text {
-  width: fit-content;
-  background: linear-gradient(90deg, #5c6b00 0%, #0a7047 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-/* Gradient text (purple → pink → green) */
-.gradient-text {
-  width: fit-content;
-  background: linear-gradient(90deg, #9945ff 0%, #e94e8a 50%, #1ce783 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-html.light .gradient-text {
-  width: fit-content;
-  background: linear-gradient(90deg, #7c3aed 0%, #c2185b 50%, #0fa968 100%);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-}
-
-/* Glow effects */
-.glow-green {
-  box-shadow:
-    0 0 40px rgba(153, 69, 255, 0.1),
-    0 0 80px rgba(233, 78, 138, 0.06);
-}
-
-.glow-purple {
-  box-shadow: 0 0 40px rgba(153, 69, 255, 0.12);
-}
-
-html.light .glow-green {
-  box-shadow: 0 0 40px rgba(15, 169, 104, 0.08);
-}
-
-html.light .glow-purple {
-  box-shadow: 0 0 40px rgba(124, 58, 237, 0.06);
-}
-
-/* Gradient mesh background orbs */
-.mesh-bg {
-  position: relative;
-}
-
-.mesh-bg::before,
-.mesh-bg::after {
-  content: '';
-  position: fixed;
-  pointer-events: none;
-  border-radius: 50%;
-}
-
-.mesh-bg::before {
-  top: -15%;
-  right: -5%;
-  width: 600px;
-  height: 600px;
-  background: radial-gradient(circle, rgba(233, 78, 138, 0.07) 0%, transparent 70%);
-  animation: drift 20s ease-in-out infinite alternate;
-}
-
-.mesh-bg::after {
-  bottom: -15%;
-  left: -5%;
-  width: 500px;
-  height: 500px;
-  background: radial-gradient(circle, rgba(153, 69, 255, 0.06) 0%, transparent 70%);
-  animation: drift 25s ease-in-out infinite alternate-reverse;
-}
-
-html.light .mesh-bg::before {
-  background: radial-gradient(circle, rgba(15, 169, 104, 0.04) 0%, transparent 70%);
-}
-
-html.light .mesh-bg::after {
-  background: radial-gradient(circle, rgba(124, 58, 237, 0.03) 0%, transparent 70%);
-}
-
-@keyframes drift {
-  from {
-    transform: translate(0, 0);
-  }
-  to {
-    transform: translate(30px, 20px);
-  }
+  box-shadow: 0 1px 0 0 rgba(0, 0, 0, 0.05);
 }
 
 /* Motion */
@@ -384,10 +275,10 @@ html.light .mesh-bg::after {
 
 @keyframes peak-glow {
   0% {
-    box-shadow: 0 0 0 0 rgba(28, 231, 131, 0.4);
+    box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.4);
   }
   50% {
-    box-shadow: 0 0 20px 4px rgba(28, 231, 131, 0.3);
+    box-shadow: 0 0 20px 4px rgba(59, 130, 246, 0.3);
   }
   100% {
     box-shadow: none;
@@ -452,21 +343,6 @@ html.light .mesh-bg::after {
   }
 }
 
-/* Geometric banner decoration */
-.geo-banner {
-  height: 48px;
-  border-radius: 10px;
-  overflow: hidden;
-  margin-bottom: 12px;
-  opacity: 0.85;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .geo-banner {
-    opacity: 0.7;
-  }
-}
-
 /* Empty state radar */
 @keyframes radar-sweep {
   from {
@@ -509,5 +385,19 @@ html.light .mesh-bg::after {
     animation: none !important;
     opacity: 1;
     transform: none;
+  }
+}
+
+/* Tables — Preline table head: small uppercase muted labels, hairline rows */
+@layer base {
+  main thead th {
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--color-ink-muted);
+  }
+  main tbody tr + tr {
+    border-top: 1px solid var(--color-border-subtle);
   }
 }

@@ -4,18 +4,27 @@ interface ShortcutConfig {
   readonly navigate: (path: string) => void;
   readonly onToggleHelp: () => void;
   readonly onToggleTheme?: () => void;
+  readonly onOpenSearch?: () => void;
 }
 
 export function useKeyboardShortcuts({
   navigate,
   onToggleHelp,
   onToggleTheme,
+  onOpenSearch,
 }: ShortcutConfig): void {
   const pendingRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent): void {
+      // ⌘K / Ctrl+K opens search from anywhere, including inputs
+      if (onOpenSearch && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        onOpenSearch();
+        return;
+      }
+
       // Skip when focus is in an input
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -80,6 +89,10 @@ export function useKeyboardShortcuts({
         e.preventDefault();
         onToggleTheme();
       }
+      if (key === '/' && onOpenSearch) {
+        e.preventDefault();
+        onOpenSearch();
+      }
     }
 
     document.addEventListener('keydown', handleKeyDown);
@@ -87,5 +100,5 @@ export function useKeyboardShortcuts({
       document.removeEventListener('keydown', handleKeyDown);
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [navigate, onToggleHelp, onToggleTheme]);
+  }, [navigate, onToggleHelp, onToggleTheme, onOpenSearch]);
 }

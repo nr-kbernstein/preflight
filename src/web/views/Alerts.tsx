@@ -161,7 +161,7 @@ export function Alerts(): JSX.Element {
   return (
     <section>
       <header className="mb-6">
-        <h1 className="text-xl font-semibold gradient-text">Alerts</h1>
+        <h1 className="text-xl font-semibold text-ink-base">Alerts</h1>
       </header>
 
       {/* Budget Status */}
@@ -211,7 +211,7 @@ export function Alerts(): JSX.Element {
                   No budget caps configured.{' '}
                   <Link
                     href="/settings"
-                    className="text-accent-cyan hover:underline transition-colors duration-150"
+                    className="text-primary hover:underline transition-colors duration-150"
                   >
                     Set limits in Settings
                   </Link>{' '}

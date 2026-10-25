@@ -12,7 +12,6 @@ import {
 } from '../api/client';
 import { AnimatedCard } from '../components/AnimatedCard';
 import { EmptyState } from '../components/EmptyState';
-import { GeoBanner } from '../components/GeoBanner';
 import { Kpi } from '../components/Kpi';
 import { Card, Eyebrow, Pill, SectionHeader } from '../components/ui';
 import type { PillTone } from '../components/ui';
@@ -166,10 +165,9 @@ export function GitEfficiency(): JSX.Element {
 
   return (
     <section>
-      <GeoBanner theme="git" />
       <header className="flex items-baseline justify-between mb-4">
         <div>
-          <h1 className="text-xl font-semibold gradient-text">Git Efficiency</h1>
+          <h1 className="text-xl font-semibold text-ink-base">Git Efficiency</h1>
           {data.repoContext.repoName && (
             <div className="flex items-center gap-2 mt-1 text-[11px] text-ink-muted">
               <span className="font-mono">{data.repoContext.repoName}</span>
@@ -225,7 +223,7 @@ export function GitEfficiency(): JSX.Element {
 
       {/* Hero KPIs — what shipped, what's risky, current state */}
       <AnimatedCard index={0} className="mb-3">
-        <Card padding="lg" tone="elevated" glow="green">
+        <Card padding="lg">
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
             <Kpi
               label="commits today"

@@ -60,7 +60,7 @@ export function AlertBanner({ alert, onDismiss }: AlertBannerProps): JSX.Element
       data-alert-id={alert.id}
       data-severity={alert.severity}
       onKeyDown={handleKeyDown}
-      className={`flex items-center gap-3 px-3 py-2 border-b text-xs focus:outline-none focus:ring-2 focus:ring-accent-cyan/40 ${SEVERITY_BG[alert.severity]}`}
+      className={`flex items-center gap-3 px-3 py-2 border-b text-xs focus:outline-none focus:ring-2 focus:ring-primary/40 ${SEVERITY_BG[alert.severity]}`}
     >
       <span
         aria-hidden="true"
@@ -79,7 +79,7 @@ export function AlertBanner({ alert, onDismiss }: AlertBannerProps): JSX.Element
         type="button"
         aria-label="Dismiss alert"
         onClick={() => onDismiss(alert.id)}
-        className="shrink-0 ml-1 p-1 rounded-md text-ink-subtle hover:text-ink-base hover:bg-surface-5 transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-accent-cyan/50"
+        className="shrink-0 ml-1 p-1 rounded-md text-ink-subtle hover:text-ink-base hover:bg-surface-5 transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-primary/40"
       >
         <X size={14} aria-hidden="true" focusable="false" />
       </button>

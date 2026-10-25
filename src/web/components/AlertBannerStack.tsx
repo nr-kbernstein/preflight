@@ -55,7 +55,7 @@ export function AlertBannerStack(): JSX.Element | null {
             `w-full flex items-center gap-2 px-3 py-2 text-xs text-left ` +
             `border-b ${SEVERITY_BORDER[headerSeverity]} ` +
             `transition-colors duration-150 ` +
-            `focus:outline-none focus:ring-2 focus:ring-accent-cyan/50`
+            `focus:outline-none focus:ring-2 focus:ring-primary/40`
           }
         >
           <ChevronRight size={14} aria-hidden="true" focusable="false" />
@@ -80,7 +80,7 @@ export function AlertBannerStack(): JSX.Element | null {
             `w-full flex items-center gap-2 px-3 py-2 text-xs text-left bg-bg-panel ` +
             `border-b ${SEVERITY_BORDER[headerSeverity]} ` +
             `transition-colors duration-150 ` +
-            `focus:outline-none focus:ring-2 focus:ring-accent-cyan/50`
+            `focus:outline-none focus:ring-2 focus:ring-primary/40`
           }
         >
           <ChevronDown size={14} aria-hidden="true" focusable="false" />

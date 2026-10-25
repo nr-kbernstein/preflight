@@ -11,6 +11,7 @@ interface ShortcutOverlayProps {
 
 const shortcuts = [
   { keys: ['?'], description: 'Show this help' },
+  { keys: ['/'], description: 'Jump to page (or ⌘K)' },
   { keys: ['t'], description: 'Toggle light/dark mode' },
   { keys: ['g', 'h'], description: 'Go to Today' },
   { keys: ['g', 's'], description: 'Go to Sessions' },
@@ -41,11 +42,11 @@ export function ShortcutOverlay({ open, onClose }: ShortcutOverlayProps): JSX.El
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
       onClick={onClose}
     >
       <div
-        className="glass-card animate-overlay-enter max-w-sm w-full mx-4 p-5"
+        className="surface-card shadow-xl animate-overlay-enter max-w-sm w-full mx-4 p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between mb-4">

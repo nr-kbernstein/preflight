@@ -47,7 +47,7 @@ function StatusIcon({ status }: { readonly status: WorkflowRunInfo['status'] }):
     case 'failed':
       return <XCircle className="w-4 h-4 text-accent-red" aria-hidden="true" />;
     case 'running':
-      return <Loader2 className="w-4 h-4 text-accent-cyan animate-spin" aria-hidden="true" />;
+      return <Loader2 className="w-4 h-4 text-primary animate-spin" aria-hidden="true" />;
     case 'cancelled':
       return <Clock className="w-4 h-4 text-accent-amber" aria-hidden="true" />;
     default:
@@ -230,7 +230,7 @@ export function WorkflowRunDetail({ runId, onClose }: WorkflowRunDetailProps): J
             type="button"
             aria-label="Close run details"
             onClick={onClose}
-            className="shrink-0 p-1.5 rounded-md text-ink-muted hover:text-ink-base hover:bg-surface-5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+            className="shrink-0 p-1.5 rounded-md text-ink-muted hover:text-ink-base hover:bg-surface-5 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
           >
             <X className="w-4 h-4" aria-hidden="true" />
           </button>

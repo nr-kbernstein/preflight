@@ -15,7 +15,7 @@ export interface PillProps extends NativeSpanProps {
 }
 
 const TONE_CLASS: Record<PillTone, string> = {
-  neutral: 'bg-surface-5 text-ink-subtle',
+  neutral: 'bg-surface-8 text-ink-subtle',
   info: 'bg-accent-blue/15 text-accent-blue',
   success: 'bg-accent-green/15 text-accent-green',
   warning: 'bg-accent-amber/20 text-accent-amber',
@@ -32,7 +32,7 @@ const TONE_BORDER_CLASS: Record<PillTone, string> = {
 
 const SIZE_CLASS: Record<PillSize, string> = {
   sm: 'px-1.5 py-0.5 text-[10px]',
-  md: 'px-2 py-0.5 text-[11px]',
+  md: 'px-2 py-0.5 text-xs',
 };
 
 export function Pill({
@@ -45,7 +45,7 @@ export function Pill({
   ...rest
 }: PillProps): JSX.Element {
   const classes = [
-    'inline-flex items-center gap-1 rounded-full',
+    'inline-flex items-center gap-x-1 rounded-full font-medium',
     TONE_CLASS[tone],
     SIZE_CLASS[size],
     bordered ? TONE_BORDER_CLASS[tone] : '',

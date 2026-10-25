@@ -36,12 +36,12 @@ function RadarIcon(): JSX.Element {
         y1="24"
         x2="24"
         y2="4"
-        stroke="var(--color-accent-green)"
+        stroke="var(--color-primary)"
         strokeWidth="1.5"
         strokeLinecap="round"
         className="animate-radar-sweep"
       />
-      <circle cx="24" cy="24" r="2" fill="var(--color-accent-green)" />
+      <circle cx="24" cy="24" r="2" fill="var(--color-primary)" />
     </svg>
   );
 }
@@ -68,7 +68,7 @@ function CodeIcon(): JSX.Element {
         y1="18"
         x2="24"
         y2="30"
-        stroke="var(--color-accent-green)"
+        stroke="var(--color-primary)"
         strokeWidth="2"
         strokeLinecap="round"
         opacity="0.8"
@@ -90,7 +90,7 @@ function TimelineIcon(): JSX.Element {
         opacity="0.4"
       />
       <circle cx="12" cy="24" r="3" stroke="var(--color-ink-muted)" strokeWidth="1.5" />
-      <circle cx="24" cy="24" r="3" stroke="var(--color-accent-green)" strokeWidth="1.5" />
+      <circle cx="24" cy="24" r="3" stroke="var(--color-primary)" strokeWidth="1.5" />
       <circle cx="36" cy="24" r="3" stroke="var(--color-ink-muted)" strokeWidth="1.5" />
       <line
         x1="12"
@@ -107,7 +107,7 @@ function TimelineIcon(): JSX.Element {
         y1="16"
         x2="24"
         y2="20"
-        stroke="var(--color-accent-green)"
+        stroke="var(--color-primary)"
         strokeWidth="1"
         strokeLinecap="round"
         opacity="0.7"
@@ -139,7 +139,7 @@ function CheckmarkIcon(): JSX.Element {
       />
       <path
         d="M16 24 L22 30 L34 18"
-        stroke="var(--color-accent-green)"
+        stroke="var(--color-primary)"
         strokeWidth="2"
         strokeLinecap="round"
         strokeLinejoin="round"

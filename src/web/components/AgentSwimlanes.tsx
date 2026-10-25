@@ -38,11 +38,11 @@ export interface AgentSwimlanesProps {
 // that component). These accents legitimately encode TOOL TYPE here, the same
 // way the gantt does, so the parent lane reads consistently with it.
 function getParentBarColor(toolName: string): string {
-  if (toolName === 'Read') return 'bg-accent-blue';
-  if (toolName === 'Edit' || toolName === 'Write') return 'bg-accent-green';
-  if (toolName === 'Bash') return 'bg-accent-purple';
-  if (toolName === 'Agent') return 'bg-accent-teal';
-  return 'bg-ink-subtle';
+  if (toolName === 'Read') return 'bg-series-1';
+  if (toolName === 'Edit' || toolName === 'Write') return 'bg-series-3';
+  if (toolName === 'Bash') return 'bg-series-2';
+  if (toolName === 'Agent') return 'bg-series-4';
+  return 'bg-series-6';
 }
 
 // Groups with more than this many lanes start collapsed so the chart doesn't
@@ -172,7 +172,7 @@ export function AgentSwimlanes({
               type="button"
               onClick={() => toggleGroup(PARENT_GROUP_ID)}
               aria-expanded={!parentCollapsed}
-              className="flex w-full items-center gap-1.5 mb-0.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded-sm"
+              className="flex w-full items-center gap-1.5 mb-0.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
             >
               {parentCollapsed ? (
                 <ChevronRight size={13} className="shrink-0 text-ink-muted" aria-hidden="true" />
@@ -275,7 +275,7 @@ export function AgentSwimlanes({
                 type="button"
                 onClick={() => toggleGroup(groupId)}
                 aria-expanded={!isCollapsed}
-                className="flex w-full items-center gap-1.5 mb-0.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded-sm"
+                className="flex w-full items-center gap-1.5 mb-0.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
               >
                 {isCollapsed ? (
                   <ChevronRight size={13} className="shrink-0 text-ink-muted" aria-hidden="true" />
@@ -333,7 +333,7 @@ export function AgentSwimlanes({
                   const barClasses =
                     `absolute inset-y-0 my-auto h-5 rounded-sm opacity-85 ${barColor} ` +
                     (clickable
-                      ? 'cursor-pointer hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40'
+                      ? 'cursor-pointer hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40'
                       : 'cursor-default');
 
                   return (

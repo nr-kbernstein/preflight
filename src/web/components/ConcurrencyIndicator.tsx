@@ -58,7 +58,7 @@ export function ConcurrencyIndicator({
       {celebration && <CelebrationBurst />}
       <Eyebrow className="mb-1.5">Concurrent Sessions</Eyebrow>
       <div className="flex items-baseline gap-3">
-        <span className="text-lg font-semibold text-accent-teal tabular-nums">{current}</span>
+        <span className="text-lg font-semibold text-ink-base tabular-nums">{current}</span>
         <span className="text-xs text-ink-muted tabular-nums">
           today peak {peak}
           {allTimePeak && allTimePeak > peak ? ` · all-time ${allTimePeak}` : ''}

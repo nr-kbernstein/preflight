@@ -45,11 +45,11 @@ interface GanttTimelineProps {
 }
 
 function getBarColor(toolName: string): string {
-  if (toolName === 'Read') return 'bg-accent-blue';
-  if (toolName === 'Edit' || toolName === 'Write') return 'bg-accent-green';
-  if (toolName === 'Bash') return 'bg-accent-purple';
-  if (toolName === 'Agent') return 'bg-accent-teal';
-  return 'bg-ink-subtle';
+  if (toolName === 'Read') return 'bg-series-1';
+  if (toolName === 'Edit' || toolName === 'Write') return 'bg-series-3';
+  if (toolName === 'Bash') return 'bg-series-2';
+  if (toolName === 'Agent') return 'bg-series-4';
+  return 'bg-series-6';
 }
 
 const SEGMENT_LABELS: Record<string, string> = {

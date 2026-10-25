@@ -22,7 +22,7 @@ export function LiveBadge({
 }: LiveBadgeProps): JSX.Element {
   const classes = [
     'inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full',
-    'bg-accent-cyan/15 text-accent-cyan uppercase tracking-wider font-semibold',
+    'bg-accent-green/15 text-accent-green uppercase tracking-wider font-semibold',
     SIZE_CLASS[size],
     className,
   ]
@@ -32,7 +32,7 @@ export function LiveBadge({
     <span className={classes}>
       <span
         aria-hidden="true"
-        className={`w-1.5 h-1.5 rounded-full bg-accent-cyan ${pulse ? 'animate-pulse' : ''}`}
+        className={`w-1.5 h-1.5 rounded-full bg-accent-green ${pulse ? 'animate-pulse' : ''}`}
       />
       {label}
     </span>

@@ -16,7 +16,6 @@ import {
 
 import { EmptyState } from '../components/EmptyState';
 import { ActivityHeatmap } from '../components/ActivityHeatmap';
-import { GeoBanner } from '../components/GeoBanner';
 import { DiscreteBlockChart, type DiscreteBlockChartItem } from '../components/DiscreteBlockChart';
 import { Card, Eyebrow } from '../components/ui';
 import {
@@ -57,30 +56,26 @@ const TOOLTIP_STYLE = {
   fontSize: 12,
   color: 'var(--color-ink-base)',
 };
-const ACCENT = 'var(--color-accent-green)';
+const ACCENT = 'var(--color-primary)';
 const ACCENT_AMBER = 'var(--color-accent-amber)';
-const ACCENT_GREEN = 'var(--color-accent-green)';
-const ACCENT_PURPLE = 'var(--color-accent-purple)';
-const ACCENT_BLUE = 'var(--color-accent-blue)';
-const ACCENT_TEAL = 'var(--color-accent-teal)';
+const SERIES = [1, 2, 3, 4, 5, 6].map((n) => `var(--color-series-${n})`);
 
 function toolFillColor(toolName: string): string {
-  if (toolName === 'Read') return ACCENT_BLUE;
-  if (toolName === 'Edit' || toolName === 'Write') return ACCENT_GREEN;
-  if (toolName === 'Bash') return ACCENT_PURPLE;
-  if (toolName === 'Agent') return ACCENT_TEAL;
-  return 'var(--color-ink-muted)';
+  if (toolName === 'Read') return SERIES[0];
+  if (toolName === 'Edit' || toolName === 'Write') return SERIES[2];
+  if (toolName === 'Bash') return SERIES[1];
+  if (toolName === 'Agent') return SERIES[3];
+  return SERIES[5];
 }
 
 function outcomeFillColor(outcome: string): string {
   const lower = outcome.toLowerCase();
-  if (lower === 'bug fix' || lower === 'fix') return '#FF6B6B';
-  if (lower === 'feature') return ACCENT_GREEN;
-  if (lower === 'refactor') return ACCENT_BLUE;
-  if (lower === 'configuration' || lower === 'config') return ACCENT_AMBER;
-  if (lower === 'test') return ACCENT_TEAL;
-  if (lower === 'docs') return '#C4B5FD';
-  return ACCENT_PURPLE;
+  if (lower === 'bug fix' || lower === 'fix') return SERIES[0];
+  if (lower === 'feature') return SERIES[1];
+  if (lower === 'refactor') return SERIES[2];
+  if (lower === 'configuration' || lower === 'config') return SERIES[3];
+  if (lower === 'test') return SERIES[4];
+  return SERIES[5];
 }
 
 // Render only the month-day portion of an ISO `YYYY-MM-DD` axis label
@@ -141,8 +136,7 @@ export function History(): JSX.Element {
 
   return (
     <section>
-      <GeoBanner theme="history" />
-      <h1 className="text-xl font-semibold gradient-text mb-4">History</h1>
+      <h1 className="text-xl font-semibold text-ink-base mb-4">History</h1>
 
       {hasLoadError && (
         <div className="text-accent-red text-xs mb-3">
@@ -300,7 +294,7 @@ export function History(): JSX.Element {
           ) : (
             <div className="h-44 overflow-y-auto text-xs">
               <table className="w-full">
-                <thead className="text-ink-muted sticky top-0 bg-bg-panel">
+                <thead className="text-ink-muted sticky top-0 bg-bg-base">
                   <tr>
                     <th className="text-left pb-1">Model</th>
                     <th className="text-right pb-1">Sessions</th>
@@ -459,7 +453,7 @@ function CoachCard({ data }: { data: PersonalCoachResult | undefined }): JSX.Ele
     <Panel title="Personal coach">
       <div className="text-xs space-y-2">
         <div>
-          <span className="text-accent-cyan font-semibold">Top recommendation: </span>
+          <span className="text-primary font-semibold">Top recommendation: </span>
           {data.topRecommendation}
         </div>
         {data.highlights.length > 0 && (

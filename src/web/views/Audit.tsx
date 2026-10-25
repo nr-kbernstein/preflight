@@ -3,7 +3,6 @@ import type { JSX } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { fetchAuditLog, qk, type AuditEntry } from '../api/client';
 import { EmptyState } from '../components/EmptyState';
-import { GeoBanner } from '../components/GeoBanner';
 import { Button, Card, Pill } from '../components/ui';
 
 const FILTERS = [
@@ -60,9 +59,8 @@ export function Audit(): JSX.Element {
 
   return (
     <section>
-      <GeoBanner theme="audit" />
       <header className="flex items-baseline justify-between mb-4">
-        <h1 className="text-xl font-semibold gradient-text">Audit</h1>
+        <h1 className="text-xl font-semibold text-ink-base">Audit</h1>
         <Button variant="secondary" size="md" onClick={() => downloadJsonl(visibleSlice)}>
           Export JSONL
         </Button>

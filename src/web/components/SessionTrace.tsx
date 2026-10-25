@@ -110,7 +110,7 @@ function StatusIcon({ status }: { readonly status: string | undefined }): JSX.El
     return (
       <Loader2
         size={12}
-        className="shrink-0 text-accent-cyan animate-spin"
+        className="shrink-0 text-primary animate-spin"
         aria-label="running"
         role="img"
       />
@@ -336,9 +336,9 @@ function LevelControl({
             onClick={() => onSelect(opt.value)}
             className={
               `px-2 py-0.5 text-[10px] rounded-md transition-colors ` +
-              `focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 ` +
+              `focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 ` +
               (isActive
-                ? 'bg-accent-cyan/20 text-accent-cyan font-medium'
+                ? 'bg-primary-soft text-primary font-medium'
                 : 'text-ink-muted hover:text-ink-subtle')
             }
           >
@@ -579,7 +579,7 @@ function CollapsedGroupBar({
           type="button"
           onClick={onToggle}
           aria-expanded={false}
-          className="shrink-0 flex items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded-sm"
+          className="shrink-0 flex items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
           title={summary}
         >
           <ChevronRight size={13} className="shrink-0 text-ink-muted" aria-hidden="true" />
@@ -604,7 +604,7 @@ function CollapsedGroupBar({
                 onOpenRun();
               }
             }}
-            className="text-[11px] font-medium text-ink-subtle truncate cursor-pointer hover:text-accent-cyan hover:underline underline-offset-2 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+            className="text-[11px] font-medium text-ink-subtle truncate cursor-pointer hover:text-primary hover:underline underline-offset-2 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
           >
             {label}
           </span>
@@ -674,7 +674,7 @@ function AgentGanttRow({
   const barClasses =
     `absolute inset-y-0 my-auto h-5 rounded-sm opacity-85 ${barColor} ` +
     (clickable
-      ? 'cursor-pointer hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40'
+      ? 'cursor-pointer hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40'
       : 'cursor-default');
 
   return (
@@ -690,7 +690,7 @@ function AgentGanttRow({
             onClick={onToggle}
             aria-expanded={expanded}
             aria-label={`${expanded ? 'Collapse' : 'Expand'} calls for ${agent.label}`}
-            className="shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+            className="shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
           >
             {expanded ? (
               <ChevronDown size={11} className="text-ink-muted" aria-hidden="true" />
@@ -983,7 +983,7 @@ function AgentListRow({
           onClick={onToggle}
           aria-expanded={expanded}
           aria-label={`${expanded ? 'Collapse' : 'Expand'} calls for ${agent.label}`}
-          className="shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+          className="shrink-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
         >
           {expanded ? (
             <ChevronDown size={11} className="text-ink-muted" aria-hidden="true" />
@@ -995,7 +995,7 @@ function AgentListRow({
           <button
             type="button"
             onClick={() => onSelectRun!(runId!)}
-            className="truncate font-medium text-accent-cyan hover:underline text-left shrink-0 max-w-[160px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded-sm"
+            className="truncate font-medium text-primary hover:underline text-left shrink-0 max-w-[160px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
             title={`${agent.label} · open workflow run`}
           >
             {agent.label}
@@ -1131,7 +1131,7 @@ function GroupHeader({
         type="button"
         onClick={onToggle}
         aria-expanded={!collapsed}
-        className="flex items-center gap-1.5 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded-sm"
+        className="flex items-center gap-1.5 shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
       >
         {collapsed ? (
           <ChevronRight size={13} className="shrink-0 text-ink-muted" aria-hidden="true" />
@@ -1161,7 +1161,7 @@ function GroupHeader({
               onOpenRun();
             }
           }}
-          className="text-[11px] font-medium text-ink-subtle truncate min-w-0 cursor-pointer hover:text-accent-cyan hover:underline underline-offset-2 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+          className="text-[11px] font-medium text-ink-subtle truncate min-w-0 cursor-pointer hover:text-primary hover:underline underline-offset-2 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
         >
           {label}
         </span>

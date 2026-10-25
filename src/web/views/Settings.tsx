@@ -235,7 +235,7 @@ export function Settings(): JSX.Element {
     <section>
       <DiagnosticsPanel />
       <header className="mb-6">
-        <h1 className="text-xl font-semibold gradient-text">Settings</h1>
+        <h1 className="text-xl font-semibold text-ink-base">Settings</h1>
         <p className="text-xs text-ink-muted mt-1">
           Changes are written to config.json on disk. Most require a server restart.
         </p>

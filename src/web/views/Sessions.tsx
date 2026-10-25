@@ -5,7 +5,6 @@ import { useSearch } from 'wouter';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import { EmptyState } from '../components/EmptyState';
 import { ActivityHeatmap } from '../components/ActivityHeatmap';
-import { GeoBanner } from '../components/GeoBanner';
 import { type AgentSpan } from '../components/AgentSwimlanes';
 import { SessionTrace } from '../components/SessionTrace';
 import { WorkflowRunDetail } from '../components/WorkflowRunDetail';
@@ -352,48 +351,43 @@ export function Sessions(): JSX.Element {
 
   return (
     <section className="flex flex-col h-full">
-      <div className="h-8 overflow-hidden rounded-lg mb-2 shrink-0">
-        <GeoBanner theme="sessions" />
-      </div>
-      <h1 className="text-lg font-semibold gradient-text mb-2 shrink-0">Sessions</h1>
+      <h1 className="text-xl font-semibold text-ink-base mb-4 shrink-0">Sessions</h1>
 
       {/* Fleet workflow KPIs + filters (consolidated from the former Workflows
           view). Filters scope the KPIs AND the master list below. */}
-      <Card tone="static" padding="sm" className="mb-2 shrink-0">
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 divide-x divide-border-subtle">
-          <div className="px-3 first:pl-0">
-            <Kpi
-              label="Workflow runs"
-              value={String(kpis.totalRuns)}
-              numericValue={kpis.totalRuns}
-              animate
-            />
-          </div>
-          <div className="px-3">
-            <Kpi
-              label="Subagents"
-              value={String(kpis.totalAgents)}
-              numericValue={kpis.totalAgents}
-              animate
-            />
-          </div>
-          <div className="px-3">
-            <Kpi
-              label="Workflow spend"
-              value={formatUsdOrDash(kpis.totalSpend)}
-              tone={kpis.totalSpend !== null ? 'warn' : 'neutral'}
-            />
-          </div>
-          <div className="px-3">
-            <Kpi
-              label="Avg duration"
-              value={kpis.avgDurationMs !== null ? formatDuration(kpis.avgDurationMs) : '—'}
-            />
-          </div>
-        </div>
-      </Card>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-4 shrink-0">
+        <Card>
+          <Kpi
+            label="Workflow runs"
+            value={String(kpis.totalRuns)}
+            numericValue={kpis.totalRuns}
+            animate
+          />
+        </Card>
+        <Card>
+          <Kpi
+            label="Subagents"
+            value={String(kpis.totalAgents)}
+            numericValue={kpis.totalAgents}
+            animate
+          />
+        </Card>
+        <Card>
+          <Kpi
+            label="Workflow spend"
+            value={formatUsdOrDash(kpis.totalSpend)}
+            tone={kpis.totalSpend !== null ? 'warn' : 'neutral'}
+          />
+        </Card>
+        <Card>
+          <Kpi
+            label="Avg duration"
+            value={kpis.avgDurationMs !== null ? formatDuration(kpis.avgDurationMs) : '—'}
+          />
+        </Card>
+      </div>
 
-      <div className="flex items-center gap-3 flex-wrap mb-2 shrink-0">
+      <div className="flex items-center gap-3 flex-wrap mb-4 shrink-0">
         <Tabs<TimeWindow>
           value={activeWindow}
           onChange={setActiveWindow}
@@ -409,10 +403,10 @@ export function Sessions(): JSX.Element {
               aria-pressed={runSourceFilter === opt.value}
               onClick={() => setRunSourceFilter(opt.value)}
               className={[
-                'px-2.5 py-1 rounded-full text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40',
+                'px-2.5 py-1 rounded-full text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40',
                 runSourceFilter === opt.value
-                  ? 'bg-accent-cyan/20 text-accent-cyan font-medium'
-                  : 'text-ink-muted hover:text-ink-subtle',
+                  ? 'bg-primary-soft text-primary font-medium'
+                  : 'text-ink-subtle hover:bg-surface-5 hover:text-ink-base',
               ].join(' ')}
             >
               {opt.label}
@@ -430,10 +424,10 @@ export function Sessions(): JSX.Element {
                 aria-pressed={active}
                 onClick={() => setStatusFilter(opt.value)}
                 className={[
-                  'px-2.5 py-1 rounded-full text-[11px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40',
+                  'px-2.5 py-1 rounded-full text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40',
                   active
-                    ? 'bg-accent-green/20 text-accent-green font-medium'
-                    : 'text-ink-muted hover:text-ink-subtle',
+                    ? 'bg-primary-soft text-primary font-medium'
+                    : 'text-ink-subtle hover:bg-surface-5 hover:text-ink-base',
                 ].join(' ')}
               >
                 {opt.label}
@@ -449,22 +443,22 @@ export function Sessions(): JSX.Element {
               setRunSourceFilter('all');
               setStatusFilter('all');
             }}
-            className="text-[10px] text-ink-muted hover:text-ink-subtle underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded-sm"
+            className="text-[10px] text-ink-muted hover:text-ink-subtle underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded-sm"
           >
             Clear filters
           </button>
         )}
       </div>
 
-      <div className="grid grid-cols-[260px_1fr] gap-3 flex-1 min-h-0">
+      <div className="grid grid-cols-1 md:grid-cols-[300px_1fr] gap-4 flex-1 min-h-0">
         <Card padding="none" tone="static" className="overflow-hidden flex flex-col">
-          <header className="p-2 border-b border-border-subtle">
+          <header className="px-4 py-3 border-b border-border-subtle">
             <div className="flex items-center justify-between">
               <Eyebrow as="h2">List</Eyebrow>
               <select
                 value={sortKey}
                 onChange={(e) => setSortKey(e.target.value as SortKey)}
-                className="text-[10px] bg-surface-5 border border-border-medium rounded-md px-1.5 py-0.5 text-ink-subtle"
+                className="text-xs bg-bg-base border border-border-subtle rounded-lg px-2 py-1 text-ink-subtle"
               >
                 <option value="date">Newest</option>
                 <option value="lastActive">Last active</option>
@@ -517,7 +511,7 @@ export function Sessions(): JSX.Element {
           </div>
         </Card>
 
-        <div className="glass-card glass-card-static p-4 overflow-auto">
+        <div className="surface-card p-4 overflow-auto">
           {!selectedId && (
             <EmptyState
               icon="timeline"
@@ -600,7 +594,7 @@ function SessionListRow({
             e.stopPropagation();
             onToggleSession(row.sessionId);
           }}
-          className="shrink-0 flex items-center justify-center w-6 text-ink-muted hover:text-ink-base focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+          className="shrink-0 flex items-center justify-center w-6 text-ink-muted hover:text-ink-base focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
         >
           {isExpanded ? (
             <ChevronDown size={13} aria-hidden="true" />
@@ -705,7 +699,7 @@ function SessionRunSubRow({
             e.stopPropagation();
             onToggleRun(run.runId);
           }}
-          className="shrink-0 flex items-center justify-center w-5 text-ink-muted hover:text-ink-base focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+          className="shrink-0 flex items-center justify-center w-5 text-ink-muted hover:text-ink-base focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
         >
           {isExpanded ? (
             <ChevronDown size={12} aria-hidden="true" />
@@ -719,7 +713,7 @@ function SessionRunSubRow({
           type="button"
           aria-label={`View workflow run ${run.workflowName ?? run.runId}`}
           onClick={() => onOpenRun(run.runId)}
-          className="flex-1 min-w-0 flex items-center gap-1.5 text-left py-1.5 pr-1 text-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 rounded"
+          className="flex-1 min-w-0 flex items-center gap-1.5 text-left py-1.5 pr-1 text-[10px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 rounded"
         >
           <span className="flex-1 min-w-0 font-medium text-ink-base truncate">
             {run.workflowName ?? run.runId}
@@ -748,7 +742,7 @@ function SessionRunSubRow({
                 type="button"
                 aria-label={`View agent ${agent.label} in run ${run.workflowName ?? run.runId}`}
                 onClick={() => onOpenRun(run.runId)}
-                className="flex w-full items-center gap-1.5 text-left py-1 pr-1 text-[10px] hover:bg-surface-5 rounded transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40"
+                className="flex w-full items-center gap-1.5 text-left py-1 pr-1 text-[10px] hover:bg-surface-5 rounded transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
               >
                 <span className="flex-1 min-w-0 text-ink-subtle truncate" title={agent.label}>
                   {agent.label}
@@ -772,11 +766,11 @@ function SessionRunSubRow({
 }
 
 function toolBarColor(toolName: string): string {
-  if (toolName === 'Read') return 'bg-accent-blue/80';
-  if (toolName === 'Edit' || toolName === 'Write') return 'bg-accent-green/80';
-  if (toolName === 'Bash') return 'bg-accent-purple/80';
-  if (toolName === 'Agent') return 'bg-accent-teal/80';
-  return 'bg-ink-subtle/80';
+  if (toolName === 'Read') return 'bg-series-1/80';
+  if (toolName === 'Edit' || toolName === 'Write') return 'bg-series-3/80';
+  if (toolName === 'Bash') return 'bg-series-2/80';
+  if (toolName === 'Agent') return 'bg-series-4/80';
+  return 'bg-series-6/80';
 }
 
 function SessionTimeline({
@@ -846,20 +840,20 @@ function SessionTimeline({
 
       <div className="grid grid-cols-3 gap-2 mb-4 text-xs">
         {data.model && (
-          <div className="bg-surface-3 rounded-lg p-2.5">
-            <Eyebrow>Model</Eyebrow>
+          <div className="bg-bg-panel rounded-lg p-2.5">
+            <div className="text-xs text-ink-muted mb-0.5">Model</div>
             <div className="font-mono">{data.model}</div>
           </div>
         )}
         {data.estimatedCostUsd != null && (
-          <div className="bg-surface-3 rounded-lg p-2.5">
-            <Eyebrow>Cost</Eyebrow>
+          <div className="bg-bg-panel rounded-lg p-2.5">
+            <div className="text-xs text-ink-muted mb-0.5">Cost</div>
             <div className="tabular-nums">{formatUsd(data.estimatedCostUsd)}</div>
           </div>
         )}
         {data.outcome && (
-          <div className="bg-surface-3 rounded-lg p-2.5">
-            <Eyebrow>Status</Eyebrow>
+          <div className="bg-bg-panel rounded-lg p-2.5">
+            <div className="text-xs text-ink-muted mb-0.5">Status</div>
             <div className="capitalize">{data.outcome}</div>
           </div>
         )}
@@ -882,7 +876,7 @@ function SessionTimeline({
       {(data.qualityProxy || data.toolSelectionScore) && (
         <div className="grid grid-cols-2 gap-3 mb-4">
           {data.qualityProxy && (
-            <div className="bg-surface-3 rounded-lg p-3">
+            <div className="bg-bg-panel rounded-lg p-3">
               <Eyebrow className="mb-2">Session Quality</Eyebrow>
               <div className="grid grid-cols-2 gap-2 text-xs">
                 <div>
@@ -915,7 +909,7 @@ function SessionTimeline({
             </div>
           )}
           {data.toolSelectionScore && (
-            <div className="bg-surface-3 rounded-lg p-3">
+            <div className="bg-bg-panel rounded-lg p-3">
               <Eyebrow className="mb-2">Tool Selection</Eyebrow>
               <div
                 className={`text-2xl font-semibold tabular-nums ${scoreColor(data.toolSelectionScore.score)}`}

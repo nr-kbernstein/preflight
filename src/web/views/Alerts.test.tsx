@@ -185,7 +185,7 @@ describe('Alerts view — error and loading states', () => {
     );
 
     const heading = await screen.findByText('Slack Digest');
-    const card = heading.closest('.glass-card');
+    const card = heading.closest('.surface-card');
     expect(card).not.toBeNull();
     // Scoped to the Slack Digest card specifically — the Alert Thresholds card
     // above it also renders a "Loading..." node while its own query is pending,

@@ -19,13 +19,13 @@ export interface TabsProps<T extends string = string> {
 }
 
 const SIZE_CLASS: Record<TabsSize, string> = {
-  sm: 'px-2 py-0.5 text-[10px] rounded-md',
-  md: 'px-3 py-1 text-xs rounded-md',
+  sm: 'px-2 py-0.5 text-[11px] rounded-md',
+  md: 'px-2.5 py-1 text-xs rounded-md',
 };
 
 const ACTIVE_TONE_CLASS: Record<TabsTone, string> = {
-  green: 'bg-accent-green/20 text-accent-green font-medium',
-  cyan: 'bg-accent-cyan/20 text-accent-cyan font-medium',
+  green: 'bg-bg-base text-ink-base font-medium shadow-sm',
+  cyan: 'bg-bg-base text-primary font-medium shadow-sm',
 };
 
 export function Tabs<T extends string = string>({
@@ -37,15 +37,15 @@ export function Tabs<T extends string = string>({
   ariaLabel,
   className = '',
 }: TabsProps<T>): JSX.Element {
-  const wrapperClasses = ['inline-flex items-center gap-1', className].filter(Boolean).join(' ');
+  const wrapperClasses = ['inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-surface-8', className].filter(Boolean).join(' ');
   return (
     <div role="tablist" aria-label={ariaLabel} className={wrapperClasses}>
       {options.map((opt) => {
         const active = opt.value === value;
         const tabClasses = [
-          'transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-cyan/40 focus-visible:ring-offset-1 focus-visible:ring-offset-bg-deep',
+          'transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40',
           SIZE_CLASS[size],
-          active ? ACTIVE_TONE_CLASS[tone] : 'text-ink-muted hover:text-ink-base',
+          active ? ACTIVE_TONE_CLASS[tone] : 'text-ink-subtle hover:text-ink-base',
         ].join(' ');
         return (
           <button

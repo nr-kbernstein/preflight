@@ -17,7 +17,6 @@ import { WorkflowRunDetail } from '../components/WorkflowRunDetail';
 import type { AgentSpan } from '../components/AgentSwimlanes';
 import { ConcurrencyIndicator, type ConcurrencyData } from '../components/ConcurrencyIndicator';
 import { ActivityHeatmap } from '../components/ActivityHeatmap';
-import { GeoBanner } from '../components/GeoBanner';
 import { ContextBar } from '../components/ContextBar';
 import { Card, Eyebrow, LiveBadge, Pill } from '../components/ui';
 import {
@@ -292,15 +291,14 @@ export function Today(): JSX.Element {
 
   return (
     <section>
-      <GeoBanner />
       <header className="flex items-baseline justify-between mb-4">
-        <h1 className="text-xl font-semibold gradient-text">Today</h1>
+        <h1 className="text-xl font-semibold text-ink-base">Today</h1>
         <span className="text-xs text-ink-muted">{headerTimestamp}</span>
       </header>
 
       {noActivityToday ? (
         <>
-          <AnimatedCard index={0} className="glass-card p-8 mb-4">
+          <AnimatedCard index={0} className="surface-card p-8 mb-4">
             <EmptyState
               icon="code"
               title="No activity yet today"
@@ -316,60 +314,68 @@ export function Today(): JSX.Element {
         <>
           {(observabilityHealth?.watcherDisabledByLock === true ||
             healthApi?.watcherDisabledByLock === true) && (
-            <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-300 mb-4">
+            <div className="rounded-lg border border-accent-amber/30 bg-accent-amber/10 px-4 py-3 text-sm text-accent-amber mb-4">
               Subagent watcher is disabled (lock conflict). Subagent costs may be undercounted.
               Check Settings &rarr; Observability health.
             </div>
           )}
           {healthApi?.watcherActive === false && subagentStats.turns === 0 && (
-            <div className="rounded-lg border border-border-subtle bg-surface-5 px-4 py-3 text-sm text-ink-muted mb-4">
+            <div className="rounded-xl border border-border-subtle bg-bg-base px-4 py-3 text-sm text-ink-subtle mb-4">
               Subagent cost tracking is disabled (
               <code className="font-mono text-xs">NR_AI_ENABLE_SUBAGENT_WATCHER=0</code>), so spend
               shown here excludes subagents. Unset that variable (it is on by default) and restart
               to see full spend.
             </div>
           )}
-          <AnimatedCard index={0} className="mb-4">
-            <Card padding="lg" tone="elevated" glow="green">
-              <div className="grid grid-cols-5 gap-4">
-                <Kpi
-                  label="efficiency"
-                  hero
-                  value={effDisplay}
-                  sub={effSub}
-                  {...(effScore !== null
-                    ? { animate: true, numericValue: Math.round(effScore * 100), suffix: '%' }
-                    : {})}
-                />
-                <Kpi
-                  label="spend today"
-                  tone="good"
-                  value={spendLoading ? '…' : formatUsd(todayTotal)}
-                  {...(!spendLoading
-                    ? { animate: true, numericValue: todayTotal, format: formatUsd }
-                    : {})}
-                />
-                <Kpi
-                  label="subagent spend"
-                  value={!subagentHasData ? '—' : formatUsd(subagentUsd)}
-                  sub={`${subagentTurns} turns`}
-                  {...(subagentHasData
-                    ? { animate: true, numericValue: subagentUsd, format: formatUsd }
-                    : {})}
-                />
-                <Kpi label="tool calls" value={String(calls)} animate numericValue={calls} />
-                <Kpi
-                  label="flags"
-                  tone={flagsCount > 0 ? 'warn' : 'neutral'}
-                  value={String(flagsCount)}
-                  animate
-                  numericValue={flagsCount}
-                />
-              </div>
+          <AnimatedCard
+            index={0}
+            className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-5 gap-4 mb-4"
+          >
+            <Card>
+              <Kpi
+                label="efficiency"
+                hero
+                value={effDisplay}
+                sub={effSub}
+                {...(effScore !== null
+                  ? { animate: true, numericValue: Math.round(effScore * 100), suffix: '%' }
+                  : {})}
+              />
+            </Card>
+            <Card>
+              <Kpi
+                label="spend today"
+                value={spendLoading ? '…' : formatUsd(todayTotal)}
+                {...(!spendLoading
+                  ? { animate: true, numericValue: todayTotal, format: formatUsd }
+                  : {})}
+              />
+            </Card>
+            <Card>
+              <Kpi
+                label="subagent spend"
+                value={!subagentHasData ? '—' : formatUsd(subagentUsd)}
+                sub={`${subagentTurns} turns`}
+                {...(subagentHasData
+                  ? { animate: true, numericValue: subagentUsd, format: formatUsd }
+                  : {})}
+              />
+            </Card>
+            <Card>
+              <Kpi label="tool calls" value={String(calls)} animate numericValue={calls} />
+            </Card>
+            <Card>
+              <Kpi
+                label="flags"
+                tone={flagsCount > 0 ? 'warn' : 'neutral'}
+                value={String(flagsCount)}
+                animate
+                numericValue={flagsCount}
+              />
             </Card>
           </AnimatedCard>
 
-          <AnimatedCard index={1} className="grid grid-cols-2 gap-3 mb-3">
+          <AnimatedCard index={1} className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
             <ForecastEodCard
               todayTotal={todayTotal}
               forecastEod={
@@ -399,7 +405,7 @@ export function Today(): JSX.Element {
 
           {flagsCount > 0 &&
             (antiPatterns.length > 0 || (apiAntiPatterns && apiAntiPatterns.length > 0)) && (
-              <AnimatedCard index={2} className="mb-3">
+              <AnimatedCard index={2} className="mb-4">
                 <Card padding="sm" tone="warning" className="text-xs">
                   {antiPatterns.length > 0 ? (
                     <>
@@ -442,7 +448,10 @@ export function Today(): JSX.Element {
               </AnimatedCard>
             )}
 
-          <AnimatedCard index={3} className="grid grid-cols-3 gap-3 mb-3">
+          <AnimatedCard
+            index={3}
+            className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-4"
+          >
             <QualityProxyPanel />
             <ToolSelectionPanel />
             <LatencyPanel />
@@ -455,7 +464,7 @@ export function Today(): JSX.Element {
           </AnimatedCard>
 
           {todayHeatmap && todayHeatmap.buckets?.length > 0 && (
-            <AnimatedCard index={5} className="mb-3">
+            <AnimatedCard index={5} className="mb-4">
               <Card padding="sm">
                 <Eyebrow className="mb-2">Activity Today</Eyebrow>
                 <ActivityHeatmap
@@ -1032,7 +1041,7 @@ function LiveSessionPane({
   return (
     <>
       <div
-        className="glass-card mb-3 grid grid-cols-[220px_1fr] overflow-hidden"
+        className="surface-card mb-3 grid grid-cols-[220px_1fr] overflow-hidden"
         style={{ height: '320px' }}
       >
         {/* Session list */}
@@ -1104,7 +1113,7 @@ function LiveSessionPane({
                 <button
                   type="button"
                   onClick={() => navigate(`/sessions?id=${activeId}`)}
-                  className="text-[10px] text-accent-cyan hover:underline transition-colors duration-150"
+                  className="text-[10px] text-primary hover:underline transition-colors duration-150"
                 >
                   full session &rarr;
                 </button>
@@ -1375,7 +1384,7 @@ function ForecastEodCard({
       {hasForecast ? (
         <>
           <div className="flex items-baseline gap-3">
-            <span className="text-lg font-semibold text-accent-cyan tabular-nums">
+            <span className="text-lg font-semibold text-ink-base tabular-nums">
               {formatUsd(effectiveForecast)}
             </span>
             <span className="text-xs text-ink-muted tabular-nums">
