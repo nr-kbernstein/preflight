@@ -1484,7 +1484,7 @@ function ToolsSection({
             const pct = totalCalls > 0 ? (count / totalCalls) * 100 : 0;
             return (
               <div key={tool} className="flex items-center gap-2 text-[11px]">
-                <span className="w-28 text-ink-subtle truncate" title={tool}>
+                <span className="w-[9.1rem] shrink-0 text-ink-subtle truncate" title={tool}>
                   {shortToolName(tool)}
                 </span>
                 <div className="flex-1 h-3 bg-surface-3 relative rounded">
@@ -1502,7 +1502,7 @@ function ToolsSection({
             const pct = maxTokens > 0 ? (tc.estimatedTokens / maxTokens) * 100 : 0;
             return (
               <div key={tc.tool} className="flex items-center gap-2 text-[11px]">
-                <span className="w-28 text-ink-subtle truncate" title={tc.tool}>
+                <span className="w-[9.1rem] shrink-0 text-ink-subtle truncate" title={tc.tool}>
                   {shortToolName(tc.tool)}
                 </span>
                 <div className="flex-1 h-3 bg-surface-3 relative rounded">
