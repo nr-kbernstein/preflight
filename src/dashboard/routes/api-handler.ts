@@ -59,6 +59,7 @@ import {
 } from '../../metrics/quality-proxy-tracker.js';
 import type { Recommendation } from '../../metrics/recommendation-engine.js';
 import type { RetryDetectorMetrics, RetrySessionBreakdown } from '../../metrics/retry-detector.js';
+import { classifyComputeWaste, sumSessionTokens } from '../../metrics/compute-waste-status.js';
 import {
   deriveSessionStatus,
   SESSION_STATUSES,
@@ -419,6 +420,8 @@ export interface ApiHandlerDeps {
       totalCacheCreationTokens?: number;
       totalCacheSavingsUsd?: number;
       totalInputTokens?: number;
+      totalOutputTokens?: number;
+      totalThinkingTokens?: number;
       unpricedByModel?: Record<string, UnpricedModelUsage>;
       estimatedByModel?: Record<string, EstimatedModelUsage>;
     };
@@ -2281,17 +2284,16 @@ export function createApiHandler(
       .map(([type, v]) => ({ type, ...v }))
       .sort((a, b) => b.tokens_wasted - a.tokens_wasted);
 
-    const status =
-      totalTokensWasted >= 2000
-        ? 'needs_attention'
-        : totalTokensWasted >= 500
-          ? 'moderate'
-          : 'clean';
+    const { status, wasteRatio } = classifyComputeWaste(
+      totalTokensWasted,
+      sumSessionTokens(deps.costTracker?.getMetrics()),
+    );
 
     jsonOk(res, {
       total_tokens_wasted: totalTokensWasted,
       retry_tokens_wasted: retryTokensWasted,
       anti_pattern_tokens_wasted: antiPatternTokensWasted,
+      waste_ratio: wasteRatio,
       breakdown,
       // Anti-pattern waste has no per-session breakdown yet — AntiPattern
       // objects don't carry a sessionId (see ThrashingAlert for the retry

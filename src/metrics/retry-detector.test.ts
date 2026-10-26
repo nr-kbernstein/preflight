@@ -520,3 +520,121 @@ describe('RetryDetector', () => {
     expect(aggregator.record).not.toHaveBeenCalled();
   });
 });
+
+describe('RetryDetector content-blind file-mutation tools', () => {
+  // Edit's parser fields carry only lengths/paths, never the edit text.
+  const editFields = {
+    toolName: 'Edit',
+    filePath: 'src/web/views/Sessions.tsx',
+    oldStringLength: 120,
+    oldLineCount: 4,
+    newStringLength: 130,
+    newLineCount: 5,
+    replaceAll: false,
+  };
+
+  it('does not alert on distinct successful same-file Edits', () => {
+    const detector = new RetryDetector();
+    detector.recordToolCall(makeRecord({ ...editFields, inputHash: 'hash-a' }));
+    detector.recordToolCall(makeRecord({ ...editFields, inputHash: 'hash-b' }));
+    detector.recordToolCall(makeRecord({ ...editFields, inputHash: 'hash-c' }));
+    const result = detector.recordToolCall(makeRecord({ ...editFields, inputHash: 'hash-d' }));
+
+    expect(result).toBeNull();
+    expect(detector.getMetrics().totalTokensWasted).toBe(0);
+  });
+
+  it('still alerts on a byte-identical Edit retry (same inputHash)', () => {
+    const detector = new RetryDetector();
+    detector.recordToolCall(makeRecord({ ...editFields, inputHash: 'same' }));
+    detector.recordToolCall(makeRecord({ ...editFields, inputHash: 'same' }));
+    const result = detector.recordToolCall(makeRecord({ ...editFields, inputHash: 'same' }));
+
+    expect(result).not.toBeNull();
+    expect(result!.toolName).toBe('Edit');
+  });
+
+  it('still alerts when every Edit in the group failed, regardless of hash', () => {
+    const detector = new RetryDetector();
+    detector.recordToolCall(makeRecord({ ...editFields, success: false, inputHash: 'x1' }));
+    detector.recordToolCall(makeRecord({ ...editFields, success: false, inputHash: 'x2' }));
+    const result = detector.recordToolCall(
+      makeRecord({ ...editFields, success: false, inputHash: 'x3' }),
+    );
+
+    expect(result).not.toBeNull();
+  });
+
+  it('keeps near-identical detection for content-carrying tools despite differing hashes', () => {
+    const detector = new RetryDetector();
+    const bash = { toolName: 'Bash', command: 'npm test -- src/foo.test.ts' };
+    detector.recordToolCall(makeRecord({ ...bash, inputHash: 'h1' }));
+    detector.recordToolCall(makeRecord({ ...bash, command: `${bash.command} `, inputHash: 'h2' }));
+    const result = detector.recordToolCall(
+      makeRecord({ ...bash, command: `${bash.command}  `, inputHash: 'h3' }),
+    );
+
+    expect(result).not.toBeNull();
+  });
+
+  it('does not count the echoed file in an Edit response toward the token estimate', () => {
+    const detector = new RetryDetector();
+    const call = {
+      ...editFields,
+      inputHash: 'same',
+      inputSizeBytes: 400,
+      outputSizeBytes: 62_000,
+    };
+    detector.recordToolCall(makeRecord(call));
+    detector.recordToolCall(makeRecord(call));
+    const result = detector.recordToolCall(makeRecord(call));
+
+    // Two repeats x 400 input bytes / 4 bytes per token.
+    expect(result!.tokensWastedEstimate).toBe(200);
+  });
+});
+
+describe('RetryDetector growing groups', () => {
+  it('does not re-count tokens for calls already counted by an earlier alert', () => {
+    const detector = new RetryDetector({ windowSize: 5 });
+    const failed = { toolName: 'Bash', success: false, inputSizeBytes: 400, outputSizeBytes: 0 };
+    const calls = [1, 2, 3, 4].map((n) => makeRecord({ ...failed, id: `c${n}` }));
+
+    detector.recordToolCall(calls[0]);
+    detector.recordToolCall(calls[1]);
+    const first = detector.recordToolCall(calls[2]);
+    const second = detector.recordToolCall(calls[3]);
+
+    // First alert: c2 + c3 (100 tokens each). Second adds only c4.
+    expect(first!.tokensWastedEstimate).toBe(200);
+    expect(second!.tokensWastedEstimate).toBe(100);
+    expect(detector.getMetrics().totalTokensWasted).toBe(300);
+  });
+
+  it('does not re-alert when a group only loses a call to the window', () => {
+    const alerts: unknown[] = [];
+    const detector = new RetryDetector({ windowSize: 5, onAlert: (a) => alerts.push(a) });
+    const failed = { toolName: 'Bash', success: false, inputSizeBytes: 400, outputSizeBytes: 0 };
+    for (const n of [1, 2, 3, 4]) detector.recordToolCall(makeRecord({ ...failed, id: `c${n}` }));
+    expect(alerts).toHaveLength(2);
+
+    // r2 pushes c1 out of the window: the group becomes c2–c4, all already counted.
+    detector.recordToolCall(makeRecord({ toolName: 'Read', id: 'r1' }));
+    const shrunk = detector.recordToolCall(makeRecord({ toolName: 'Read', id: 'r2' }));
+
+    expect(shrunk).toBeNull();
+    expect(alerts).toHaveLength(2);
+    expect(detector.getMetrics().totalTokensWasted).toBe(300);
+  });
+
+  it('clears counted calls on reset', () => {
+    const detector = new RetryDetector();
+    const failed = { toolName: 'Bash', success: false, inputSizeBytes: 400, outputSizeBytes: 0 };
+    for (const n of [1, 2, 3]) detector.recordToolCall(makeRecord({ ...failed, id: `c${n}` }));
+    detector.reset('sess-1');
+    for (const n of [1, 2]) detector.recordToolCall(makeRecord({ ...failed, id: `c${n}` }));
+    const again = detector.recordToolCall(makeRecord({ ...failed, id: 'c3' }));
+
+    expect(again!.tokensWastedEstimate).toBe(200);
+  });
+});

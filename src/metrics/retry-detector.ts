@@ -82,6 +82,22 @@ const MAX_FIRED_KEYS = MAX_ALERTS;
 // bySession map this class maintains, so this is the one place that decides
 // how a sessionless alert rolls up.
 const UNKNOWN_SESSION_KEY = 'unknown';
+// Tools whose parser fields (extractInputMeta/parseToolSpecificFields) keep
+// only lengths/paths of the edit payload, never its text. Two distinct edits
+// to the same file therefore serialize almost identically, so Levenshtein
+// similarity over those fields says nothing about whether the calls repeat.
+const CONTENT_BLIND_TOOLS: ReadonlySet<string> = new Set([
+  'Edit',
+  'MultiEdit',
+  'Write',
+  'NotebookEdit',
+]);
+// Claude Code's PostToolUse tool_response for these tools echoes the whole
+// original file / structured patch back to the hook — bytes the model never
+// sees — so only the input payload is model-visible cost.
+const FILE_MUTATION_TOOLS: ReadonlySet<string> = CONTENT_BLIND_TOOLS;
+// Bounds the already-counted call-id set (see countedCallIds).
+const MAX_COUNTED_CALL_IDS = MAX_ALERTS * 10;
 
 // ---------------------------------------------------------------------------
 // Levenshtein similarity
@@ -144,6 +160,10 @@ export class RetryDetector implements Resettable {
   private readonly bySession = new Map<string, RetrySessionBreakdown>();
   // Track which tool+window combos already fired to avoid spamming
   private readonly firedKeys = new Set<string>();
+  // Calls whose wasted tokens were already added to the totals. A group that
+  // grows (3 calls, then the same 3 plus one more) gets a new dedupe key and
+  // re-fires, but must only add the newly joined calls' tokens.
+  private readonly countedCallIds = new Set<string>();
 
   constructor(options?: RetryDetectorOptions) {
     this.minOccurrences = options?.minOccurrences ?? DEFAULT_MIN_OCCURRENCES;
@@ -186,6 +206,7 @@ export class RetryDetector implements Resettable {
     this.totalAlertsEmitted = 0;
     this.bySession.clear();
     this.firedKeys.clear();
+    this.countedCallIds.clear();
   }
 
   private checkWindow(): ThrashingAlert | null {
@@ -235,7 +256,17 @@ export class RetryDetector implements Resettable {
         if (oldest !== undefined) this.firedKeys.delete(oldest);
       }
 
+      // A group that only lost a call to the window has no new repeat to report.
+      if (calls.slice(1).every((c) => this.countedCallIds.has(c.id))) continue;
+
       const tokensWasted = this.estimateTokensWasted(calls);
+      // The first call is necessary work, so only repeats are ever counted.
+      for (const call of calls.slice(1)) this.countedCallIds.add(call.id);
+      while (this.countedCallIds.size > MAX_COUNTED_CALL_IDS) {
+        const oldest = this.countedCallIds.values().next().value;
+        if (oldest === undefined) break;
+        this.countedCallIds.delete(oldest);
+      }
       const alert: ThrashingAlert = {
         toolName,
         occurrences: calls.length,
@@ -315,9 +346,23 @@ export class RetryDetector implements Resettable {
     // Levenshtein-comparing the hash itself creates a false-positive floor
     // there, because unrelated random hex strings still share characters
     // by chance. See serializeInput()'s doc comment.
+    //
+    // Content-blind tools (Edit, Write, ...) are the exception: their
+    // serialized fields omit the edit text, so the serialized string can't
+    // distinguish two different edits to one file. For those, differing
+    // inputHashes mean different calls (similarity 0) even when the
+    // serialized fields are nearly identical; identical hashes still count
+    // as a byte-identical retry. Legacy records without a hash fall through
+    // to the Levenshtein comparison.
     const reference = inputs[0];
     const referenceHash = calls[0].inputHash;
+    const contentBlind = CONTENT_BLIND_TOOLS.has(calls[0].toolName);
     for (let i = 1; i < inputs.length; i++) {
+      if (contentBlind && referenceHash !== undefined && calls[i].inputHash !== undefined) {
+        totalSimilarity += referenceHash === calls[i].inputHash ? 1 : 0;
+        comparisons++;
+        continue;
+      }
       const levenshteinSimilarity = normalizedLevenshteinSimilarity(reference, inputs[i]);
       const hashSimilarity = referenceHash === calls[i].inputHash ? 1 : 0;
       const combinedSimilarity =
@@ -396,11 +441,14 @@ export class RetryDetector implements Resettable {
   }
 
   // The first call in the group is necessary work, not waste — only the
-  // repeats after it represent redundant, wasted effort.
+  // repeats after it represent redundant, wasted effort. Calls already
+  // counted by an earlier alert (a growing group) are skipped.
   private estimateTokensWasted(calls: ToolCallRecord[]): number {
     let totalBytes = 0;
     for (const call of calls.slice(1)) {
-      totalBytes += (call.inputSizeBytes ?? 0) + (call.outputSizeBytes ?? 0);
+      if (this.countedCallIds.has(call.id)) continue;
+      const outputBytes = FILE_MUTATION_TOOLS.has(call.toolName) ? 0 : (call.outputSizeBytes ?? 0);
+      totalBytes += (call.inputSizeBytes ?? 0) + outputBytes;
     }
     return Math.ceil(totalBytes / BYTES_PER_TOKEN_ESTIMATE);
   }
