@@ -99,7 +99,10 @@ export function ShareTable<Row>({
           <thead className="text-ink-muted sticky top-0 bg-bg-panel">
             <tr>
               {columns.map((col, columnIndex) => {
-                const base = col.align === 'right' ? 'text-right pb-1' : 'text-left pb-1';
+                const base =
+                  col.align === 'right'
+                    ? 'text-right pb-1 pl-4 whitespace-nowrap'
+                    : 'text-left pb-1 pr-2';
                 if (!col.sortValue) {
                   return (
                     <th key={col.header} className={base}>
@@ -134,7 +137,9 @@ export function ShareTable<Row>({
               <tr key={rowKey(row)} className="border-t border-bg-line">
                 {columns.map((col) => {
                   const base =
-                    col.align === 'right' ? 'py-1 text-right tabular-nums' : 'py-1 text-ink-base';
+                    col.align === 'right'
+                      ? 'py-1 pl-4 text-right tabular-nums whitespace-nowrap'
+                      : 'py-1 pr-2 text-ink-base';
                   const extra =
                     typeof col.className === 'function' ? col.className(row) : col.className;
                   return (
