@@ -1484,7 +1484,10 @@ function ToolsSection({
             const pct = totalCalls > 0 ? (count / totalCalls) * 100 : 0;
             return (
               <div key={tool} className="flex items-center gap-2 text-[11px]">
-                <span className="w-[9.1rem] shrink-0 text-ink-subtle truncate" title={tool}>
+                <span
+                  className="w-[9.1rem] shrink-0 text-ink-subtle whitespace-normal break-words [overflow-wrap:anywhere] leading-tight"
+                  title={tool}
+                >
                   {shortToolName(tool)}
                 </span>
                 <div className="flex-1 h-3 bg-surface-3 relative rounded">
@@ -1493,7 +1496,9 @@ function ToolsSection({
                     style={{ width: `${pct}%` }}
                   />
                 </div>
-                <span className="w-10 text-right text-ink-muted tabular-nums">{count}</span>
+                <span className="w-10 shrink-0 text-right text-ink-muted tabular-nums">
+                  {count}
+                </span>
               </div>
             );
           })}
@@ -1502,13 +1507,16 @@ function ToolsSection({
             const pct = maxTokens > 0 ? (tc.estimatedTokens / maxTokens) * 100 : 0;
             return (
               <div key={tc.tool} className="flex items-center gap-2 text-[11px]">
-                <span className="w-[9.1rem] shrink-0 text-ink-subtle truncate" title={tc.tool}>
+                <span
+                  className="w-[9.1rem] shrink-0 text-ink-subtle whitespace-normal break-words [overflow-wrap:anywhere] leading-tight"
+                  title={tc.tool}
+                >
                   {shortToolName(tc.tool)}
                 </span>
                 <div className="flex-1 h-3 bg-surface-3 relative rounded">
                   <div className="h-3 rounded bg-accent-amber/80" style={{ width: `${pct}%` }} />
                 </div>
-                <span className="w-16 text-right text-ink-muted tabular-nums text-[10px]">
+                <span className="w-16 shrink-0 text-right text-ink-muted tabular-nums text-[10px]">
                   ~{formatTokens(tc.estimatedTokens)}
                 </span>
               </div>
