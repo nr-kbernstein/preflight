@@ -116,7 +116,7 @@ html.light {
   --color-series-3: #ea580c; /* orange */
   --color-series-4: #38bdf8; /* sky */
   --color-series-5: #64748b; /* slate */
-  --color-series-6: #d1d5db; /* gray */
+  --color-series-6: #374151; /* gray */
 
   --color-chart-block: rgba(37, 99, 235, 0.65);
   --color-chart-block-peak: rgba(37, 99, 235, 1);

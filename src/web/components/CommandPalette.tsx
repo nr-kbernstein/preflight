@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { JSX, KeyboardEvent } from 'react';
 
 import { CornerDownLeft, Search } from 'lucide-react';
@@ -30,6 +30,10 @@ export function CommandPalette({
   const [query, setQuery] = useState('');
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const baseId = useId();
+  const listboxId = `${baseId}-listbox`;
+  const optionId = (index: number): string => `${baseId}-option-${index}`;
 
   const results = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -43,7 +47,12 @@ export function CommandPalette({
     if (!open) return;
     setQuery('');
     setActiveIndex(0);
+    // Hand focus back to whatever opened the palette once it closes.
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     inputRef.current?.focus();
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
   }, [open]);
 
   if (!open) return null;
@@ -54,11 +63,36 @@ export function CommandPalette({
     onClose();
   }
 
-  function handleKeyDown(e: KeyboardEvent<HTMLInputElement>): void {
+  // Dialog-level: Escape works wherever focus is inside, and Tab never leaves.
+  function handleDialogKeyDown(e: KeyboardEvent<HTMLDivElement>): void {
     if (e.key === 'Escape') {
       e.preventDefault();
+      e.stopPropagation();
       onClose();
-    } else if (e.key === 'ArrowDown') {
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+      'input, button, [href], select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    if (!focusable || focusable.length === 0) {
+      e.preventDefault();
+      return;
+    }
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+    const current = document.activeElement;
+    if (e.shiftKey && (current === first || !dialogRef.current?.contains(current))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (current === last || !dialogRef.current?.contains(current))) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
+
+  function handleKeyDown(e: KeyboardEvent<HTMLInputElement>): void {
+    if (e.key === 'ArrowDown') {
       e.preventDefault();
       setActiveIndex((i) => Math.min(i + 1, results.length - 1));
     } else if (e.key === 'ArrowUp') {
@@ -76,11 +110,13 @@ export function CommandPalette({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label="Jump to page"
         className="surface-card shadow-xl animate-overlay-enter w-full max-w-lg mx-4 overflow-hidden"
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={handleDialogKeyDown}
       >
         <div className="flex items-center gap-x-3 px-4 border-b border-border-subtle">
           <Search size={16} className="text-ink-muted shrink-0" aria-hidden="true" />
@@ -94,10 +130,18 @@ export function CommandPalette({
             onKeyDown={handleKeyDown}
             placeholder="Search pages…"
             aria-label="Search pages"
+            aria-autocomplete="list"
+            aria-controls={listboxId}
+            aria-activedescendant={results[activeIndex] ? optionId(activeIndex) : undefined}
             className="w-full py-3.5 bg-transparent text-sm text-ink-base placeholder:text-ink-muted focus:outline-none"
           />
         </div>
-        <ul role="listbox" aria-label="Pages" className="max-h-80 overflow-y-auto p-2">
+        <ul
+          id={listboxId}
+          role="listbox"
+          aria-label="Pages"
+          className="max-h-80 overflow-y-auto p-2"
+        >
           {results.length === 0 && (
             <li className="px-3 py-6 text-center text-sm text-ink-muted">No matching pages</li>
           )}
@@ -107,6 +151,7 @@ export function CommandPalette({
             return (
               <li
                 key={entry.item.path}
+                id={optionId(i)}
                 role="option"
                 aria-selected={active}
                 onMouseEnter={() => setActiveIndex(i)}

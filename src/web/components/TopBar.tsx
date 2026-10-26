@@ -34,7 +34,7 @@ export function TopBar({
   const match = findNavItem(currentPath);
 
   return (
-    <header className="sticky top-0 z-30 flex items-center gap-x-3 h-15 px-4 sm:px-6 bg-bg-base border-b border-border-subtle">
+    <header className="flex items-center gap-x-3 h-15 px-4 sm:px-6 bg-bg-base border-b border-border-subtle">
       <button
         type="button"
         onClick={onOpenMobileNav}
@@ -79,7 +79,7 @@ export function TopBar({
       <div className="flex items-center gap-x-1">
         <span
           className={
-            'hidden md:inline-flex items-center gap-x-1.5 me-1 px-2 py-1 rounded-full text-xs font-medium ' +
+            'inline-flex items-center gap-x-1.5 me-1 px-2 py-1 rounded-full text-xs font-medium ' +
             (connected
               ? 'bg-accent-green/15 text-accent-green'
               : 'bg-accent-amber/15 text-accent-amber')
@@ -89,7 +89,7 @@ export function TopBar({
             aria-hidden="true"
             className={`size-1.5 rounded-full ${connected ? 'bg-accent-green animate-pulse' : 'bg-accent-amber'}`}
           />
-          {connected ? 'live' : 'reconnecting'}
+          <span className="sr-only md:not-sr-only">{connected ? 'live' : 'reconnecting'}</span>
         </span>
 
         <button

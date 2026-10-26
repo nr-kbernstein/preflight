@@ -45,4 +45,43 @@ describe('CommandPalette', () => {
     fireEvent.keyDown(screen.getByRole('textbox', { name: 'Search pages' }), { key: 'Escape' });
     expect(onClose).toHaveBeenCalled();
   });
+
+  it('closes on Escape from anywhere inside the dialog', () => {
+    const onClose = vi.fn();
+    render(<CommandPalette open onClose={onClose} onNavigate={() => {}} />);
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it('traps Tab inside the dialog', () => {
+    render(<CommandPalette open onClose={() => {}} onNavigate={() => {}} />);
+    const input = screen.getByRole('textbox', { name: 'Search pages' });
+    expect(input).toHaveFocus();
+    expect(fireEvent.keyDown(input, { key: 'Tab' })).toBe(false);
+    expect(fireEvent.keyDown(input, { key: 'Tab', shiftKey: true })).toBe(false);
+    expect(input).toHaveFocus();
+  });
+
+  it('restores focus to the previously focused element on close', () => {
+    const opener = document.createElement('button');
+    document.body.appendChild(opener);
+    opener.focus();
+    const { rerender } = render(<CommandPalette open onClose={() => {}} onNavigate={() => {}} />);
+    expect(screen.getByRole('textbox', { name: 'Search pages' })).toHaveFocus();
+    rerender(<CommandPalette open={false} onClose={() => {}} onNavigate={() => {}} />);
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
+  it('wires aria-controls and aria-activedescendant to the listbox options', () => {
+    render(<CommandPalette open onClose={() => {}} onNavigate={() => {}} />);
+    const input = screen.getByRole('textbox', { name: 'Search pages' });
+    const listbox = screen.getByRole('listbox');
+    expect(input).toHaveAttribute('aria-controls', listbox.id);
+    const options = screen.getAllByRole('option');
+    expect(input).toHaveAttribute('aria-activedescendant', options[0]!.id);
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(input).toHaveAttribute('aria-activedescendant', options[1]!.id);
+    expect(new Set(options.map((o) => o.id)).size).toBe(options.length);
+  });
 });

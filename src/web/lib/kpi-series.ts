@@ -14,14 +14,23 @@ export interface LabeledSeries {
   readonly labels: string[];
 }
 
+/**
+ * A daily trend line. `completed` is the same series without today's
+ * in-progress day, so a half-over-half comparison never counts a partial day
+ * as a full one.
+ */
+export interface DailySeries extends LabeledSeries {
+  readonly completed: number[];
+}
+
 export interface DailyKpiSeries {
-  readonly spend: LabeledSeries;
-  readonly sessions: LabeledSeries;
-  readonly flags: LabeledSeries;
+  readonly spend: DailySeries;
+  readonly sessions: DailySeries;
+  readonly flags: DailySeries;
   /** Only days that had at least one scored session — no invented values for idle days. */
-  readonly efficiencyPct: LabeledSeries;
+  readonly efficiencyPct: DailySeries;
   /** Only days that had at least one costed session. */
-  readonly avgCost: LabeledSeries;
+  readonly avgCost: DailySeries;
 }
 
 function localDayKey(d: Date): string {
@@ -82,6 +91,9 @@ export function buildDailyKpiSeries(
   const flags: number[] = [];
   const eff: LabeledSeries = { values: [], labels: [] };
   const avgCost: LabeledSeries = { values: [], labels: [] };
+  const todayIndex = keys.length - 1;
+  const effCompleted: number[] = [];
+  const avgCostCompleted: number[] = [];
 
   keys.forEach((k, i) => {
     const b = buckets.get(k)!;
@@ -91,19 +103,21 @@ export function buildDailyKpiSeries(
     if (b.effCount > 0) {
       eff.values.push((b.effSum / b.effCount) * 100);
       eff.labels.push(labels[i]!);
+      if (i !== todayIndex) effCompleted.push(eff.values[eff.values.length - 1]!);
     }
     if (b.costed > 0) {
       avgCost.values.push(b.spend / b.costed);
       avgCost.labels.push(labels[i]!);
+      if (i !== todayIndex) avgCostCompleted.push(avgCost.values[avgCost.values.length - 1]!);
     }
   });
 
   return {
-    spend: { values: spend, labels },
-    sessions: { values: sessions, labels },
-    flags: { values: flags, labels },
-    efficiencyPct: eff,
-    avgCost,
+    spend: { values: spend, labels, completed: spend.slice(0, todayIndex) },
+    sessions: { values: sessions, labels, completed: sessions.slice(0, todayIndex) },
+    flags: { values: flags, labels, completed: flags.slice(0, todayIndex) },
+    efficiencyPct: { ...eff, completed: effCompleted },
+    avgCost: { ...avgCost, completed: avgCostCompleted },
   };
 }
 

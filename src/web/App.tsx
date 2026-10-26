@@ -39,6 +39,7 @@ export function App(): JSX.Element {
     onToggleHelp: toggleHelp,
     onToggleTheme: toggleTheme,
     onOpenSearch: openSearch,
+    enabled: !searchOpen,
   });
 
   return (
@@ -51,17 +52,21 @@ export function App(): JSX.Element {
           onCloseMobile={closeMobileNav}
         />
         <div className="lg:ps-65">
-          <TopBar
-            currentPath={location}
-            onNavigate={navigate}
-            connected={connected}
-            theme={theme}
-            onToggleTheme={toggleTheme}
-            onOpenSearch={openSearch}
-            onOpenHelp={toggleHelp}
-            onOpenMobileNav={() => setMobileNavOpen(true)}
-          />
-          <AlertBannerStack />
+          <div className="sticky top-0 z-30">
+            <TopBar
+              currentPath={location}
+              onNavigate={navigate}
+              connected={connected}
+              theme={theme}
+              onToggleTheme={toggleTheme}
+              onOpenSearch={openSearch}
+              onOpenHelp={toggleHelp}
+              onOpenMobileNav={() => setMobileNavOpen(true)}
+            />
+            <div className="max-h-[40vh] overflow-y-auto">
+              <AlertBannerStack />
+            </div>
+          </div>
           <main>
             <div className="max-w-screen-2xl mx-auto p-4 sm:p-6">
               <ErrorBoundary resetKey={location}>

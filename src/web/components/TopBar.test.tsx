@@ -82,4 +82,12 @@ describe('TopBar', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Alerts, 1 firing' }));
     expect(onNavigate).toHaveBeenCalledWith('/alerts');
   });
+
+  it('keeps the live indicator at every width, text-only for screen readers on small screens', () => {
+    renderTopBar({ connected: true });
+    const label = screen.getByText('live');
+    expect(label.className).toContain('sr-only');
+    expect(label.className).toContain('md:not-sr-only');
+    expect(label.parentElement!.className).not.toContain('hidden');
+  });
 });

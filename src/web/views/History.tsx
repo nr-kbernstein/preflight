@@ -392,6 +392,10 @@ export function History(): JSX.Element {
       : null;
   const kpis = computeHistoryKpis(windowSessions);
   const trend = buildDailyKpiSeries(windowSessions, windowNum);
+  // A truncated sample zero-fills the start of the window, which would read as
+  // a spurious upward trend — suppress the pills rather than show a wrong one.
+  const trendDelta = (completed: readonly number[]): number | null =>
+    dailySpendTruncated ? null : halfOverHalfPercent(completed);
   const trendCaption = `Daily · ${windowSubtitle(windowNum).toLowerCase()}`;
 
   return (
@@ -428,7 +432,7 @@ export function History(): JSX.Element {
               series={trend.spend.values}
               seriesLabels={trend.spend.labels}
               seriesCaption={trendCaption}
-              deltaPercent={halfOverHalfPercent(trend.spend.values)}
+              deltaPercent={trendDelta(trend.spend.completed)}
               trend="neutral"
             />
           </Card>
@@ -441,7 +445,7 @@ export function History(): JSX.Element {
               series={trend.sessions.values}
               seriesLabels={trend.sessions.labels}
               seriesCaption={trendCaption}
-              deltaPercent={halfOverHalfPercent(trend.sessions.values)}
+              deltaPercent={trendDelta(trend.sessions.completed)}
               trend="neutral"
             />
           </Card>
@@ -456,7 +460,7 @@ export function History(): JSX.Element {
               seriesLabels={trend.efficiencyPct.labels}
               seriesCaption="Daily average, days with sessions"
               formatPoint={(n) => formatPct(n)}
-              deltaPercent={halfOverHalfPercent(trend.efficiencyPct.values)}
+              deltaPercent={trendDelta(trend.efficiencyPct.completed)}
               trend="up-is-good"
             />
           </Card>
@@ -468,7 +472,7 @@ export function History(): JSX.Element {
               seriesLabels={trend.avgCost.labels}
               seriesCaption="Daily average, days with sessions"
               formatPoint={formatUsd}
-              deltaPercent={halfOverHalfPercent(trend.avgCost.values)}
+              deltaPercent={trendDelta(trend.avgCost.completed)}
               trend="down-is-good"
             />
           </Card>
@@ -482,7 +486,7 @@ export function History(): JSX.Element {
               series={trend.flags.values}
               seriesLabels={trend.flags.labels}
               seriesCaption={trendCaption}
-              deltaPercent={halfOverHalfPercent(trend.flags.values)}
+              deltaPercent={trendDelta(trend.flags.completed)}
               trend="down-is-good"
             />
           </Card>

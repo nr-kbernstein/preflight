@@ -30,6 +30,22 @@ describe('useKeyboardShortcuts', () => {
     expect(navigate).toHaveBeenCalledWith('/sessions');
   });
 
+  it('fires no shortcuts while disabled, and resumes when re-enabled', () => {
+    const { rerender } = renderHook(
+      ({ enabled }) => useKeyboardShortcuts({ navigate, onToggleHelp, onToggleTheme, enabled }),
+      { initialProps: { enabled: false } },
+    );
+    dispatchKeyDown('g');
+    dispatchKeyDown('s');
+    dispatchKeyDown('t');
+    expect(navigate).not.toHaveBeenCalled();
+    expect(onToggleTheme).not.toHaveBeenCalled();
+    rerender({ enabled: true });
+    dispatchKeyDown('g');
+    dispatchKeyDown('s');
+    expect(navigate).toHaveBeenCalledWith('/sessions');
+  });
+
   it('expires the g-prefix window after 500ms, so a late second key does not navigate', () => {
     renderHook(() => useKeyboardShortcuts({ navigate, onToggleHelp, onToggleTheme }));
     dispatchKeyDown('g');

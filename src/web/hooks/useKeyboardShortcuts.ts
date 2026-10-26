@@ -5,6 +5,8 @@ interface ShortcutConfig {
   readonly onToggleHelp: () => void;
   readonly onToggleTheme?: () => void;
   readonly onOpenSearch?: () => void;
+  /** When false (e.g. a modal is open) no shortcut fires. Defaults to true. */
+  readonly enabled?: boolean;
 }
 
 export function useKeyboardShortcuts({
@@ -12,11 +14,17 @@ export function useKeyboardShortcuts({
   onToggleHelp,
   onToggleTheme,
   onOpenSearch,
+  enabled = true,
 }: ShortcutConfig): void {
   const pendingRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
+    if (!enabled) {
+      // Drop any half-typed `g` prefix so it can't complete after the modal closes.
+      pendingRef.current = null;
+      return;
+    }
     function handleKeyDown(e: KeyboardEvent): void {
       // ⌘K / Ctrl+K opens search from anywhere, including inputs
       if (onOpenSearch && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -100,5 +108,5 @@ export function useKeyboardShortcuts({
       document.removeEventListener('keydown', handleKeyDown);
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [navigate, onToggleHelp, onToggleTheme, onOpenSearch]);
+  }, [navigate, onToggleHelp, onToggleTheme, onOpenSearch, enabled]);
 }

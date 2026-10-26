@@ -1,6 +1,7 @@
+import { useEffect, useRef } from 'react';
 import type { JSX } from 'react';
 
-import { ExternalLink, X } from 'lucide-react';
+import { ChevronRight, ExternalLink, X } from 'lucide-react';
 
 import { useLiveAlerts } from '../hooks/useLiveAlerts';
 import { useVersionInfo } from '../hooks/useVersionInfo';
@@ -32,6 +33,23 @@ export function Sidebar({
 }: SidebarProps): JSX.Element {
   const { count: alertCount, maxSeverity } = useLiveAlerts();
   const versionInfo = useVersionInfo();
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+
+  // While the drawer is open: move focus into it, close on Escape, and hand
+  // focus back to whatever opened it (the top bar's menu button) on close.
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeButtonRef.current?.focus();
+    function onKeyDown(e: KeyboardEvent): void {
+      if (e.key === 'Escape') onCloseMobile?.();
+    }
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      if (opener?.isConnected) opener.focus();
+    };
+  }, [mobileOpen, onCloseMobile]);
 
   function renderNavItem({ path, label, Icon }: NavItem) {
     const active = currentPath === path;
@@ -82,8 +100,8 @@ export function Sidebar({
       )}
       <aside
         className={
-          'fixed inset-y-0 start-0 z-50 w-65 flex flex-col bg-bg-base border-e border-border-subtle transition-transform duration-200 lg:translate-x-0 ' +
-          (mobileOpen ? 'translate-x-0' : '-translate-x-full')
+          'fixed inset-y-0 start-0 z-50 w-65 flex flex-col bg-bg-base border-e border-border-subtle transition-[transform,visibility] duration-200 lg:translate-x-0 ' +
+          (mobileOpen ? 'translate-x-0' : '-translate-x-full max-lg:invisible')
         }
       >
         {/* Logo + brand */}
@@ -137,6 +155,7 @@ export function Sidebar({
           </div>
           {onCloseMobile && (
             <button
+              ref={closeButtonRef}
               type="button"
               onClick={onCloseMobile}
               aria-label="Close navigation"
@@ -158,6 +177,19 @@ export function Sidebar({
               </nav>
             </div>
           ))}
+        </div>
+
+        {/* The top bar hosts this CTA from xl up; below that it lives here. */}
+        <div className="px-3 pb-3 xl:hidden">
+          <a
+            href="https://newrelic.com/platform/ai-observability"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center gap-x-1.5 py-2 px-3 rounded-lg bg-primary text-on-primary text-sm font-medium hover:bg-primary-hover transition-colors duration-150 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+          >
+            Try AI Observability
+            <ChevronRight size={14} aria-hidden="true" />
+          </a>
         </div>
 
         {/* Footer — workspace card, mirrors Preline's sidebar account switcher */}

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { Sidebar, type SidebarProps } from './Sidebar';
 import { useLiveStore, type AlertEvent } from '../store/liveStore';
 import { useVersionInfo } from '../hooks/useVersionInfo';
@@ -178,5 +178,51 @@ describe('Sidebar', () => {
     });
     renderSidebar();
     expect(screen.queryByText(/available/)).not.toBeInTheDocument();
+  });
+
+  it('takes the closed mobile drawer out of the tab order below lg only', () => {
+    const { container } = render(<Sidebar currentPath="/" onNavigate={() => {}} />);
+    const aside = container.querySelector('aside')!;
+    expect(aside.className).toContain('max-lg:invisible');
+    expect(aside.className).toContain('lg:translate-x-0');
+  });
+
+  it('keeps the open mobile drawer visible', () => {
+    const { container } = render(
+      <Sidebar currentPath="/" onNavigate={() => {}} mobileOpen onCloseMobile={() => {}} />,
+    );
+    expect(container.querySelector('aside')!.className).not.toContain('max-lg:invisible');
+  });
+
+  it('closes on Escape while open and ignores Escape while closed', () => {
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <Sidebar currentPath="/" onNavigate={() => {}} onCloseMobile={onClose} />,
+    );
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+    rerender(<Sidebar currentPath="/" onNavigate={() => {}} mobileOpen onCloseMobile={onClose} />);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('moves focus into the drawer on open and back to the opener on close', () => {
+    const opener = document.createElement('button');
+    document.body.appendChild(opener);
+    opener.focus();
+    const { rerender } = render(
+      <Sidebar currentPath="/" onNavigate={() => {}} onCloseMobile={() => {}} />,
+    );
+    rerender(<Sidebar currentPath="/" onNavigate={() => {}} mobileOpen onCloseMobile={() => {}} />);
+    expect(screen.getByRole('button', { name: 'Close navigation' })).toHaveFocus();
+    rerender(<Sidebar currentPath="/" onNavigate={() => {}} onCloseMobile={() => {}} />);
+    expect(opener).toHaveFocus();
+    opener.remove();
+  });
+
+  it('offers the Try AI Observability link below xl', () => {
+    render(<Sidebar currentPath="/" onNavigate={() => {}} />);
+    const link = screen.getByRole('link', { name: /Try AI Observability/ });
+    expect(link.parentElement!.className).toContain('xl:hidden');
   });
 });
