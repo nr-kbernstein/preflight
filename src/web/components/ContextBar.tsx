@@ -67,8 +67,14 @@ const CHART_COLORS: Record<string, string> = {
   assistant: 'var(--color-accent-green)',
 };
 
-const CHART_TICK_STYLE = { fontSize: 10, fill: '#6b7280' } as const;
-const CHART_GRID_STROKE = '#2a2a3a';
+const CHART_TICK_STYLE = { fontSize: 10, fill: 'var(--color-ink-muted)' } as const;
+const CHART_GRID_STROKE = 'var(--color-border-subtle)';
+const CHART_TOOLTIP_STYLE = {
+  backgroundColor: 'var(--color-bg-elevated)',
+  border: '1px solid var(--color-border-medium)',
+  fontSize: 11,
+  color: 'var(--color-ink-base)',
+} as const;
 
 export interface ContextTimelineProps {
   readonly history: ContextResponse['history'];
@@ -104,11 +110,7 @@ export function ContextTimeline({
           <XAxis dataKey="turn" tick={CHART_TICK_STYLE} stroke={CHART_GRID_STROKE} />
           <YAxis domain={[0, 100]} unit="%" tick={CHART_TICK_STYLE} stroke={CHART_GRID_STROKE} />
           <Tooltip
-            contentStyle={{
-              backgroundColor: '#1a1a2e',
-              border: '1px solid #2a2a3a',
-              fontSize: 11,
-            }}
+            contentStyle={CHART_TOOLTIP_STYLE}
             formatter={(value: unknown, name: unknown) => [
               `${(value as number).toFixed(1)}%`,
               name as string,
